@@ -28,10 +28,21 @@ def _b64u(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
 
-def _seller(raw) -> str:
-    """卖家ID。"0" 是 メルカリShops 的哨兵值（店铺不是用户），当成未知。"""
-    sid = str(raw or "").strip()
-    return "" if sid == "0" else sid[:32]
+def _seller(raw: dict) -> str:
+    """卖家标识。个人出品用 sellerId，メルカリShops 用店铺ID。
+
+    【Shops 的 sellerId 是哨兵 "0"，不是卖家】卖家是店铺实体不是用户，
+    接口对所有 Shops 商品一律返回 "0" —— 实测库里 41 件商品顶着这个"卖家ID"，
+    分属不同店铺。当初直接归一成空串，结果是这些商品在面板上【没法拉黑】，
+    而"某个店铺反复挂高价货刷屏"恰恰是黑名单最主要的用途。
+    真正的店铺标识在 `shop.id`（形如 YoUQXX6TT8X6C47LxjRZbH），实测不依赖
+    withShopname 开关，默认就有。用它当卖家ID，拉黑一次就屏蔽这家店的全部商品。
+    （店铺【名字】才需要 withShopname=True，这里没开——拉黑用ID就够了。）
+    """
+    sid = str(raw.get("sellerId") or "").strip()
+    if sid and sid != "0":
+        return sid[:32]
+    return str((raw.get("shop") or {}).get("id") or "").strip()[:32]
 
 
 class Mercari(Source):
@@ -129,11 +140,8 @@ class Mercari(Source):
             "item_type": "user" if raw.get("itemType") == "ITEM_TYPE_MERCARI" else "shop",
             "category_id": int(raw["categoryId"]) if raw.get("categoryId") else None,
             "brand_name": ((raw.get("itemBrand") or {}).get("name") or "")[:64],
-            # 【"0" 是哨兵不是卖家】メルカリShops 的商品卖家是店铺实体不是用户，
-            # 接口对它们一律返回 sellerId="0"。实测库里 41 件商品顶着这个"卖家ID"，
-            # 全是 Shops 品、分属不同店铺 —— 原样留着的话，卖家黑名单里填一个 0
-            # 就会一次误杀这 41 件，而人以为自己只拉黑了一家店。归一成空串＝卖家未知。
-            "seller_id": _seller(raw.get("sellerId")),
+            # 个人出品取 sellerId，Shops 取 shop.id —— 见 _seller() 的说明
+            "seller_id": _seller(raw),
             "thumb_url": (raw.get("thumbnails") or [""])[0][:255],
             "listed_at": self.ts(raw.get("created")),
             "updated_at_src": self.ts(raw.get("updated")),

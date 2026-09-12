@@ -76,19 +76,28 @@ def test_卖家ID为空时一律放行():
     assert judge_snap(RULE, snap(seller_id=None))["matched"] == 1
 
 
-def test_メルカリShops_的哨兵_0_不是卖家():
-    """Shops 商品的卖家是店铺实体不是用户，接口一律返回 sellerId="0"。
-    实测库里 41 件顶着这个"卖家ID"，分属不同店铺 —— 原样留着的话，
-    黑名单里填一个 0 就会一次误杀这 41 件。"""
-    assert _seller("0") == ""
-    assert _seller(None) == ""
-    assert _seller("") == ""
-    assert _seller("917987475") == "917987475"
+def test_个人出品取_sellerId():
+    assert _seller({"sellerId": "917987475"}) == "917987475"
 
 
-def test_哨兵归零后黑名单填0也伤不到人():
-    rule = dict(RULE, exclude_sellers="0")
-    assert judge_snap(rule, snap(seller_id=_seller("0")))["matched"] == 1
+def test_メルカリShops_取店铺ID而不是哨兵_0():
+    """Shops 的卖家是店铺实体不是用户，接口对它们一律返回 sellerId="0"。
+    实测库里 41 件顶着这个"卖家ID"、分属不同店铺 —— 拿 "0" 当卖家ID 的话，
+    黑名单里填一个 0 会一次误杀这 41 件；归一成空串则让它们【没法拉黑】，
+    而"店铺反复挂高价货刷屏"正是黑名单最主要的用途。真正的标识是 shop.id。"""
+    shops = {"sellerId": "0", "shop": {"id": "YoUQXX6TT8X6C47LxjRZbH"},
+             "itemType": "ITEM_TYPE_BEYOND"}
+    assert _seller(shops) == "YoUQXX6TT8X6C47LxjRZbH"
+    # 拉黑这家店 → 它的商品全部判为不合适
+    rule = dict(RULE, exclude_sellers="YoUQXX6TT8X6C47LxjRZbH")
+    assert judge_snap(rule, snap(seller_id=_seller(shops)))["reject_reason"] == "seller"
+
+
+def test_既没有_sellerId_也没有_shop_时才算未知():
+    for raw in ({}, {"sellerId": ""}, {"sellerId": "0"}, {"sellerId": "0", "shop": None},
+                {"sellerId": None, "shop": {}}):
+        assert _seller(raw) == "", raw
+        assert judge_snap(RULE, snap(seller_id=_seller(raw)))["matched"] == 1
 
 
 # ---------------------------------------------------------------- ID 拆分

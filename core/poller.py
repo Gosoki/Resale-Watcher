@@ -102,11 +102,13 @@ def reconcile_sold(src, rule: dict, seen: set[str]) -> None:
                if it["item_id"] not in seen and it["last_seen_at"] < cutoff]
 
     budget = rule["detail_budget"]
+    checked = 0
     for it in missing:
         if budget <= 0:
             break
         iid = it["item_id"]
         budget -= 1
+        checked += 1
         d = src.detail(iid)
         if d is None:
             store.set_status(src.key, iid, rid, "gone")          # 已删除
@@ -137,6 +139,16 @@ def reconcile_sold(src, rule: dict, seen: set[str]) -> None:
             # 但上面已经 touch 过，所以不会变成每轮重来的死循环。
             log.warning("[%s] %s 详情读不出状态，保持原状下轮再看", src.key, iid)
         # 还在售 → 只是这轮没翻到，已 touch，下个宽限期再说
+
+    # 【这一行是本项目最大的一笔请求开销，必须可见】实测 4 条规则稳态下，
+    # 对账核实占全部请求的六成，比搜索本身还多 —— 而它原先一行日志都不打。
+    # 原因见上面那句「还在售 → 下个宽限期再说」：库里还标在售、却不在搜索结果里的
+    # 商品（卖家改了标题、掉出关键词、或搜索排序把它挤走），每过一个
+    # missing_grace_min 就要重新核实一次，永远循环。这是刻意的（为了逮到它哪天真卖掉），
+    # 但你调 daily_request_limit 之前得知道钱花在这儿。
+    if checked:
+        log.info("[%s] 规则「%s」对账核实 %d 件（失踪 %d 件，预算 %d）",
+                 src.key, rule["name"], checked, len(missing), rule["detail_budget"])
 
 
 # ------------------------------------------------------------------ 3. 补详情

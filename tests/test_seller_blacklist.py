@@ -180,3 +180,42 @@ def test_explain_读的字段在_全部页_的_SELECT_里都有():
         assert not missing, (
             f"explain 在 reject_reason={reason!r} 时读了 {missing}，"
             f"但「全部」页的 SELECT 里没有 —— 那一列会静默显示兜底文案")
+
+
+# ---------------------------------------------------------------- 「全部」页的按钮
+
+def test_全部页按钮三态():
+    """插槽模板每行只实例化一份同样的元素，Python 侧没法逐行控制显隐，
+    所以文案和可点性必须预先算成行数据。三态各有各的意思：
+      —      这一行没有卖家ID（ヤフオク 部分商品不给，メルカリShops 的卖家是店铺）
+      已拉黑  已经在该规则的黑名单里了，再点一次只会得到「已经在里面」
+      拉黑    可点
+    """
+    from web.ui import _act_label, _can_blacklist
+
+    rule = {"exclude_sellers": "abc123, p999"}
+    assert _act_label({"seller_id": "xyz"}, rule) == "拉黑"
+    assert _can_blacklist({"seller_id": "xyz"}, rule) is True
+
+    # 大小写不敏感，和 judge_snap 的比对口径一致
+    assert _act_label({"seller_id": "ABC123"}, rule) == "已拉黑"
+    assert _can_blacklist({"seller_id": "ABC123"}, rule) is False
+
+    for empty in ("", None, "   "):
+        assert _act_label({"seller_id": empty}, rule) == "—"
+        assert _can_blacklist({"seller_id": empty}, rule) is False
+
+
+def test_全部页按钮的判据和_judge_snap_一致():
+    """按钮说「已拉黑」而判定却没拉黑（或反过来），面板就在自相矛盾。
+    两边都必须走 normalize.ids + 小写精确比对。"""
+    from web.ui import _can_blacklist
+
+    rule = dict(RULE)          # exclude_sellers = "917987475, 2yhr98NDVi1eGuLhNbYtU5Z6"
+    for sid in ("917987475", "2YHR98ndvI1EgUlHnBytu5z6"):
+        judged_out = judge_snap(rule, snap(seller_id=sid))["reject_reason"] == "seller"
+        assert judged_out is True
+        assert _can_blacklist({"seller_id": sid}, rule) is False, f"{sid} 已被拉黑，按钮不该还能点"
+    # 没拉黑的：判定放行，按钮可点
+    assert judge_snap(rule, snap(seller_id="ne123"))["matched"] == 1
+    assert _can_blacklist({"seller_id": "ne123"}, rule) is True

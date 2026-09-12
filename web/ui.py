@@ -201,8 +201,14 @@ def blacklist_seller(rule_id: int, seller_id: str) -> None:
         return
     store.update_rule(rule_id, {"exclude_sellers": new})
     n = poller.revalidate(store.get_rule(rule_id))
-    notify(f"已拉黑 {seller_id}，{n} 件商品改判")
+    # 【提示里要点名是哪条规则】黑名单是按规则存的，而「全部」页可以同时列出
+    # 多条规则的商品 —— 不说清楚的话，你以为拉黑了这个人，其实只在一条规则里生效。
+    notify(f"「{rule['name']}」已拉黑 {seller_id}，{n} 件商品改判")
+    # 两个页都要刷：从哪个页点的都可能。refresh() 不带参数会沿用各自最近一次的
+    # 参数（NiceGUI 的 target.args = args or target.args），所以「全部」页的
+    # 筛选条件不会被重置回「全部规则」。没渲染过的页 targets 为空，是空操作。
     hits_view.refresh()
+    all_view.refresh()
 
 
 # ------------------------------------------------------------------ 命中页
@@ -333,6 +339,18 @@ def hits_view() -> None:
                                 "text-xs " + ("text-green-400" if r["is_deal"] else "text-gray-400"))
 
 
+def _can_blacklist(row: dict, rule: dict) -> bool:
+    """这一行能不能拉黑：有卖家ID、且还没在该规则的黑名单里。"""
+    sid = (row.get("seller_id") or "").strip().lower()
+    return bool(sid) and sid not in ids(rule.get("exclude_sellers"))
+
+
+def _act_label(row: dict, rule: dict) -> str:
+    if not (row.get("seller_id") or "").strip():
+        return "—"
+    return "拉黑" if _can_blacklist(row, rule) else "已拉黑"
+
+
 # ------------------------------------------------------------------ 全部页
 
 @ui.refreshable
@@ -371,6 +389,7 @@ def all_view(rule_id: int | None, reason: str) -> None:
             {"name": "detail", "label": "具体原因", "field": "detail", "align": "left"},
             {"name": "status", "label": "状态", "field": "status", "align": "left"},
             {"name": "name", "label": "标题（点击打开商品页）", "field": "name", "align": "left"},
+            {"name": "act", "label": "卖家", "field": "act", "align": "left"},
         ],
         rows=[{
             "id": f"{r['source']}-{r['item_id']}-{r['rule_id']}",
@@ -382,8 +401,16 @@ def all_view(rule_id: int | None, reason: str) -> None:
             "status": {"on_sale": "在售", "sold_out": "已售出",
                        "trading": "交易中", "gone": "已下架"}.get(r["status"], r["status"]),
             "name": r["name"],
-            # link 不作为一列显示，只放在行数据里给下面的模板取用
+            # 下面三个不作为列显示，只放在行数据里给模板和事件回调取用。
+            # rule_id 必须逐行带：这一页可以同时显示多条规则的商品（筛选选「全部规则」时），
+            # 拉黑只能落在该行自己那条规则上。
             "link": item_url(r["source"], r["item_id"]),
+            "seller": r["seller_id"],
+            "rule_id": r["rule_id"],
+            # 【按钮的文案和可点性在这里算好】插槽模板每行只实例化一份同样的元素，
+            # Python 侧没法逐行控制，所以条件得预先算成行数据、模板里只做绑定。
+            "act": _act_label(r, rules.get(r["rule_id"]) or {}),
+            "can_bl": _can_blacklist(r, rules.get(r["rule_id"]) or {}),
         } for r in rows],
         row_key="id", pagination=50,
     )
@@ -400,6 +427,23 @@ def all_view(rule_id: int | None, reason: str) -> None:
              class="text-blue-400 hover:underline">{{ props.value }}</a>
         </q-td>
     ''')
+    # 【这一格用 NiceGUI 元素，不用裸 HTML】上面两个插槽是纯展示，裸模板就够了；
+    # 这一格要回调到 Python，走 table.cell + 元素自己的 on() 是官方支持的路径，
+    # 不用去赌 `$parent.$emit` 在 scoped slot 里指向哪个组件。
+    # 文案三态：没有卖家ID → 「—」（ヤフオク 有一部分商品不给，メルカリShops
+    # 的卖家是店铺不是用户）；已经在黑名单里 → 「已拉黑」；其余才可点。
+    with tbl.add_slot("body-cell-act"):
+        with tbl.cell("act"):
+            ui.button().props(
+                'flat dense no-caps size=sm color=negative '
+                ':label="props.row.act" :disable="!props.row.can_bl"'
+            ).on(
+                "click",
+                # 【rule_id 必须逐行取】这一页可以同时列出多条规则的商品，
+                # 拉黑只能落在该行自己那条规则上。
+                js_handler="() => emit(props.row.rule_id, props.row.seller)",
+                handler=lambda e: blacklist_seller(e.args[0], e.args[1]),
+            )
 
 
 # ------------------------------------------------------------------ 规则页

@@ -307,6 +307,12 @@ https://page.auctions.yahoo.co.jp/jp/auction/xxxxxxxxx
 
 ---
 
+### 命中页在宽屏上是两列
+
+窗口 ≥1280px（Tailwind 的 `xl`）时，命中列表自动排成两列，每列约 610px；
+再窄就退回一列。不设这个下限的话，笔记本上正文会被压到标题每行只剩几个字。
+嫌 1280 还是挤就把 `web/ui.py` 里的 `xl:grid-cols-2` 改成 `2xl:`（1536px）。
+
 ## 二点五、面板是暗色的
 
 `ui.dark_mode(True)` 强制暗色，主色 blue-400 / 负色 red-400，用 oklch 指定（P3 屏上不走 sRGB 夹紧）。

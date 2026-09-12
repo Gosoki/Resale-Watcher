@@ -251,92 +251,98 @@ def hits_view() -> None:
                 ui.label("当前没有符合条件的在售商品。").classes("text-gray-400 text-sm")
                 continue
 
-            for r in rows:
-                fresh = freshness(r, fresh_hours, cold_start)
-                # 【这一行的三个 class 是一组，缺一个价格就会被长标题挤下去】
-                #   flex-nowrap  外层三列（图/正文/价格）绝不换行 —— 没有它，
-                #                标题一长整个价格列会被挤到下一行去
-                #   items-start  标题换成两行时，价格保持在顶部对齐而不是浮到中间
-                #   正文列的 min-w-0 + 价格列的 shrink-0 见下面，是同一件事的另一半：
-                #   flex 子项默认 min-width:auto，不写 min-w-0 的话正文列会被内容
-                #   撑到超过容器宽度，把右边挤没
-                with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
-                    if r["thumb_url"]:
-                        # 96px：正文列在「徽标+标题两行+拍卖提示+品相行」时约 90px 高，
-                        # 图跟着长到差不多，两边才齐。64px 时右边明显空一块，
-                        # 看起来就像行距被撑开了。
-                        ui.image(r["thumb_url"]).classes(
-                            "w-24 h-24 object-cover rounded shrink-0")
-                    # leading-snug：正文是 3~4 行小字堆起来的，默认行高留白偏多，
-                    # 累积下来整张卡片会显得松垮
-                    with ui.column().classes("gap-0 grow min-w-0 leading-snug"):
-                        # 【徽标在标题上方】它们是"要不要点进去"的信号，得一眼看见。
-                        # 放在标题后面的话，遇到长标题（全库最长 130 字，超 70 字的有
-                        # 一百多件）就会被推到第二三行的行尾，等于没有。
-                        # 没有任何徽标时整行不渲染，不留空档。
-                        if r["is_deal"] or fresh or r["desc_warn"]:
-                            with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
-                                if r["is_deal"]:
-                                    ui.badge("捡漏", color="green")
-                                if fresh == "listed":
-                                    ui.badge("新上架", color="orange").tooltip(
-                                        f"平台显示它是最近 {fresh_hours} 小时内挂出来的")
-                                elif fresh == "found":
-                                    ui.badge("新发现", color="blue-grey").tooltip(
-                                        f"最近 {fresh_hours} 小时内才进我们的库。商品本身可能"
-                                        "早就挂着了 —— 多半是它降价进了你的价格区间。"
-                                        "ヤフオク 不提供上架时间，它的商品只会有这个标")
-                                if r["desc_warn"] == poller.DESC_UNREAD:
-                                    # 【这不是警示词，是降级信号】详情页打开了但描述没解析出来
-                                    # （多半是平台改版）。画成普通警示徽标、还配一句
-                                    # 「可能是卖家在否认」的解释，等于用假信息盖住了
-                                    # 「警示层对这件商品整个失效」这个事实。
-                                    ui.badge("描述未读到", color="grey").tooltip(
-                                        "详情页打开了，但描述没解析出来（平台页面结构可能变了）。"
-                                        "这件商品的描述警示【没有生效】，点进去自己看一眼")
-                                elif r["desc_warn"]:
-                                    # 描述里命中了警示词。商品没被毙掉，只是提醒你点开看一眼
-                                    ui.badge(f"描述: {r['desc_warn']}", color="amber") \
-                                        .tooltip("描述里出现了这些词，但可能是卖家在否认（如"
-                                                 "「ジャンク品ではありません」）。点标题自己看一眼")
-                        # 标题【不截断】，长了就换行（break-words 让超长的连续
-                        # 字符串——比如日文长串型号——也能断开，不会撑破容器）
-                        ui.link(r["name"], item_url(r["source"], r["item_id"]),
-                                new_tab=True).classes("font-medium break-words")
-                        note, color = auction_note(r)
-                        if note:
-                            ui.label(note).classes(f"text-xs {color}")
-                        with ui.row().classes("gap-3 text-xs text-gray-400 items-center"):
-                            ui.label(COND.get(r["condition_id"], "品相未标"))
-                            # 【必须用默认参数绑死 rid/sid】这两个是循环变量，
-                            # 直接在 lambda 里引用 rule/r 的话，等你点下去时它们
-                            # 早就指向循环的最后一件商品了 —— 每个按钮都会拉黑同一个人。
-                            # 卖家ID为空时不给按钮：ヤフオク 有一部分商品不给卖家ID，
-                            # 没有可拉黑的对象，画个点不动的按钮只会让人以为坏了。
-                            if r["seller_id"]:
-                                ui.button(
-                                    "拉黑卖家",
-                                    on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
-                                        blacklist_seller(rid, sid),
-                                ).props("flat dense no-caps size=sm color=negative") \
-                                 .classes("text-xs px-1").tooltip(
-                                    f"卖家 {r['seller_id']}\n"
-                                    "拉黑后这条规则下他的全部商品立刻判为不合适。"
-                                    "想反悔就去规则页把 ID 从 exclude_sellers 里删掉")
-                            if r["price"] < r["first_price"]:
-                                ui.label(f"已降 {yen(r['first_price'] - r['price'])}"
-                                         f"（首见 {yen(r['first_price'])}）").classes("text-red-400")
-                            ui.label(f"上架 {r['listed_at']:%m-%d %H:%M}" if r["listed_at"] else "")
-                    # shrink-0：价格列宽度固定，不参与压缩
-                    # whitespace-nowrap：¥1,188,800 这种数字本身也绝不折行
-                    with ui.column().classes("gap-0 items-end shrink-0 whitespace-nowrap"):
-                        # 来源放在价格正上方：这两个信息是一起看的 ——
-                        # 同一个价格在哪个平台，直接决定你怎么去买
-                        ui.badge(source_name(r["source"]), color="blue-grey").classes("mb-1")
-                        ui.label(yen(r["price"])).classes("text-lg font-bold")
-                        if r["deal_pct"]:
-                            ui.label(f"市价的 {r['deal_pct']}%").classes(
-                                "text-xs " + ("text-green-400" if r["is_deal"] else "text-gray-400"))
+            # 【宽屏两列】一件商品那一行最窄要 ~480px 才不挤（图 96 + 正文 + 价格列），
+            # xl 是 80rem=1280px，两列各约 610px，够。再窄就退回一列 ——
+            # 不设下限的话，笔记本上正文会被压到标题每行只剩几个字。
+            # gap 只给 x 方向：纵向的间距由每行自己的 border-t + py-2 负责，
+            # 再加 gap-y 会让两列之间的分隔线对不齐。
+            with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
+                for r in rows:
+                    fresh = freshness(r, fresh_hours, cold_start)
+                    # 【这一行的三个 class 是一组，缺一个价格就会被长标题挤下去】
+                    #   flex-nowrap  外层三列（图/正文/价格）绝不换行 —— 没有它，
+                    #                标题一长整个价格列会被挤到下一行去
+                    #   items-start  标题换成两行时，价格保持在顶部对齐而不是浮到中间
+                    #   正文列的 min-w-0 + 价格列的 shrink-0 见下面，是同一件事的另一半：
+                    #   flex 子项默认 min-width:auto，不写 min-w-0 的话正文列会被内容
+                    #   撑到超过容器宽度，把右边挤没
+                    with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
+                        if r["thumb_url"]:
+                            # 96px：正文列在「徽标+标题两行+拍卖提示+品相行」时约 90px 高，
+                            # 图跟着长到差不多，两边才齐。64px 时右边明显空一块，
+                            # 看起来就像行距被撑开了。
+                            ui.image(r["thumb_url"]).classes(
+                                "w-24 h-24 object-cover rounded shrink-0")
+                        # leading-snug：正文是 3~4 行小字堆起来的，默认行高留白偏多，
+                        # 累积下来整张卡片会显得松垮
+                        with ui.column().classes("gap-0 grow min-w-0 leading-snug"):
+                            # 【徽标在标题上方】它们是"要不要点进去"的信号，得一眼看见。
+                            # 放在标题后面的话，遇到长标题（全库最长 130 字，超 70 字的有
+                            # 一百多件）就会被推到第二三行的行尾，等于没有。
+                            # 没有任何徽标时整行不渲染，不留空档。
+                            if r["is_deal"] or fresh or r["desc_warn"]:
+                                with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
+                                    if r["is_deal"]:
+                                        ui.badge("捡漏", color="green")
+                                    if fresh == "listed":
+                                        ui.badge("新上架", color="orange").tooltip(
+                                            f"平台显示它是最近 {fresh_hours} 小时内挂出来的")
+                                    elif fresh == "found":
+                                        ui.badge("新发现", color="blue-grey").tooltip(
+                                            f"最近 {fresh_hours} 小时内才进我们的库。商品本身可能"
+                                            "早就挂着了 —— 多半是它降价进了你的价格区间。"
+                                            "ヤフオク 不提供上架时间，它的商品只会有这个标")
+                                    if r["desc_warn"] == poller.DESC_UNREAD:
+                                        # 【这不是警示词，是降级信号】详情页打开了但描述没解析出来
+                                        # （多半是平台改版）。画成普通警示徽标、还配一句
+                                        # 「可能是卖家在否认」的解释，等于用假信息盖住了
+                                        # 「警示层对这件商品整个失效」这个事实。
+                                        ui.badge("描述未读到", color="grey").tooltip(
+                                            "详情页打开了，但描述没解析出来（平台页面结构可能变了）。"
+                                            "这件商品的描述警示【没有生效】，点进去自己看一眼")
+                                    elif r["desc_warn"]:
+                                        # 描述里命中了警示词。商品没被毙掉，只是提醒你点开看一眼
+                                        ui.badge(f"描述: {r['desc_warn']}", color="amber") \
+                                            .tooltip("描述里出现了这些词，但可能是卖家在否认（如"
+                                                     "「ジャンク品ではありません」）。点标题自己看一眼")
+                            # 标题【不截断】，长了就换行（break-words 让超长的连续
+                            # 字符串——比如日文长串型号——也能断开，不会撑破容器）
+                            ui.link(r["name"], item_url(r["source"], r["item_id"]),
+                                    new_tab=True).classes("font-medium break-words")
+                            note, color = auction_note(r)
+                            if note:
+                                ui.label(note).classes(f"text-xs {color}")
+                            with ui.row().classes("gap-3 text-xs text-gray-400 items-center"):
+                                ui.label(COND.get(r["condition_id"], "品相未标"))
+                                # 【必须用默认参数绑死 rid/sid】这两个是循环变量，
+                                # 直接在 lambda 里引用 rule/r 的话，等你点下去时它们
+                                # 早就指向循环的最后一件商品了 —— 每个按钮都会拉黑同一个人。
+                                # 卖家ID为空时不给按钮：ヤフオク 有一部分商品不给卖家ID，
+                                # 没有可拉黑的对象，画个点不动的按钮只会让人以为坏了。
+                                if r["seller_id"]:
+                                    ui.button(
+                                        "拉黑卖家",
+                                        on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
+                                            blacklist_seller(rid, sid),
+                                    ).props("flat dense no-caps size=sm color=negative") \
+                                     .classes("text-xs px-1").tooltip(
+                                        f"卖家 {r['seller_id']}\n"
+                                        "拉黑后这条规则下他的全部商品立刻判为不合适。"
+                                        "想反悔就去规则页把 ID 从 exclude_sellers 里删掉")
+                                if r["price"] < r["first_price"]:
+                                    ui.label(f"已降 {yen(r['first_price'] - r['price'])}"
+                                             f"（首见 {yen(r['first_price'])}）").classes("text-red-400")
+                                ui.label(f"上架 {r['listed_at']:%m-%d %H:%M}" if r["listed_at"] else "")
+                        # shrink-0：价格列宽度固定，不参与压缩
+                        # whitespace-nowrap：¥1,188,800 这种数字本身也绝不折行
+                        with ui.column().classes("gap-0 items-end shrink-0 whitespace-nowrap"):
+                            # 来源放在价格正上方：这两个信息是一起看的 ——
+                            # 同一个价格在哪个平台，直接决定你怎么去买
+                            ui.badge(source_name(r["source"]), color="blue-grey").classes("mb-1")
+                            ui.label(yen(r["price"])).classes("text-lg font-bold")
+                            if r["deal_pct"]:
+                                ui.label(f"市价的 {r['deal_pct']}%").classes(
+                                    "text-xs " + ("text-green-400" if r["is_deal"] else "text-gray-400"))
 
 
 def _can_blacklist(row: dict, rule: dict) -> bool:

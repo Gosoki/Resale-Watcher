@@ -25,8 +25,12 @@ from db import store  # noqa: E402
 def replay(rule: dict, apply: bool) -> None:
     rid = rule["id"]
     rows = store.query(
-        "SELECT source, item_id, name, price, item_type, condition_id, matched, "
-        "reject_reason, desc_checked FROM item WHERE rule_id = %s", (rid,))
+        # 【这个列表必须覆盖 judge_snap 读的每一个字段】和 poller.revalidate
+        # 那份是两套独立的 SQL，加字段时极容易只改一边 —— 漏掉的字段在这里
+        # 读成 None，于是重放给出的结论和 --apply 真正写回库的结果【相反】。
+        # seller_id 就这么漏过一次。tests/test_seller_blacklist.py 守着这三处。
+        "SELECT source, item_id, name, price, item_type, condition_id, seller_id, "
+        "matched, reject_reason, desc_checked FROM item WHERE rule_id = %s", (rid,))
     if not rows:
         print(f"规则 #{rid}「{rule['name']}」库里还没有商品，先跑一轮再来。\n")
         return

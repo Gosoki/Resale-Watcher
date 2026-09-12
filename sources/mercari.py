@@ -28,6 +28,12 @@ def _b64u(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
 
+def _seller(raw) -> str:
+    """卖家ID。"0" 是 メルカリShops 的哨兵值（店铺不是用户），当成未知。"""
+    sid = str(raw or "").strip()
+    return "" if sid == "0" else sid[:32]
+
+
 class Mercari(Source):
     key = "mercari"
     name = "メルカリ"
@@ -123,7 +129,11 @@ class Mercari(Source):
             "item_type": "user" if raw.get("itemType") == "ITEM_TYPE_MERCARI" else "shop",
             "category_id": int(raw["categoryId"]) if raw.get("categoryId") else None,
             "brand_name": ((raw.get("itemBrand") or {}).get("name") or "")[:64],
-            "seller_id": str(raw.get("sellerId") or "")[:24],
+            # 【"0" 是哨兵不是卖家】メルカリShops 的商品卖家是店铺实体不是用户，
+            # 接口对它们一律返回 sellerId="0"。实测库里 41 件商品顶着这个"卖家ID"，
+            # 全是 Shops 品、分属不同店铺 —— 原样留着的话，卖家黑名单里填一个 0
+            # 就会一次误杀这 41 件，而人以为自己只拉黑了一家店。归一成空串＝卖家未知。
+            "seller_id": _seller(raw.get("sellerId")),
             "thumb_url": (raw.get("thumbnails") or [""])[0][:255],
             "listed_at": self.ts(raw.get("created")),
             "updated_at_src": self.ts(raw.get("updated")),

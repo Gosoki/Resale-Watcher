@@ -120,7 +120,7 @@ class YahooAuction(Source):
             "item_type": "shop" if _attr(blk, "isshoppingitem") else "user",
             "category_id": _int(_attr(blk, "category")) or None,
             "brand_name": "",
-            "seller_id": _attr(blk, "auc-seller-id")[:24],
+            "seller_id": _attr(blk, "auc-seller-id")[:32],
             "thumb_url": _attr(blk, "img")[:255],
             "listed_at": None,                # 搜索结果里没有上架时间，只有结束时间
             "updated_at_src": self.ts(_attr(blk, "endtime")),

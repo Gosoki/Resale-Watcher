@@ -16,6 +16,7 @@ import config
 import sources
 from core import poller
 from core.matcher import explain
+from core.normalize import ids
 from db import store
 
 # 暗色样式：ui.dark_mode(True) + ui.colors 定主色 + 这张表修 Quasar 在暗底上的两处短板。
@@ -54,6 +55,7 @@ REASON_LABEL = {
     # 重判【已在库】的商品 —— 你把必含词改严之后，老商品就会被写成这个原因留在库里
     "no_keyword": "关键词不匹配",
     "condition": "品相不符", "shop_item": "Shops商家品",
+    "seller": "卖家黑名单",
 }
 
 # 编辑对话框里每个字段的提示。写在这里而不是只靠 DDL 注释 ——
@@ -66,6 +68,9 @@ FIELD_HELP = {
     "exclude_any": "标题排除词，命中任一即判不合适。整机靠 CPU 型号（ryzen/ultra9/14900）最好认",
     "warn_desc": "描述警示词，只查描述。【命中只打黄标，不会毙掉商品】所以可以放宽一点填，"
                  "宁可多挂个标签让你看一眼，也别静悄悄漏掉一块好卡",
+    "exclude_sellers": "卖家黑名单：逗号分隔的卖家ID，命中就判不合适。"
+                       "【不用手抄】命中页每行有「拉黑卖家」按钮，点一下就加进来。"
+                       "取消拉黑（从这里删掉）后，被误杀的商品下一轮会自己回到命中列表",
     "condition_ids": "品相白名单 1新品〜6状态差，逗号分隔。留空=不限",
     "note": "备注",
 }
@@ -171,6 +176,35 @@ def auction_note(r: dict) -> tuple[str, str]:
            ("text-red-400" if urgent else "text-gray-400")
 
 
+def blacklist_seller(rule_id: int, seller_id: str) -> None:
+    """把这个卖家加进该规则的黑名单，并【立刻】重判一次。
+
+    立刻重判（而不是等下一轮）是因为这是个手动动作：点完按钮商品还挂在页面上，
+    人会以为没生效、然后再点一次。revalidate 是纯 CPU、不发任何请求，
+    在这里同步跑一次的代价只是几百行 UPDATE。
+    """
+    rule = store.get_rule(rule_id)
+    if not rule:
+        notify("这条规则不在了（可能刚被删掉）", type="warning")
+        return
+    cur = rule["exclude_sellers"] or ""
+    if seller_id.strip().lower() in ids(cur):
+        notify(f"{seller_id} 已经在黑名单里了")
+        return
+    new = f"{cur},{seller_id}" if cur else seller_id
+    # exclude_sellers 是 VARCHAR(1024)。满了必须出声 —— 非严格模式下 MySQL 会
+    # 【静默截断】，那会把最后一个 ID 砍成半截：既没拉黑成，又可能误伤一个
+    # 前缀恰好相同的卖家，而面板上显示的是「已拉黑」。
+    if len(new) > 1024:
+        notify("黑名单满了（上限 1024 字符）—— 去规则页删掉几个不再需要的 ID",
+               type="negative")
+        return
+    store.update_rule(rule_id, {"exclude_sellers": new})
+    n = poller.revalidate(store.get_rule(rule_id))
+    notify(f"已拉黑 {seller_id}，{n} 件商品改判")
+    hits_view.refresh()
+
+
 # ------------------------------------------------------------------ 命中页
 
 @ui.refreshable
@@ -266,8 +300,23 @@ def hits_view() -> None:
                         note, color = auction_note(r)
                         if note:
                             ui.label(note).classes(f"text-xs {color}")
-                        with ui.row().classes("gap-3 text-xs text-gray-400"):
+                        with ui.row().classes("gap-3 text-xs text-gray-400 items-center"):
                             ui.label(COND.get(r["condition_id"], "品相未标"))
+                            # 【必须用默认参数绑死 rid/sid】这两个是循环变量，
+                            # 直接在 lambda 里引用 rule/r 的话，等你点下去时它们
+                            # 早就指向循环的最后一件商品了 —— 每个按钮都会拉黑同一个人。
+                            # 卖家ID为空时不给按钮：ヤフオク 有一部分商品不给卖家ID，
+                            # 没有可拉黑的对象，画个点不动的按钮只会让人以为坏了。
+                            if r["seller_id"]:
+                                ui.button(
+                                    "拉黑卖家",
+                                    on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
+                                        blacklist_seller(rid, sid),
+                                ).props("flat dense no-caps size=sm color=negative") \
+                                 .classes("text-xs px-1").tooltip(
+                                    f"卖家 {r['seller_id']}\n"
+                                    "拉黑后这条规则下他的全部商品立刻判为不合适。"
+                                    "想反悔就去规则页把 ID 从 exclude_sellers 里删掉")
                             if r["price"] < r["first_price"]:
                                 ui.label(f"已降 {yen(r['first_price'] - r['price'])}"
                                          f"（首见 {yen(r['first_price'])}）").classes("text-red-400")
@@ -296,9 +345,12 @@ def all_view(rule_id: int | None, reason: str) -> None:
         where.append("reject_reason = %s"); args.append(key)
 
     rows = store.query(
+        # 【必须覆盖 explain() 读的每一个字段】少一个，「具体原因」那一列就会
+        # 静默退化成兜底文案（seller_id 漏掉时每行都显示「卖家 ? 在黑名单里」），
+        # 而这一列存在的全部意义就是说清楚是哪个条件、哪个值判掉的。
         f"SELECT source, item_id, rule_id, name, price, matched, reject_reason, status, "
-        f"condition_id, desc_warn, desc_checked, bid_count, buy_now_price, end_time, "
-        f"first_seen_at FROM item "
+        f"condition_id, seller_id, desc_warn, desc_checked, bid_count, buy_now_price, "
+        f"end_time, first_seen_at FROM item "
         f"WHERE {' AND '.join(where)} "
         f"ORDER BY first_seen_at DESC LIMIT 300", args)
     # 拿完整规则（不只是名字）：原因列要用规则里的词表和阈值把「为什么」算出来
@@ -365,7 +417,8 @@ def rule_dialog(rule: dict | None, host=None) -> None:
     data = dict(rule) if rule else {
         "name": "", "enabled": 1, "keyword": "", "sources": "",
         "include_all": "", "include_any": "",
-        "exclude_any": "", "warn_desc": "", "price_min": 0, "price_max": 0,
+        "exclude_any": "", "warn_desc": "", "exclude_sellers": "",
+        "price_min": 0, "price_max": 0,
         "condition_ids": "", "allow_shops": 0, "check_desc": 1,
         "deal_ratio": 85, "quick_min": 7, "note": "",
     }
@@ -378,7 +431,7 @@ def rule_dialog(rule: dict | None, host=None) -> None:
                 ui.input(f, value=data[f]).classes("w-full").props("dense outlined") \
                     .bind_value(data, f).tooltip(FIELD_HELP.get(f, ""))
                 ui.label(FIELD_HELP.get(f, "")).classes("text-xs text-gray-400 -mt-2")
-            for f in ("exclude_any", "warn_desc"):
+            for f in ("exclude_any", "warn_desc", "exclude_sellers"):
                 ui.textarea(f, value=data[f]).classes("w-full").props("dense outlined rows=3") \
                     .bind_value(data, f)
                 ui.label(FIELD_HELP.get(f, "")).classes("text-xs text-gray-400 -mt-2")
@@ -453,6 +506,17 @@ def rule_dialog(rule: dict | None, host=None) -> None:
 
             payload = {k: clean(v) for k, v in data.items() if k in store.RULE_FIELDS}
             if rule:
+                # 【只写真正改过的字段，不要整行覆盖】data 是打开对话框那一刻的快照，
+                # 而这个对话框是刻意建在 dialog_host 里的（要能撑过几分钟的「立即跑一轮」），
+                # 开着的时候你完全可以切到命中页点「拉黑卖家」。整行写回会拿旧快照
+                # 把 exclude_sellers 冲回空串 —— 两次操作都提示成功，而拉黑没了，
+                # 下一轮那些商品又回到命中列表，人只会觉得「黑名单不生效」。
+                before = {k: clean(v) for k, v in rule.items() if k in store.RULE_FIELDS}
+                payload = {k: v for k, v in payload.items() if v != before.get(k)}
+                if not payload:
+                    close()
+                    notify("没有任何改动")
+                    return
                 store.update_rule(rule["id"], payload)
             else:
                 store.insert_rule(payload)

@@ -92,19 +92,28 @@ def plan_schema_changes(want: dict, have: dict) -> tuple[list, list]:
     永远不该产出 DROP。
 
     want: {(表, 列): schema.sql 里那一行完整定义}
-    have: {(表, 列): 该列在库里的 COMMENT}
-    返回 (要新增的, 要改注释的)，元素都是 (表, 列, 定义)。
+    have: {(表, 列): {"comment": 库里的注释, "type": 库里的类型如 "varchar(24)"}}
+    返回 (要新增的, 要改的)，元素都是 (表, 列, 定义)。
+
+    【注释和类型都要比】只比注释的话，把 VARCHAR(24) 改成 VARCHAR(32) 而注释没动，
+    对已有的库就毫无作用 —— 而这种"悄悄不生效"正是本函数要消灭的东西。
+    实测本库 65 个列的 DDL 类型串和 information_schema 的 COLUMN_TYPE 逐一相等
+    （TINYINT(1) 这类也对得上），所以直接比字符串不会天天误报去 ALTER 全表。
     """
     tables = {t for t, _ in have}          # 库里已经存在的表
     adds, mods = [], []
     for (table, col), definition in want.items():
         if table not in tables:
             continue                        # 整张表还没建：CREATE TABLE 会连列带注释一起建出来
-        if (table, col) not in have:
+        cur = have.get((table, col))
+        if cur is None:
             adds.append((table, col, definition))
             continue
         m = re.search(r"COMMENT\s+'((?:[^']|'')*)'", definition)
-        if m and m.group(1).replace("''", "'") != have[(table, col)]:
+        comment_differs = bool(m) and m.group(1).replace("''", "'") != cur["comment"]
+        t = re.match(r"\w+\s+(\S+)", definition)
+        type_differs = bool(t) and t.group(1).lower() != cur["type"]
+        if comment_differs or type_differs:
             mods.append((table, col, definition))
     return adds, mods
 
@@ -141,8 +150,9 @@ def sync_schema() -> None:
             if hit:
                 want[(table, hit.group(1))] = line.strip().rstrip(",")
 
-    have = {(r["TABLE_NAME"], r["COLUMN_NAME"]): r["COLUMN_COMMENT"]
-            for r in query("SELECT TABLE_NAME, COLUMN_NAME, COLUMN_COMMENT "
+    have = {(r["TABLE_NAME"], r["COLUMN_NAME"]):
+            {"comment": r["COLUMN_COMMENT"], "type": (r["COLUMN_TYPE"] or "").lower()}
+            for r in query("SELECT TABLE_NAME, COLUMN_NAME, COLUMN_COMMENT, COLUMN_TYPE "
                            "FROM information_schema.columns WHERE table_schema = %s",
                            (config.DB["database"],))}
     adds, mods = plan_schema_changes(want, have)
@@ -241,6 +251,7 @@ def save_setting(k: str, v) -> None:
 
 RULE_COLUMNS = (
     "name, enabled, keyword, sources, include_all, include_any, exclude_any, warn_desc, "
+    "exclude_sellers, "
     "price_min, price_max, condition_ids, allow_shops, check_desc, "
     "deal_ratio, quick_min, note"
 )
@@ -273,11 +284,18 @@ def get_rule(rule_id: int) -> dict | None:
 
 
 def insert_rule(data: dict) -> int:
-    cols = [c.strip() for c in RULE_COLUMNS.split(",")]
+    # 【只插 data 里真有的列，别用 data.get() 兜底成 None】
+    # 原先是对 RULE_COLUMNS 逐列 data.get(c)：调用方少给一个键就往 NOT NULL 的列里
+    # 塞 NULL，STRICT 模式下直接 IntegrityError。每往 watch_rule 加一个新列，
+    # tools/seed.py 这种手写字典的调用方就会当场炸掉（exclude_sellers 就是这么炸的一次）。
+    # 省掉的列走 DDL 里的 DEFAULT，这也正是 update_rule 一直以来的做法。
+    cols = [c.strip() for c in RULE_COLUMNS.split(",") if c.strip() in data]
+    if not cols:
+        raise ValueError("insert_rule 收到的字典里没有任何 watch_rule 的列")
     ph = ", ".join(["%s"] * len(cols))
-    sql = (f"INSERT INTO watch_rule ({RULE_COLUMNS}, created_at, updated_at) "
+    sql = (f"INSERT INTO watch_rule ({', '.join(cols)}, created_at, updated_at) "
            f"VALUES ({ph}, %s, %s)")
-    args = [data.get(c) for c in cols] + [config.now(), config.now()]
+    args = [data[c] for c in cols] + [config.now(), config.now()]
     with conn() as c, c.cursor() as cur:
         cur.execute(sql, args)
         return cur.lastrowid

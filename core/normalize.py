@@ -39,3 +39,18 @@ def words(csv: str | None) -> list[str]:
     """把规则表里逗号分隔的词表拆开并逐个归一化。半角/全角逗号、顿号、分号、换行都认。"""
     return [n for _raw, n in word_pairs(csv)]
 
+
+
+def ids(csv: str | None) -> set[str]:
+    """把逗号分隔的【标识符】拆开，只做去空白 + 转小写。
+
+    【刻意不走 norm()】norm() 会把非字母数字的字符全删掉，那是为商品标题设计的：
+    「RTX 5090」和「rtx-5090」应该视为同一个词。但卖家 ID 是标识符不是词 ——
+    实测 ヤフオク 的 ID 形如 `2yhr98NDVi1eGuLhNbYtU5Z6`，Mercari 是纯数字，
+    Yahoo!フリマ 是 `p58365705`。这些本来就没有符号可剥，剥了反而可能把两个
+    不同的 ID 抹成同一个。转小写是为了容忍手抄时的大小写出入：
+    实测库里 179 个卖家 ID 小写化之后【没有任何碰撞】。
+    """
+    if not csv:
+        return set()
+    return {t.strip().lower() for t in _SPLIT.split(csv) if t.strip()}

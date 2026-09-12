@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS watch_rule (
   include_any   VARCHAR(512)  NOT NULL DEFAULT ''     COMMENT '任含词（OR）：出现任意一个即可。留空=不检查',
   exclude_any   VARCHAR(1024) NOT NULL DEFAULT ''     COMMENT '排除词：出现任意一个就判不合适。例：ジャンク,部品取り,箱のみ,ノート,ゲーミングPC',
 
+  exclude_sellers VARCHAR(1024) NOT NULL DEFAULT ''   COMMENT '卖家黑名单，逗号分隔的卖家ID。命中就判不合适（reject_reason=seller），但仍入库——取消拉黑后会被重判回来。【每条规则各自一份】和其它词表一致；同一个卖家要在多条规则里分别拉黑。面板命中页每行有「拉黑」按钮，不用手抄ID。【卖家ID未知的商品一律不判】ヤフオク 部分商品不给卖家ID，メルカリShops 的卖家不是用户——不知道≠命中',
+
   price_min     INT           NOT NULL DEFAULT 0      COMMENT '价格下限（日元，含）。0=不限。低于它多半是配件/废品',
   price_max     INT           NOT NULL DEFAULT 0      COMMENT '价格上限（日元，含）。0=不限。这是「合适」的硬门槛',
 
@@ -99,7 +101,7 @@ CREATE TABLE IF NOT EXISTS item (
   item_type     VARCHAR(8)    NOT NULL DEFAULT 'user' COMMENT 'user=个人出品 shop=商家出品（メルカリShops 等）',
   category_id   INT           NULL                    COMMENT '该平台的分类ID（各家编号体系不同，不跨源比较）',
   brand_name    VARCHAR(64)   NOT NULL DEFAULT ''     COMMENT '品牌名。只有 Mercari 和 Yahoo!フリマ 给，且经常为空或不准；ヤフオク 恒为空',
-  seller_id     VARCHAR(24)   NOT NULL DEFAULT ''     COMMENT '卖家ID',
+  seller_id     VARCHAR(32)   NOT NULL DEFAULT ''     COMMENT '卖家ID。【宽度按最长的源定】实测 ヤフオク 的是 28~29 字符，Mercari 是 1~9 位数字，Yahoo!フリマ 是 p+数字共 5~9；原本 VARCHAR(24) 会把 ヤフオク 的全部截断，于是你从网页上复制完整ID填进卖家黑名单会匹配不上',
   thumb_url     VARCHAR(255)  NOT NULL DEFAULT ''     COMMENT '缩略图，面板里显示用',
 
   listed_at     DATETIME      NULL                    COMMENT '商品上架时间。ヤフオク 的搜索结果不给这个，会是 NULL',

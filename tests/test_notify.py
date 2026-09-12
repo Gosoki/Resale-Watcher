@@ -152,3 +152,24 @@ def test_单条发送失败不影响后面几条():
     _, fake, n = run({}, {"notify_url": "u", "notify_on": "deal",
                           "notify_max_per_round": 5}, rows, sender=flaky)
     assert len(calls) == 3 and n == 2
+
+
+# ---------------------------------------------------------------- 接线
+
+def test_推送必须接在常驻轮询的路径上():
+    """【这条是踩出来的】推送一开始只挂在 run_once 上，而 run_once 只被面板的
+    「立即跑一次」和 ./run.sh once 调用 —— 常驻轮询走的是 loop → _run_round。
+    于是正常部署方式（./run.sh start / systemd）下推送一条都发不出去，
+    而日志、面板、rule_source_state.last_error 全都正常，没有任何线索。
+
+    更坏的一层：后台轮询期间待推的商品一直堆着，等哪天手点一次「立即跑一次」，
+    条数几乎必然超过 notify_max_per_round，被整批标成已推、永久丢掉。
+    """
+    import inspect
+    from core import poller
+
+    assert "push_new" in inspect.getsource(poller.finalize), \
+        "finalize 里没有推送 —— 两条路径就都推不出去了"
+    for fn, name in [(poller.run_once, "run_once"), (poller._run_round, "_run_round")]:
+        assert "finalize(" in inspect.getsource(fn), \
+            f"{name} 没有调 finalize —— 这条路径上的重判/捡漏/推送全都不会发生"

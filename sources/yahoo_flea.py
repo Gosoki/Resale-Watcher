@@ -83,7 +83,7 @@ class YahooFlea(Source):
             "item_type": "user",
             "category_id": int(cat["id"]) if cat.get("id") else None,
             "brand_name": ((brand or {}).get("name") or "")[:64],
-            "seller_id": str((raw.get("seller") or {}).get("id") or raw.get("sellerId") or "")[:24],
+            "seller_id": str((raw.get("seller") or {}).get("id") or raw.get("sellerId") or "")[:32],
             "thumb_url": (raw.get("thumbnailImageUrl") or "")[:255],
             "listed_at": self.iso(raw.get("openTime")),
             # 没有单独的成交时间字段。endTime 是出品期限，售出时它就是这件商品

@@ -185,8 +185,13 @@ def revalidate(rule: dict) -> int:
     rid = rule["id"]
     changed = 0
     for r in store.query(
-            "SELECT source, item_id, name, price, item_type, condition_id, matched, "
-            "reject_reason, desc_checked, desc_warn, description FROM item WHERE rule_id = %s",
+            # 【这个列表必须覆盖 judge_snap 读的每一个字段】漏一个的后果是静默的：
+            # 扫描时用完整 snap 判成不合适，紧接着 revalidate 拿缺字段的行判回合适，
+            # 两个动作在同一轮里一前一后互相抵消 —— 那条规则看起来就是"不生效"，
+            # 而日志和面板都不会有任何异常。seller_id 就是这么漏掉过一次的。
+            "SELECT source, item_id, name, price, item_type, condition_id, seller_id, "
+            "matched, reject_reason, desc_checked, desc_warn, description "
+            "FROM item WHERE rule_id = %s",
             (rid,)):
         v = judge_snap(rule, r)
         if r["desc_warn"] == DESC_UNREAD:
@@ -276,6 +281,38 @@ def scan_sold(src, rule: dict) -> dict:
 
 # ------------------------------------------------------------------ 主循环
 
+def finalize(rule_id: int) -> dict:
+    """一轮扫完之后的跨源收尾：重判 → 算捡漏 → 推送。返回 {'rejudged', 'notified'}。
+
+    【必须在这里重新取规则，不能用调用方手上那份】传进来的 rule 是一轮开始时
+    取的快照，而一轮要跑几十秒到几分钟（每个请求之间还有 3~8 秒的随机等待）。
+    你在这期间于面板上点了「拉黑卖家」，拿旧快照跑 revalidate 会把刚拉黑的商品
+    原样判回命中 —— 用户最明确的一次主动操作被静默回滚，面板上那几件商品
+    当着人的面又冒出来，而日志里什么都没有。
+
+    【扫描阶段用旧快照是可以接受的】scan_on_sale 期间 upsert 可能按旧规则
+    写回 matched=1，但紧接着这里就用新规则整体重判一遍，同一轮内就收敛了。
+
+    【推送必须挂在这里，不能只挂在 run_once 上】常驻轮询走的是 _run_round，
+    面板的「立即跑一次」才走 run_once。推送只挂后者的话，正常部署方式
+    （./run.sh start / systemd）下一条都发不出去，而且待推的商品会一直
+    堆到某次手动触发时超过 notify_max_per_round，被整批标成已推、永久丢掉。
+    """
+    rule = store.get_rule(rule_id)
+    if rule is None:
+        return {"rejudged": 0, "notified": 0}       # 规则在这一轮里被删了
+    out = {"rejudged": revalidate(rule), "notified": 0}
+    mark_deals(rule)
+    # 【推送在 mark_deals 之后】只推捡漏时，is_deal 要先算出来才知道该推谁。
+    # 【单独包 try】推送是附属功能，它坏了不该让这一轮的抓取成果丢掉 ——
+    # push_new 内部已经吞掉了单条发送的异常，这里兜的是读库、读设置这些。
+    try:
+        out["notified"] = notify.push_new(rule)
+    except Exception as e:                  # noqa: BLE001 - 推送故障不该拖垮抓取
+        log.warning("规则「%s」推送环节失败：%s", rule["name"], e)
+    return out
+
+
 def run_once(rule: dict) -> dict:
     """跑一条规则的完整一轮（遍历它启用的所有源）。面板上的「立即跑一次」也走这里。"""
     srcs = sources.for_rule(rule)
@@ -297,16 +334,7 @@ def run_once(rule: dict) -> dict:
                  src.key, rule["name"], stat["total"], stat["pages"],
                  stat["new"], stat["price_down"], stat["details"])
 
-    agg["rejudged"] = revalidate(rule)
-    mark_deals(rule)
-    # 【必须在 mark_deals 之后】只推捡漏时，is_deal 要先算出来才知道该推谁。
-    # 【整段包 try】推送是附属功能，它坏了不该让这一轮的抓取成果丢掉 ——
-    # push_new 内部已经吞掉了单条发送的异常，这里兜的是读库、读设置这些。
-    try:
-        agg["notified"] = notify.push_new(rule)
-    except Exception as e:                  # noqa: BLE001 - 推送故障不该拖垮抓取
-        log.warning("规则「%s」推送环节失败：%s", rule["name"], e)
-        agg["notified"] = 0
+    agg.update(finalize(rule["id"]))
     agg["matched"] = store.one("SELECT COUNT(*) n FROM item WHERE rule_id = %s AND matched = 1 "
                                "AND status = 'on_sale'", (rule["id"],))["n"]
     log.info("规则「%s」合计：在售%d件 新增%d 降价%d 改判%d → 当前命中%d",
@@ -403,10 +431,9 @@ def _run_round(rules, stop_event) -> bool:
                                               last_scan_at=config.now())
 
         if worked:
-            # 跨源的收尾：重判 + 捡漏。只在真扫过东西时做，没动静就别空跑。
+            # 跨源的收尾：重判 + 捡漏 + 推送。只在真扫过东西时做，没动静就别空跑。
             try:
-                revalidate(rule)
-                mark_deals(rule)
+                finalize(rid)
             except Exception:           # noqa: BLE001 - 纯本地计算，出错记下继续
-                log.exception("规则「%s」重判/捡漏失败", rule["name"])
+                log.exception("规则「%s」收尾失败", rule["name"])
     return halted

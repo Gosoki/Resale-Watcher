@@ -25,6 +25,25 @@ CONDITION = {"new": 1, "used10": 2, "used20": 3, "used40": 4, "used60": 5, "used
 
 _NEXT_DATA = re.compile(r'id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
 
+# 【这个源的发货地是大写罗马字】实测 item.location 给的是 "KAGAWA" 这种写法，
+# 而 メルカリ 给「愛知県」、ヤフオク 给「香川県」。不统一的话面板上一半日文一半罗马字，
+# 而且「東京都」的判断也要写两套。在这里就地归一成日文，库里只存一种形态。
+# 查不到的原样返回（宁可留下线索，也别把不认识的值抹成空）。
+_PREF = {
+    "HOKKAIDO": "北海道", "AOMORI": "青森県", "IWATE": "岩手県", "MIYAGI": "宮城県",
+    "AKITA": "秋田県", "YAMAGATA": "山形県", "FUKUSHIMA": "福島県", "IBARAKI": "茨城県",
+    "TOCHIGI": "栃木県", "GUNMA": "群馬県", "SAITAMA": "埼玉県", "CHIBA": "千葉県",
+    "TOKYO": "東京都", "KANAGAWA": "神奈川県", "NIIGATA": "新潟県", "TOYAMA": "富山県",
+    "ISHIKAWA": "石川県", "FUKUI": "福井県", "YAMANASHI": "山梨県", "NAGANO": "長野県",
+    "GIFU": "岐阜県", "SHIZUOKA": "静岡県", "AICHI": "愛知県", "MIE": "三重県",
+    "SHIGA": "滋賀県", "KYOTO": "京都府", "OSAKA": "大阪府", "HYOGO": "兵庫県",
+    "NARA": "奈良県", "WAKAYAMA": "和歌山県", "TOTTORI": "鳥取県", "SHIMANE": "島根県",
+    "OKAYAMA": "岡山県", "HIROSHIMA": "広島県", "YAMAGUCHI": "山口県", "TOKUSHIMA": "徳島県",
+    "KAGAWA": "香川県", "EHIME": "愛媛県", "KOCHI": "高知県", "FUKUOKA": "福岡県",
+    "SAGA": "佐賀県", "NAGASAKI": "長崎県", "KUMAMOTO": "熊本県", "OITA": "大分県",
+    "MIYAZAKI": "宮崎県", "KAGOSHIMA": "鹿児島県", "OKINAWA": "沖縄県",
+}
+
 
 class YahooFlea(Source):
     key = "yahoo_flea"
@@ -54,19 +73,20 @@ class YahooFlea(Source):
         # warn_desc 这一层对整个源静默失效，而面板上还写着「✓ 描述已查，干净」。
         # 返回整个 dict 而不是 None：None 是"商品没了"的语义，会让上层把它标成下架。
         if not m:
-            return {"description": None, "price": 0, "name": "", "status": ""}
+            return {"description": None, "price": 0, "name": "", "status": "", "ship_from": ""}
         try:
             blob = json.loads(m.group(1))
         except json.JSONDecodeError:
-            return {"description": None, "price": 0, "name": "", "status": ""}
+            return {"description": None, "price": 0, "name": "", "status": "", "ship_from": ""}
         item = _find_item(blob, item_id)
         if item is None:
-            return {"description": None, "price": 0, "name": "", "status": ""}
+            return {"description": None, "price": 0, "name": "", "status": "", "ship_from": ""}
         return {
             "description": item.get("description") or "",
             "price": int(item.get("price") or 0),
             "name": item.get("title") or "",
             "status": {"OPEN": "on_sale", "SOLD": "sold_out"}.get(item.get("itemStatus"), ""),
+            "ship_from": _pref(item.get("location")),
         }
 
     def _parse(self, raw: dict) -> dict:
@@ -116,3 +136,9 @@ def _find_item(node, item_id: str, depth: int = 0):
             if r:
                 return r
     return None
+
+
+def _pref(raw) -> str:
+    """把 "KAGAWA" 归一成「香川県」。不认识的原样留着，别抹成空。"""
+    v = str(raw or "").strip().upper()
+    return _PREF.get(v, v)[:16]

@@ -102,6 +102,9 @@ class YahooAuction(Source):
             "price": int(item.get("price") or 0),
             "name": item.get("title") or "",
             "status": mapped,
+            # seller.location.prefecture，已经是「東京都」这种日文写法
+            "ship_from": str((((item.get("seller") or {}).get("location") or {})
+                              .get("prefecture")) or "")[:16],
         }
 
     def _parse(self, blk: str) -> dict:

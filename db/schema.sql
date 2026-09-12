@@ -119,6 +119,8 @@ CREATE TABLE IF NOT EXISTS item (
 
   notified_at   DATETIME      NULL                    COMMENT '推送过这件商品的时间。NULL=还没推过。【失败也会写】推送失败不重试：一条迟到一小时的提醒没有意义，而对着挂掉的地址每轮重试会拖慢抓取',
 
+  ship_from     VARCHAR(16)   NOT NULL DEFAULT ''     COMMENT '发货地都道府县，如「東京都」。【只有拉过详情的商品才有】三个源都只在详情响应里给这个字段，搜索结果里没有；没拉过详情的是空串＝未知，不打标签（不知道≠不是）。メルカリShops 的商品详情接口不支持，永远是空',
+
   desc_checked  TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '1=已拉过详情并用警示词查过描述',
   desc_warn     VARCHAR(128)  NOT NULL DEFAULT ''     COMMENT '描述里命中的警示词，逗号分隔。空=描述干净。【不影响 matched】只是提示你点开看一眼',
   description   MEDIUMTEXT    NULL                    COMMENT '商品描述原文，只有拉过详情的才有',

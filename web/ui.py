@@ -36,14 +36,19 @@ DARK_CSS = (
     ".q-badge.bg-orange{background:oklch(75% 0.183 55.934)!important}"       # orange-400
     ".q-badge.bg-amber{background:oklch(82.8% 0.189 84.429)!important}"      # amber-400
     ".q-badge.bg-grey{background:oklch(70.7% 0.022 261.325)!important}"      # gray-400
+    ".q-badge.bg-teal{background:oklch(77.7% 0.152 181.912)!important}"      # teal-400
     # 【这半条和上面是同一个决定】Quasar 的 .q-badge{color:#fff} 是写死的白字，
     # 而上面这批背景亮度在 70%~83% —— amber 上白字只有 1.7:1、green 2.2:1，全线看不清。
     # 亮底一律改配深色前景。
-    ".q-badge.bg-green,.q-badge.bg-orange,.q-badge.bg-amber,.q-badge.bg-grey"
-    "{color:#18181b!important}"
+    ".q-badge.bg-green,.q-badge.bg-orange,.q-badge.bg-amber,.q-badge.bg-grey,"
+    ".q-badge.bg-teal{color:#18181b!important}"
     "}"
     "</style>"
 )
+
+# 发货地标签只标这一个 —— 你要的是「在不在东京都内」，其余都道府县
+# 照常显示在下面那行小字里，但不占徽标位。
+TOKYO = "東京都"
 
 COND = {1: "新品未使用", 2: "未使用に近い", 3: "傷汚れなし",
         4: "やや傷汚れ", 5: "傷や汚れあり", 6: "状態が悪い"}
@@ -280,10 +285,16 @@ def hits_view() -> None:
                             # 放在标题后面的话，遇到长标题（全库最长 130 字，超 70 字的有
                             # 一百多件）就会被推到第二三行的行尾，等于没有。
                             # 没有任何徽标时整行不渲染，不留空档。
-                            if r["is_deal"] or fresh or r["desc_warn"]:
+                            if (r["is_deal"] or fresh or r["desc_warn"]
+                                    or r["ship_from"] == TOKYO):
                                 with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
                                     if r["is_deal"]:
                                         ui.badge("捡漏", color="green")
+                                    if r["ship_from"] == TOKYO:
+                                        ui.badge(TOKYO, color="teal").tooltip(
+                                            "发货地在东京都内。【只有拉过详情的商品才知道发货地】"
+                                            "三个源都只在详情里给这个字段，搜索结果里没有——"
+                                            "没这个标不等于不在东京，可能只是还没拉详情")
                                     if fresh == "listed":
                                         ui.badge("新上架", color="orange").tooltip(
                                             f"平台显示它是最近 {fresh_hours} 小时内挂出来的")
@@ -314,6 +325,10 @@ def hits_view() -> None:
                                 ui.label(note).classes(f"text-xs {color}")
                             with ui.row().classes("gap-3 text-xs text-gray-400 items-center"):
                                 ui.label(COND.get(r["condition_id"], "品相未标"))
+                                # 非东京的也显示出来 —— 不然「这件为什么没有东京标」
+                                # 你分不清是「不在东京」还是「还没拉详情」
+                                if r["ship_from"]:
+                                    ui.label(f"发货 {r['ship_from']}")
                                 # 【必须用默认参数绑死 rid/sid】这两个是循环变量，
                                 # 直接在 lambda 里引用 rule/r 的话，等你点下去时它们
                                 # 早就指向循环的最后一件商品了 —— 每个按钮都会拉黑同一个人。
@@ -659,6 +674,45 @@ def rules_view(host=None) -> None:
                           ).props("flat dense color=negative")
 
 
+# 【进程级的重入闸】面板是多标签页的，而抓取是服务端动作 ——
+# 两个标签页各点一次，就是两轮并发打同一批源。各源的 _lock 会把请求串起来，
+# 所以不会绕过节流，但配额会白烧一倍、日志也会交错到看不懂。
+_fetching = {"busy": False}
+
+
+async def fetch_all() -> None:
+    """一键抓取：所有启用的规则立刻各跑一轮（常驻轮询照常继续，两边共用同一套限速）。"""
+    if _fetching["busy"]:
+        notify("已经在抓了，等这一轮跑完再点", type="warning")
+        return
+    rules = store.get_rules(enabled_only=True)
+    if not rules:
+        notify("没有启用的规则", type="warning")
+        return
+    _fetching["busy"] = True
+    try:
+        st = store.get_settings()
+        notify(f"开始抓 {len(rules)} 条规则 × {len(sources.all_sources())} 个源，"
+               f"每个请求间隔 {st['req_delay_min']:g}〜{st['req_delay_max']:g} 秒，要几分钟…")
+        new = matched = 0
+        for r in rules:
+            try:
+                # 【每条规则单独 try】一条失败不该让后面几条一起放弃
+                stat = await run.io_bound(poller.run_once, store.get_rule(r["id"]))
+                new += stat["new"]
+                matched += stat["matched"]
+            except Exception as e:          # noqa: BLE001 - 手动抓取失败只弹提示
+                notify(f"「{r['name']}」失败：{e}", type="negative")
+        notify(f"抓完：新增 {new} 件，当前命中 {matched} 件", type="positive")
+    finally:
+        # 【必须在 finally】中途抛异常而不解锁的话，这个按钮就永久点不动了，
+        # 而且没有任何办法恢复，只能重启进程。
+        _fetching["busy"] = False
+    hits_view.refresh()
+    rules_view.refresh()
+    all_view.refresh()
+
+
 async def run_now(rule: dict) -> None:
     """面板上的手动试跑。走 io_bound 扔到线程里 —— 一轮要遍历所有源、发好几个请求、
     每个之间还要等 3〜8 秒，直接在事件循环里跑会把整个面板卡死。"""
@@ -797,7 +851,12 @@ def create() -> None:
             t_set = ui.tab("设置")
         with ui.tab_panels(tabs, value=t_hit).classes("w-full"):
             with ui.tab_panel(t_hit):
-                ui.button("刷新", on_click=hits_view.refresh).props("flat dense")
+                with ui.row().classes("items-center gap-2"):
+                    ui.button("一键抓取", on_click=fetch_all).props("color=primary dense no-caps") \
+                        .tooltip("所有启用的规则立刻各跑一轮。常驻轮询照常继续，"
+                                 "两边共用同一套限速，不会因此发得更快")
+                    ui.button("刷新", on_click=hits_view.refresh).props("flat dense no-caps") \
+                        .tooltip("只重画页面，不发请求")
                 hits_view()
             with ui.tab_panel(t_all):
                 rules = store.get_rules()

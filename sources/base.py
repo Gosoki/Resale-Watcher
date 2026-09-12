@@ -61,7 +61,11 @@ class Source(ABC):
 
     @abstractmethod
     def detail(self, item_id: str) -> dict | None:
-        """返回 {'description', 'price', 'name', 'status'}；商品已删除时返回 None。"""
+        """返回 {'description', 'price', 'name', 'status', 'ship_from'}；商品已删除时返回 None。
+
+        ship_from 是发货地都道府县（如「東京都」），取不到就给空串 ——
+        三个源都【只在详情里】给这个字段，搜索结果里一律没有。
+        """
 
     @abstractmethod
     def item_url(self, item_id: str) -> str:

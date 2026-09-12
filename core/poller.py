@@ -173,12 +173,12 @@ def fetch_details(src, rule: dict) -> int:
             # 【仍然置 desc_checked】否则每轮都会重试这批商品，把 detail_budget 吃光；
             # 但 desc_warn 写明「读取失败」——绝不能让面板显示成「描述已查，干净」，
             # 那等于用一条假信息盖住了整个警示层已经失效的事实。
-            store.save_detail(src.key, iid, rid, "", DESC_UNREAD)
+            store.save_detail(src.key, iid, rid, "", DESC_UNREAD, d.get("ship_from", ""))
             done += 1
             log.warning("[%s] %s 描述没解析出来（页面结构可能变了）", src.key, iid)
             continue
         warn = flag_desc(rule, d["description"])
-        store.save_detail(src.key, iid, rid, d["description"], warn)
+        store.save_detail(src.key, iid, rid, d["description"], warn, d.get("ship_from", ""))
         done += 1
         if warn:
             log.info("[%s] 描述警示 %s [%s] %s", src.key, iid, warn, it["name"][:40])

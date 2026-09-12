@@ -434,11 +434,16 @@ def touch_seen(source: str, item_id: str, rule_id: int) -> None:
             (config.now(), source, item_id, rule_id))
 
 
-def save_detail(source: str, item_id: str, rule_id: int, description: str, desc_warn: str) -> None:
-    """存描述 + 警示标签。【不动 matched】描述只提示，不参与合不合适的判定。"""
-    execute("UPDATE item SET description = %s, desc_checked = 1, desc_warn = %s "
+def save_detail(source: str, item_id: str, rule_id: int, description: str, desc_warn: str,
+                ship_from: str = "") -> None:
+    """存描述 + 警示标签 + 发货地。【不动 matched】描述只提示，不参与合不合适的判定。
+
+    【ship_from 只有这里能写】三个源都只在详情响应里给发货地，搜索结果里没有 ——
+    所以没拉过详情的商品这一列恒为空，面板上按「未知」处理、不打地区标签。
+    """
+    execute("UPDATE item SET description = %s, desc_checked = 1, desc_warn = %s, ship_from = %s "
             "WHERE source = %s AND item_id = %s AND rule_id = %s",
-            (description, desc_warn, source, item_id, rule_id))
+            (description, desc_warn, ship_from, source, item_id, rule_id))
 
 
 def set_deal(source: str, item_id: str, rule_id: int, is_deal: int, deal_pct: int | None) -> None:

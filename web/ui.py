@@ -117,6 +117,32 @@ def time_left(end) -> str:
     return f"剩 {h // 24} 天 {h % 24} 小时"
 
 
+def freshness(r: dict, hours: int, cold_start: bool) -> str:
+    """返回 "listed"（新上架）/ "found"（新发现）/ ""（都不是）。
+
+    【为什么要分两个】原先只有一个「新」标，判的是 first_seen_at —— 也就是
+    「我们什么时候抓到的」，而不是「商品什么时候挂出来的」。实测这两个差得离谱：
+    Mercari 的商品平均滞后 185 天，最久的一件上架 1405 天后我们才第一次抓到它。
+    于是一件挂了三年多的商品会被标成「新」，标签完全没有信息量。
+
+      新上架  商品本身刚挂出来（用平台给的 listed_at）—— 你直觉理解的「新」
+      新发现  商品早就挂着，但今天才进我们的库。多半是它降价进了你的价格区间，
+              对你来说同样是新机会，只是性质不同，不该和上面混为一谈
+
+    ヤフオク 的搜索结果不给上架时间，它的商品只可能是「新发现」。
+    """
+    if cold_start:
+        # 规则刚开始监控，库里所有东西都是刚抓到的 —— 那时候全是新的，标了等于没标
+        return ""
+    win = timedelta(hours=hours)
+    now = config.now()
+    if r["listed_at"] and now - r["listed_at"] < win:
+        return "listed"
+    if now - r["first_seen_at"] < win:
+        return "found"
+    return ""
+
+
 def auction_note(r: dict) -> tuple[str, str]:
     """拍卖商品的提示文字和颜色。返回 ("", "") 表示这不是拍卖。
 
@@ -147,9 +173,14 @@ def hits_view() -> None:
         ui.label("还没有规则，去「规则」页新建一条。").classes("text-gray-400 p-4")
         return
 
+    fresh_hours = store.get_settings()["fresh_hours"]
     for rule in rules:
         st = store.get_state(rule["id"])
         med = st["median_price"]
+        # 冷启动判断：这条规则库里【最早】的商品也是刚抓到的，说明监控本身才刚开始
+        earliest = store.one("SELECT MIN(first_seen_at) m FROM item WHERE rule_id = %s",
+                             (rule["id"],))["m"]
+        cold_start = bool(earliest) and (config.now() - earliest) < timedelta(hours=fresh_hours)
         rows = store.query(
             "SELECT * FROM item WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' "
             "ORDER BY COALESCE(deal_pct, 999), price", (rule["id"],))
@@ -174,7 +205,7 @@ def hits_view() -> None:
                 continue
 
             for r in rows:
-                fresh = (config.now() - r["first_seen_at"]) < timedelta(hours=24)
+                fresh = freshness(r, fresh_hours, cold_start)
                 # 【这一行的三个 class 是一组，缺一个价格就会被长标题挤下去】
                 #   flex-nowrap  外层三列（图/正文/价格）绝不换行 —— 没有它，
                 #                标题一长整个价格列会被挤到下一行去
@@ -200,8 +231,14 @@ def hits_view() -> None:
                             with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
                                 if r["is_deal"]:
                                     ui.badge("捡漏", color="green")
-                                if fresh:
-                                    ui.badge("新", color="orange")
+                                if fresh == "listed":
+                                    ui.badge("新上架", color="orange").tooltip(
+                                        f"平台显示它是最近 {fresh_hours} 小时内挂出来的")
+                                elif fresh == "found":
+                                    ui.badge("新发现", color="blue-grey").tooltip(
+                                        f"最近 {fresh_hours} 小时内才进我们的库。商品本身可能"
+                                        "早就挂着了 —— 多半是它降价进了你的价格区间。"
+                                        "ヤフオク 不提供上架时间，它的商品只会有这个标")
                                 if r["desc_warn"]:
                                     # 描述里命中了警示词。商品没被毙掉，只是提醒你点开看一眼
                                     ui.badge(f"描述: {r['desc_warn']}", color="amber") \

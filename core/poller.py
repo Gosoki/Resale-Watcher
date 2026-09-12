@@ -124,6 +124,13 @@ def reconcile_sold(src, rule: dict, seen: set[str]) -> None:
             log.info("[%s] 售出 %s ¥%s", src.key, iid, f"{d['price']:,}")
         elif d["status"] == "trading":
             store.set_status(src.key, iid, rid, "trading")
+        elif d["status"] == "gone":
+            # ヤフオク 的流标拍卖（结束了但一次出价都没有）。漏掉这个分支的话，
+            # 它既不进 sold_out 也不进 trading，落到最后什么都不做 —— 而它
+            # 再也不会出现在在售搜索结果里，于是每过一个 missing_grace_min
+            # 就重新进 missing 队列、再花一个详情请求、再什么都判不出来，
+            # 和上一轮修掉的僵尸死循环是同一类，只是走的另一个 status 取值。
+            store.set_status(src.key, iid, rid, "gone")
         elif not d["status"]:
             # 详情页读到了但解析不出状态（页面改版/异常页）。不猜、不改状态，
             # 但上面已经 touch 过，所以不会变成每轮重来的死循环。
@@ -181,8 +188,19 @@ def revalidate(rule: dict) -> int:
             "reject_reason, desc_checked, desc_warn, description FROM item WHERE rule_id = %s",
             (rid,)):
         v = judge_snap(rule, r)
-        # 描述已经在库里了，警示标签也一起重算 —— 改了 warn_desc 下一轮就反映出来
-        warn = flag_desc(rule, r["description"]) if r["desc_checked"] else ""
+        if r["desc_warn"] == DESC_UNREAD:
+            # 【读失败是终态，重算不了】这一行的 description 存的是空串（详情页打开了
+            # 但描述没解析出来），拿它去跑 flag_desc 必然得到空 —— 于是每一轮
+            # revalidate 都会把 fetch_details 刚写下的 DESC_UNREAD 洗掉，
+            # 面板转而显示「✓ 描述已查，干净」。那正是用一条假信息盖住
+            # 「警示层对这件商品整个失效」的事实，也是 matcher/yahoo_flea/poller
+            # 三处注释都写明绝不能发生的那件事。
+            warn = DESC_UNREAD
+        elif r["desc_checked"]:
+            # 描述已经在库里了，警示标签一起重算 —— 改了 warn_desc 下一轮就反映出来
+            warn = flag_desc(rule, r["description"])
+        else:
+            warn = ""
         if (v["matched"] != r["matched"] or v["reject_reason"] != r["reject_reason"]
                 or warn != r["desc_warn"]):
             store.execute("UPDATE item SET matched = %s, reject_reason = %s, desc_warn = %s "

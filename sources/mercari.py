@@ -89,10 +89,13 @@ class Mercari(Source):
 
     def detail(self, item_id: str) -> dict | None:
         # メルカリShops 的商品 ID 不是 mXXXX 格式，/items/get 拿不到它们 ——
-        # 不先挡掉的话，每个 Shops 商品每轮都要打一次注定失败的请求，
-        # 还会累加 _fails 把退避顶到 300 秒上限。返回 None＝按「查无此物」处理。
+        # 不先挡掉的话，每个 Shops 商品每轮都要打一次注定失败的请求。
+        # 【但绝不能返回 None】None 的语义是「查无此物」，上层会据此把商品标成
+        # 已下架：开了 allow_shops 的规则，Shops 商品会命中一轮就从命中页消失。
+        # 返回 description=None 表示「我们读不到」，status="" 表示「状态未知」——
+        # 上层会保持原状，和详情页解析失败走同一条路。
         if not item_id.startswith("m"):
-            return None
+            return {"description": None, "price": 0, "name": "", "status": ""}
         resp = self._call("GET", DETAIL_URL,
                           params={"id": item_id, "country_code": "", "view": "1"})
         if resp.status_code == 404:

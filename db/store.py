@@ -444,7 +444,10 @@ def refresh_median(rule_id: int) -> tuple[int | None, int]:
     rows = query("SELECT price FROM sold_sample WHERE rule_id = %s AND sold_at >= %s",
                  (rule_id, since))
     prices = [r["price"] for r in rows]
-    median = int(statistics.median(prices)) if len(prices) >= st["median_min_samples"] else None
+    # 【必须先判非空】median_min_samples 设成 0 时 0 >= 0 成立，
+    # statistics.median([]) 抛 StatisticsError，成交轮每次都会在最后一步炸掉。
+    median = (int(statistics.median(prices))
+              if prices and len(prices) >= st["median_min_samples"] else None)
     update_state(rule_id, median_price=median, sample_count=len(prices))
     return median, len(prices)
 

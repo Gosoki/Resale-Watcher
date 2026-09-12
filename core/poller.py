@@ -275,11 +275,9 @@ def scan_sold(src, rule: dict) -> dict:
 
 # ------------------------------------------------------------------ 主循环
 
-def run_once(rule: dict, only_source: str | None = None) -> dict:
+def run_once(rule: dict) -> dict:
     """跑一条规则的完整一轮（遍历它启用的所有源）。面板上的「立即跑一次」也走这里。"""
     srcs = sources.for_rule(rule)
-    if only_source:
-        srcs = [s for s in srcs if s.key == only_source]
     agg = {"total": 0, "new": 0, "price_down": 0, "details": 0, "pages": 0}
 
     for src in srcs:

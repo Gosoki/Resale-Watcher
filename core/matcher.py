@@ -15,11 +15,6 @@ reject_reason 的先后顺序是有讲究的：把「永远不会翻身」的原
 """
 from core.normalize import norm, word_pairs, words
 
-# 顺序即优先级：靠前的原因更「永久」，reject_reason 只记第一个命中的
-CONDITION_NAMES = {1: "新品、未使用", 2: "未使用に近い", 3: "目立った傷や汚れなし",
-                   4: "やや傷や汚れあり", 5: "傷や汚れあり", 6: "全体的に状態が悪い"}
-
-
 def judge_snap(rule: dict, snap: dict) -> dict:
     """用搜索结果里的信息做初筛（不含商品描述 —— 那要另发一次详情请求）。
 

@@ -119,7 +119,6 @@ CREATE TABLE IF NOT EXISTS item (
   desc_warn     VARCHAR(128)  NOT NULL DEFAULT ''     COMMENT '描述里命中的警示词，逗号分隔。空=描述干净。【不影响 matched】只是提示你点开看一眼',
   description   MEDIUMTEXT    NULL                    COMMENT '商品描述原文，只有拉过详情的才有',
 
-  starred       TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '你在面板上手动打的星，不参与任何自动逻辑',
 
   PRIMARY KEY (source, item_id, rule_id),
   KEY idx_rule_matched (rule_id, matched, last_seen_at),

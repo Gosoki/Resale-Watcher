@@ -62,6 +62,11 @@ def execute(sql: str, args=()) -> int:
 def init_schema() -> None:
     """执行 schema.sql。全是 IF NOT EXISTS，可反复跑。"""
     sql = SCHEMA_PATH.read_text(encoding="utf-8")
+    # 【库名以 .env 为准】schema.sql 里写死了 CREATE DATABASE / USE 的库名，
+    # 不替换的话 .env 的 DB_NAME 改了等于没改：建表建到 schema.sql 写的那个库里，
+    # 而连接用的是 .env 的库名，启动时报 Unknown database —— 而 deploy.sh
+    # 的错误提示还把原因指向密码和网络，排查方向全歪。
+    sql = sql.replace("resale_watcher", config.DB["database"])
     # 先按行剥掉整行注释，再按分号切分。
     # 【不能反过来】先切分再判断"整段是否以 -- 开头"会把 CREATE DATABASE 一起丢掉——
     # 它前面正好压着一大段注释，strip 后整段就是以 -- 开头的，于是建库语句被静默跳过，
@@ -91,6 +96,11 @@ def sync_column_comments() -> None:
     始终是唯一真相。只对注释真的不一样的列动手，没变化的一列都不碰。
     """
     sql = SCHEMA_PATH.read_text(encoding="utf-8")
+    # 【库名以 .env 为准】schema.sql 里写死了 CREATE DATABASE / USE 的库名，
+    # 不替换的话 .env 的 DB_NAME 改了等于没改：建表建到 schema.sql 写的那个库里，
+    # 而连接用的是 .env 的库名，启动时报 Unknown database —— 而 deploy.sh
+    # 的错误提示还把原因指向密码和网络，排查方向全歪。
+    sql = sql.replace("resale_watcher", config.DB["database"])
     want: dict[tuple[str, str], str] = {}     # (表, 列) -> 该列在 schema.sql 里的完整定义
     for m in re.finditer(r"CREATE TABLE IF NOT EXISTS (\w+) \((.*?)\n\) ENGINE", sql, re.S):
         table, body = m.group(1), m.group(2)
@@ -251,11 +261,20 @@ def update_rule(rule_id: int, data: dict) -> None:
 
 
 def delete_rule(rule_id: int) -> None:
-    # item / price_log / sold_sample 不挂外键（见 schema.sql），删规则时手动清干净，
+    # item / sold_sample 不挂外键（见 schema.sql），删规则时手动清干净，
     # 免得留下一堆 rule_id 指向不存在规则的孤儿行，把面板的统计数字算错。
     execute("DELETE FROM item WHERE rule_id = %s", (rule_id,))
     execute("DELETE FROM sold_sample WHERE rule_id = %s", (rule_id,))
     execute("DELETE FROM watch_rule WHERE id = %s", (rule_id,))
+    # price_log 不带 rule_id，没法按规则删；改成清掉「已经没有任何 item 行引用」的记录。
+    # 不清的话这张表只涨不减，删一条抓过几百件商品的规则会留下等量的孤儿。
+    execute("DELETE pl FROM price_log pl "
+            "LEFT JOIN item i ON i.source = pl.source AND i.item_id = pl.item_id "
+            "WHERE i.item_id IS NULL")
+    # 兜底：轮询线程可能正好在删除的同时往这两张表写（没有事务，各自自动提交），
+    # 那一瞬间写进去的行会指向一条已经不存在的规则。再扫一遍清掉。
+    execute("DELETE FROM item WHERE rule_id NOT IN (SELECT id FROM watch_rule)")
+    execute("DELETE FROM sold_sample WHERE rule_id NOT IN (SELECT id FROM watch_rule)")
 
 
 # ---------------------------------------------------------------- 规则状态
@@ -413,13 +432,18 @@ def pending_detail(rule_id: int, source: str, limit: int) -> list[dict]:
 
 
 def add_price_log(source: str, item_id: str, price: int, at) -> None:
+    """记一条价格变动。
+
+    【去重】price_log 不带 rule_id（价格是商品自身的属性），而 upsert_item 是
+    按规则调的 —— 同一件商品被两条规则同时命中时会各调一次，写出两行一模一样的
+    记录。这里比一下最新的那条，价格没变就不写。
+    """
+    last = one("SELECT price FROM price_log WHERE source = %s AND item_id = %s "
+               "ORDER BY noted_at DESC, id DESC LIMIT 1", (source, item_id))
+    if last and last["price"] == price:
+        return
     execute("INSERT INTO price_log (source, item_id, price, noted_at) VALUES (%s, %s, %s, %s)",
             (source, item_id, price, at))
-
-
-def price_history(source: str, item_id: str) -> list[dict]:
-    return query("SELECT price, noted_at FROM price_log WHERE source = %s AND item_id = %s "
-                 "ORDER BY noted_at", (source, item_id))
 
 
 # ---------------------------------------------------------------- 成交样本 / 市价
@@ -467,14 +491,10 @@ def bump_daily(source: str, requests: int = 0, errors: int = 0) -> None:
             (config.now().date(), source, requests, errors))
 
 
-def today_stat(source: str | None = None) -> dict:
-    """不传 source 就是【全源合计】—— 每日上限管的是总量。"""
-    if source:
-        row = one("SELECT requests, errors FROM daily_stat WHERE day = %s AND source = %s",
-                  (config.now().date(), source))
-    else:
-        row = one("SELECT COALESCE(SUM(requests),0) requests, COALESCE(SUM(errors),0) errors "
-                  "FROM daily_stat WHERE day = %s", (config.now().date(),))
+def today_stat() -> dict:
+    """今天的【全源合计】请求数 —— 每日上限管的是总量。按源分开看用 today_by_source()。"""
+    row = one("SELECT COALESCE(SUM(requests),0) requests, COALESCE(SUM(errors),0) errors "
+              "FROM daily_stat WHERE day = %s", (config.now().date(),))
     return row or {"requests": 0, "errors": 0}
 
 

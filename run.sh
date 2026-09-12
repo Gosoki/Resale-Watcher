@@ -18,15 +18,38 @@ LOGFILE="$LOGDIR/watch.log"
 mkdir -p "$LOGDIR"
 [ -x "$PY" ] || { echo "❌ 没有虚拟环境：$PY"; echo "   先跑：python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"; exit 1; }
 
-running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+SVC=resale-watcher
+
+# 【systemd 和 pid 文件两种都要认】NAS 上服务由 systemd 拉起，不写 pid 文件。
+# 只看 pid 文件的话 status 永远报「未运行」，而 start 还会再起一个实例，
+# 两个进程同时对外发请求 —— 而 deploy.sh 结尾正是让你用 run.sh status。
+systemd_running() {
+  command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SVC" 2>/dev/null
+}
+
+# pid 文件里的进程不仅要活着，还得真是本项目的 —— 重启后 pid 可能被别的进程复用，
+# 那样 start 会假称「已经在跑了」，stop 会去杀无关进程。
+pidfile_running() {
+  [ -f "$PIDFILE" ] || return 1
+  local pid; pid="$(cat "$PIDFILE" 2>/dev/null)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o command= 2>/dev/null | grep -q "main.py"
+}
+
+running() { systemd_running || pidfile_running; }
 
 port() { sed -n 's/^WEB_PORT=\([0-9]*\).*/\1/p' "$APP/.env" 2>/dev/null | head -1; }
 
 case "${1:-}" in
   start)
-    running && { echo "已经在跑了（PID $(cat "$PIDFILE")）"; exit 0; }
+    systemd_running && {
+      echo "systemd 服务 $SVC 正在运行 —— 用 systemctl restart $SVC，别用这个脚本"
+      echo "（再起一个实例会让两个进程同时对外发请求）"; exit 0; }
+    pidfile_running && { echo "已经在跑了（PID $(cat "$PIDFILE")）"; exit 0; }
     cd "$APP"
-    nohup "$PY" main.py >>"$LOGFILE" 2>&1 &
+    # 【不能重定向到 $LOGFILE】那是 RotatingFileHandler 正在写并轮转的文件：
+    # 轮转把它改名之后，这里的 fd 还指着旧 inode，stderr 全写进被改名的文件，
+    # 最终随轮转被删。而未捕获异常的堆栈恰恰只走 stderr。
+    nohup "$PY" main.py >>"$LOGDIR/stdout.log" 2>&1 &
     echo $! > "$PIDFILE"
     # 【等端口真的能连上，不是干睡几秒】NiceGUI 起来要几秒（建表、连库、绑端口），
     # 固定 sleep 要么白等要么不够 —— 不够的时候脚本报「已启动」而浏览器打开是连接被拒。
@@ -40,11 +63,13 @@ case "${1:-}" in
       echo "✅ 已启动（PID $(cat "$PIDFILE")）→ http://127.0.0.1:$(port)"
       echo "   日志：./run.sh logs"
     else
-      echo "❌ 启动失败，最后 30 行日志："; tail -30 "$LOGFILE"; rm -f "$PIDFILE"; exit 1
+      echo "❌ 启动失败，最后 30 行："; tail -30 "$LOGDIR/stdout.log" "$LOGFILE" 2>/dev/null
+      rm -f "$PIDFILE"; exit 1
     fi
     ;;
   stop)
-    running || { echo "没在跑"; rm -f "$PIDFILE"; exit 0; }
+    systemd_running && { echo "由 systemd 管着，用 systemctl stop $SVC"; exit 1; }
+    pidfile_running || { echo "没在跑"; rm -f "$PIDFILE"; exit 0; }
     PID="$(cat "$PIDFILE")"
     kill "$PID"
     # 等它自己收尾：轮询线程可能正卡在一次请求的 3〜8 秒间隔里
@@ -57,7 +82,13 @@ case "${1:-}" in
   fg)      cd "$APP"; exec "$PY" main.py ;;
   logs)    tail -f "$LOGFILE" ;;
   status)
-    running && echo "● 运行中（PID $(cat "$PIDFILE")）→ http://127.0.0.1:$(port)" || echo "○ 未运行"
+    if systemd_running; then
+      echo "● 运行中（systemd: $SVC）→ http://127.0.0.1:$(port)"
+    elif pidfile_running; then
+      echo "● 运行中（PID $(cat "$PIDFILE")）→ http://127.0.0.1:$(port)"
+    else
+      echo "○ 未运行"
+    fi
     cd "$APP" && "$PY" - <<'PYEOF'
 from db import store
 import config

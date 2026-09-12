@@ -54,8 +54,6 @@ REASON_LABEL = {
     # 重判【已在库】的商品 —— 你把必含词改严之后，老商品就会被写成这个原因留在库里
     "no_keyword": "关键词不匹配",
     "condition": "品相不符", "shop_item": "Shops商家品",
-    # 历史遗留：描述判定改成只打标签之后就不再产生这个原因了，留着只为看懂老数据
-    "excluded_desc": "描述排除词(已废弃)",
 }
 
 # 编辑对话框里每个字段的提示。写在这里而不是只靠 DDL 注释 ——
@@ -354,8 +352,16 @@ def all_view(rule_id: int | None, reason: str) -> None:
 
 # ------------------------------------------------------------------ 规则页
 
-def rule_dialog(rule: dict | None) -> None:
-    """新建/编辑规则。rule=None 表示新建。"""
+def rule_dialog(rule: dict | None, host=None) -> None:
+    """新建/编辑规则。rule=None 表示新建。
+
+    【host 必须是页面级容器，不能省】对话框默认会建在「触发它的那个按钮」所在的
+    插槽里，也就是 rules_view 的刷新容器内部。而 refreshable.refresh() 的第一步是
+    container.clear()，会把所有后代删掉 —— 于是：你点「立即跑一轮」（要跑几分钟），
+    等待期间去编辑另一条规则的排除词表，那一轮跑完时 run_now 末尾无条件
+    rules_view.refresh()，对话框连同你刚敲的一大段内容凭空消失，界面上只弹一个
+    绿色的「完成」，没有任何提示说你的编辑被吃了。
+    """
     data = dict(rule) if rule else {
         "name": "", "enabled": 1, "keyword": "", "sources": "",
         "include_all": "", "include_any": "",
@@ -363,7 +369,9 @@ def rule_dialog(rule: dict | None) -> None:
         "condition_ids": "", "allow_shops": 0, "check_desc": 1,
         "deal_ratio": 85, "quick_min": 7, "note": "",
     }
-    with ui.dialog() as dlg, ui.card().classes("w-[760px] max-w-full"):
+    with (host or ui.context.client.content):
+        dlg = ui.dialog()
+    with dlg, ui.card().classes("w-[760px] max-w-full"):
         ui.label("编辑规则" if rule else "新建规则").classes("text-lg font-bold")
         with ui.column().classes("w-full gap-2"):
             for f in ("name", "keyword", "include_all", "include_any"):
@@ -448,38 +456,50 @@ def rule_dialog(rule: dict | None) -> None:
                 store.update_rule(rule["id"], payload)
             else:
                 store.insert_rule(payload)
-            dlg.close()
+            close()
             rules_view.refresh()
             hits_view.refresh()
             notify("已保存，下一轮生效")
 
+        def close() -> None:
+            # 关了就删掉：每点一次「编辑」都会新建一个 dialog 元素，
+            # 只 close 不 delete 的话它们会一直挂在页面上越积越多。
+            dlg.close()
+            dlg.delete()
+
         with ui.row().classes("w-full justify-end gap-2"):
-            ui.button("取消", on_click=dlg.close).props("flat")
+            ui.button("取消", on_click=close).props("flat")
             ui.button("保存", on_click=save).props("color=primary")
     dlg.open()
 
 
-def confirm_delete(rule: dict) -> None:
-    with ui.dialog() as dlg, ui.card():
+def confirm_delete(rule: dict, host=None) -> None:
+    with (host or ui.context.client.content):
+        dlg = ui.dialog()
+    with dlg, ui.card():
         ui.label(f"删除规则「{rule['name']}」？")
         ui.label("它抓到的商品和成交样本会一并删除，不可恢复。").classes("text-sm text-red-400")
 
+        def close() -> None:
+            dlg.close()
+            dlg.delete()
+
         def do() -> None:
             store.delete_rule(rule["id"])
-            dlg.close()
+            close()
             rules_view.refresh()
             hits_view.refresh()
             notify("已删除")
 
         with ui.row().classes("w-full justify-end gap-2"):
-            ui.button("取消", on_click=dlg.close).props("flat")
+            ui.button("取消", on_click=close).props("flat")
             ui.button("删除", on_click=do).props("color=negative")
     dlg.open()
 
 
 @ui.refreshable
-def rules_view() -> None:
-    ui.button("新建规则", on_click=lambda: rule_dialog(None)).props("color=primary")
+def rules_view(host=None) -> None:
+    ui.button("新建规则", on_click=lambda: rule_dialog(None, host)).props("color=primary")
     for rule in store.get_rules():
         st = store.get_state(rule["id"])
         # 【命中＝当前在售的命中】和「命中」页显示的是同一批。
@@ -519,9 +539,9 @@ def rules_view() -> None:
             if rule["note"]:
                 ui.label(rule["note"]).classes("text-xs text-gray-400")
             with ui.row().classes("gap-2"):
-                ui.button("编辑", on_click=lambda r=rule: rule_dialog(r)).props("flat dense")
+                ui.button("编辑", on_click=lambda r=rule: rule_dialog(r, host)).props("flat dense")
                 ui.button("立即跑一轮", on_click=lambda r=rule: run_now(r)).props("flat dense")
-                ui.button("删除", on_click=lambda r=rule: confirm_delete(r)
+                ui.button("删除", on_click=lambda r=rule: confirm_delete(r, host)
                           ).props("flat dense color=negative")
 
 
@@ -559,15 +579,36 @@ def settings_view() -> None:
             ui.label(it["note"]).classes("text-xs text-gray-400")
             ui.label(f"默认值：{it['default']}").classes("text-xs text-gray-400")
 
+    # 这几项填 0 不是「关闭」而是各种翻车：
+    #   sold_scan_hours=0  成交轮每 30 秒重跑一次
+    #   max_pages=0        一件都扫不到，truncated 却判 False，于是售出对账
+    #                      把全库在售当成失踪逐个花详情核实
+    #   detail_budget=0    永远不核实、不读描述
+    #   median_window_days=0  prune 会把整张 sold_sample 删空，tracked 样本再也抓不回来
+    #   fresh_hours=0      两个「新」徽标永远不出现
+    MUST_BE_POSITIVE = ("sold_scan_hours", "max_pages", "detail_budget",
+                        "median_window_days", "fresh_hours", "daily_request_limit",
+                        "missing_grace_min", "req_delay_min", "req_delay_max")
+
     def save() -> None:
-        bad = []
+        bad, bad_zero = [], []
         for k, (comp, it) in fields.items():
             val = comp.value
+            if val is not None and k in MUST_BE_POSITIVE:
+                try:
+                    if float(val) <= 0:
+                        bad_zero.append(k)
+                        continue
+                except (TypeError, ValueError):
+                    pass
             if val is None:
                 bad.append(k)                  # 空值会让该项回落默认，多半是误删，拦一下
                 continue
             store.save_setting(k, val)
         settings_view.refresh()
+        if bad_zero:
+            notify(f"{'、'.join(bad_zero)} 不能填 0 或负数（这几项的 0 不是「关闭」，"
+                   f"而是会让轮询退化或把成交样本删空），已跳过未保存", type="negative")
         if bad:
             # 【原来写的是「会按默认值走」，和事实正好相反】代码是 continue 跳过不写，
             # 库里的旧值继续生效。照着错提示操作的人会以为自己成功恢复了默认值。
@@ -620,6 +661,9 @@ def create() -> None:
         tick()
         ui.timer(10.0, tick)
 
+        # 对话框的家：建在所有 refreshable 容器之外，refresh() 清不到它
+        dialog_host = ui.element()
+
         with ui.tabs().classes("w-full") as tabs:
             t_hit = ui.tab("命中")
             t_all = ui.tab("全部")
@@ -642,6 +686,6 @@ def create() -> None:
                 sel_reason.on_value_change(lambda: all_view.refresh(sel_rule.value, sel_reason.value))
                 all_view(None, "全部")
             with ui.tab_panel(t_rule):
-                rules_view()
+                rules_view(dialog_host)
             with ui.tab_panel(t_set):
                 settings_view()

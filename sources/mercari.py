@@ -107,8 +107,8 @@ class Mercari(Source):
             "description": d.get("description") or "",
             "price": int(d.get("price") or 0),
             "name": d.get("name") or "",
-            "status": {"on_sale": "on_sale", "trading": "trading",
-                       "sold_out": "sold_out"}.get(d.get("status"), d.get("status") or ""),
+            # Mercari 详情接口给的状态字符串和我们库里的取值恰好同名，不用映射
+            "status": d.get("status") or "",
         }
 
     def _parse(self, raw: dict) -> dict:

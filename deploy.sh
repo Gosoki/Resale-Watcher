@@ -68,10 +68,16 @@ n = len(store.get_rules())
 print(f"✔ 数据库 OK，建表完成，现有 {n} 条规则" + ("（跑 ./run.sh seed 写入起步规则）" if n == 0 else ""))
 PYEOF
 
-# WEB_HOST 默认 127.0.0.1（见 config.py），NAS 上不改成 0.0.0.0 就只有本机能访问
-grep -q '^WEB_HOST=' .env || echo "WEB_HOST=0.0.0.0" >> .env
-sed -i 's/^WEB_HOST=127.0.0.1$/WEB_HOST=0.0.0.0/' .env
-echo "✔ $(grep '^WEB_HOST=' .env)"
+# WEB_HOST 默认 127.0.0.1（见 config.py），NAS 上不改成 0.0.0.0 就只有本机能访问。
+# 【只在首次部署时改】原先这里无条件 sed 成 0.0.0.0，于是每次 git pull && bash deploy.sh
+# 都会把用户自己改回 127.0.0.1 的设置再撤掉一次 —— 把本脚本结尾推荐的缓解措施
+# （"真要暴露到不可信网络，请加一层 Basic Auth"）连同用户的决定一起抹掉。
+if ! grep -q '^WEB_HOST=' .env; then
+  echo "WEB_HOST=0.0.0.0" >> .env
+  echo "✔ 首次部署，已设 WEB_HOST=0.0.0.0（局域网可访问）"
+else
+  echo "✔ 保留你现有的 $(grep '^WEB_HOST=' .env)（升级不覆盖这一项）"
+fi
 
 # ---- 5. systemd ----
 cat > "/etc/systemd/system/${SVC}.service" <<EOF

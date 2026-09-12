@@ -70,12 +70,13 @@ def replay(rule: dict, apply: bool) -> None:
         print(f"    ¥{r['price']:>9,} [{','.join(hit[:3])}] {r['name'][:50]}")
 
     if apply:
-        for r in rows:
-            v = r["_new"]
-            store.execute("UPDATE item SET matched = %s, reject_reason = %s "
-                          "WHERE source = %s AND item_id = %s AND rule_id = %s",
-                          (v["matched"], v["reject_reason"], r["source"], r["item_id"], rid))
-        print(f"\n  ✔ 已把新判定写回数据库（{len(rows)} 件）")
+        # 【直接调 poller.revalidate，不要自己再写一遍 UPDATE】
+        # 两份实现已经分叉过一次：这里只写 matched/reject_reason，而 revalidate
+        # 还会重算 desc_warn —— 于是 --apply 之后下一轮轮询又把结果改一次，
+        # 你看到的和最终入库的不是同一个东西。
+        from core.poller import revalidate
+        n = revalidate(rule)
+        print(f"\n  ✔ 已把新判定写回数据库（改判 {n} 件 / 共 {len(rows)} 件）")
     print()
 
 

@@ -154,22 +154,21 @@ def hits_view() -> None:
             "SELECT * FROM item WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' "
             "ORDER BY COALESCE(deal_pct, 999), price", (rule["id"],))
 
-        with ui.card().classes("w-full mb-4"):
-            with ui.row().classes("items-center w-full gap-4"):
-                ui.label(rule["name"]).classes("text-lg font-bold")
-                ui.label(f"预算 {yen(rule['price_min'])}〜{yen(rule['price_max'])}").classes("text-sm")
-                if med:
-                    ui.label(f"市价中位 {yen(med)}（{st['sample_count']}件成交）").classes(
-                        "text-sm text-blue-400")
-                    if rule["deal_ratio"]:
-                        ui.label(f"捡漏线 {yen(med * rule['deal_ratio'] // 100)}").classes(
-                            "text-sm text-green-400")
-                else:
-                    ui.label(f"成交样本不足{rule['median_min_samples']}件，暂无市价参考"
-                             ).classes("text-sm text-gray-400")
-                ui.space()
-                ui.label(f"{len(rows)} 件").classes("text-sm text-gray-400")
+        # 折叠摘要：折起来之后这一行就是你能看到的全部，所以预算/市价/捡漏线都要在里面
+        summary = [f"预算 {yen(rule['price_min'])}〜{yen(rule['price_max'])}"]
+        if med:
+            summary.append(f"市价中位 {yen(med)}（{st['sample_count']}件成交）")
+            if rule["deal_ratio"]:
+                summary.append(f"捡漏线 {yen(med * rule['deal_ratio'] // 100)}")
+        else:
+            summary.append(f"成交样本不足{rule['median_min_samples']}件，暂无市价参考")
+        deals = sum(1 for r in rows if r["is_deal"])
+        head = f"{rule['name']}　{len(rows)} 件" + (f"　🟢 {deals} 件捡漏" if deals else "")
 
+        # value=True＝默认展开。折叠状态只活在当前页面里，刷新后回到展开 ——
+        # 这正是想要的：命中列表是每次打开都要从头扫一遍的东西。
+        with ui.expansion(head, caption=" · ".join(summary), value=True) \
+                .classes("w-full mb-3").props("header-class=text-base"):
             if not rows:
                 ui.label("当前没有符合条件的在售商品。").classes("text-gray-400 text-sm")
                 continue

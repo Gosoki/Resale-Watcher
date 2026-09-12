@@ -68,16 +68,19 @@ try:
     for r in store.get_rules():
         st = store.get_state(r["id"])
         s = store.one("SELECT COUNT(*) t, SUM(matched) h FROM item WHERE rule_id=%s", (r["id"],))
+        live = store.one("SELECT COUNT(*) n FROM item WHERE rule_id=%s AND matched=1 "
+                         "AND status='on_sale'", (r["id"],))["n"]
         med = f"¥{st['median_price']:,}" if st["median_price"] else "样本不足"
         flag = "" if r["enabled"] else " [停用]"
-        print(f"  #{r['id']} {r['name']}{flag}  入库{s['t'] or 0}/命中{int(s['h'] or 0)}  "
-              f"市价中位 {med}（跨源{st['sample_count']}件）")
+        print(f"  #{r['id']} {r['name']}{flag}  入库{s['t'] or 0}  "
+              f"在售命中{live}（累计{int(s['h'] or 0)}）  市价中位 {med}（跨源{st['sample_count']}件）")
         for src in sources.for_rule(r):
             ss = store.get_source_state(r["id"], src.key)
-            n = store.one("SELECT COUNT(*) t, SUM(matched) h FROM item WHERE rule_id=%s AND source=%s",
-                          (r["id"], src.key))
+            n = store.one("SELECT COUNT(*) t, "
+                          "SUM(matched = 1 AND status = 'on_sale') h "
+                          "FROM item WHERE rule_id=%s AND source=%s", (r["id"], src.key))
             last = f"{ss['last_scan_at']:%m-%d %H:%M}" if ss["last_scan_at"] else "还没扫过"
-            print(f"       {src.name:<14} 在售{ss['last_total']:>4}  入库{n['t'] or 0:>3}/命中{int(n['h'] or 0):<3}  上次 {last}")
+            print(f"       {src.name:<14} 平台在售{ss['last_total']:>4}  入库{n['t'] or 0:>3}  在售命中{int(n['h'] or 0):<3}  上次 {last}")
             if ss["last_error"]:
                 print(f"         ⚠ {ss['last_error'][:70]}")
 except Exception as e:

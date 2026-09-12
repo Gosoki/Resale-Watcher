@@ -373,8 +373,11 @@ def rules_view() -> None:
     ui.button("新建规则", on_click=lambda: rule_dialog(None)).props("color=primary")
     for rule in store.get_rules():
         st = store.get_state(rule["id"])
+        # 【命中＝当前在售的命中】和「命中」页显示的是同一批。
+        # 用 SUM(matched) 会把已售出/已结束的历史命中也算进来，同一个词两个意思。
         stats = store.one(
-            "SELECT COUNT(*) total, SUM(matched) hit FROM item WHERE rule_id = %s", (rule["id"],))
+            "SELECT COUNT(*) total, SUM(matched = 1 AND status = 'on_sale') hit "
+            "FROM item WHERE rule_id = %s", (rule["id"],))
         with ui.card().classes("w-full my-2"):
             with ui.row().classes("items-center w-full gap-3"):
                 ui.label(rule["name"]).classes("text-base font-bold")
@@ -383,7 +386,7 @@ def rules_view() -> None:
                 ui.label(f'搜「{rule["keyword"]}」').classes("text-sm")
                 ui.label(f"{yen(rule['price_min'])}〜{yen(rule['price_max'])}").classes("text-sm")
                 ui.space()
-                ui.label(f"入库 {stats['total'] or 0} / 命中 {int(stats['hit'] or 0)}"
+                ui.label(f"入库 {stats['total'] or 0} · 在售命中 {int(stats['hit'] or 0)}"
                          ).classes("text-sm text-gray-400")
             ui.label(f"市价中位 {yen(st['median_price'])}"
                      f"（跨源 {st['sample_count']} 件成交）").classes("text-xs text-blue-400")
@@ -391,14 +394,15 @@ def rules_view() -> None:
             # 每个数据源单独一行：各源独立计时、独立限速，状态也分开看
             for src in sources.for_rule(rule):
                 ss = store.get_source_state(rule["id"], src.key)
-                n = store.one("SELECT COUNT(*) t, SUM(matched) h FROM item "
-                              "WHERE rule_id = %s AND source = %s", (rule["id"], src.key))
+                n = store.one("SELECT COUNT(*) t, SUM(matched = 1 AND status = 'on_sale') h "
+                              "FROM item WHERE rule_id = %s AND source = %s",
+                              (rule["id"], src.key))
                 with ui.row().classes("gap-3 text-xs text-gray-400 items-center"):
                     ui.badge(src.name, color="blue-grey")
                     ui.label(f"上次扫描 {ss['last_scan_at']:%m-%d %H:%M}"
                              if ss["last_scan_at"] else "还没扫过")
                     ui.label(f"在售 {ss['last_total']}")
-                    ui.label(f"入库 {n['t'] or 0} / 命中 {int(n['h'] or 0)}")
+                    ui.label(f"入库 {n['t'] or 0} · 在售命中 {int(n['h'] or 0)}")
                     if ss["truncated"]:
                         ui.label("⚠ 上次没扫全，售出对账已跳过").classes("text-orange-400")
                     if ss["last_error"]:

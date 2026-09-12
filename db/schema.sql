@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS watch_rule (
   enabled       TINYINT(1)    NOT NULL DEFAULT 1      COMMENT '1=启用 0=停用（停用的规则完全不发请求）',
 
   keyword       VARCHAR(128)  NOT NULL                COMMENT '搜索词，发给所有启用的数据源。宁可宽一点（如「RTX 5090」），精筛交给下面的词表',
-  sources       VARCHAR(64)   NOT NULL DEFAULT ''     COMMENT '这条规则要搜哪些数据源，逗号分隔（mercari / yahoo_flea）。留空=全部源',
+  sources       VARCHAR(64)   NOT NULL DEFAULT ''     COMMENT '这条规则要搜哪些数据源，逗号分隔（mercari / yahoo_flea / yahoo_auction）。留空=全部源',
 
   -- 【下面三个词表都是逗号分隔；匹配前会自动归一化：全角→半角、大写→小写、去空格、片假名统一】
   -- 所以填「5090」就能同时命中 RTX5090 / RTX 5090 / ＲＴＸ５０９０ 三种写法，不用自己列变体。
@@ -32,14 +32,14 @@ CREATE TABLE IF NOT EXISTS watch_rule (
   price_max     INT           NOT NULL DEFAULT 0      COMMENT '价格上限（日元，含）。0=不限。这是「合适」的硬门槛',
 
   condition_ids VARCHAR(32)   NOT NULL DEFAULT ''     COMMENT '品相白名单，逗号分隔。1=新品未使用 2=未使用に近い 3=目立った傷なし 4=やや傷あり 5=傷や汚れあり 6=全体的に状態が悪い。留空=不限',
-  allow_shops   TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '1=也收メルカリShops商家品（一般是溢价新品）0=只要个人出品',
+  allow_shops   TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '1=也收商家出品（メルカリShops / ヤフオク 的ストア出品，一般是溢价新品）0=只要个人出品。注意 Yahoo!フリマ 的接口不给商家标记，这一项对它不生效',
 
   check_desc    TINYINT(1)    NOT NULL DEFAULT 1      COMMENT '1=初筛通过后再拉一次商品详情读描述，用下面的 warn_desc 查一遍并打警示标签。关掉就完全不拉详情',
   warn_desc     VARCHAR(1024) NOT NULL DEFAULT ''     COMMENT '描述警示词，逗号分隔，只在描述里查。【命中只打标签，不会把商品毙掉】商品照样进命中列表，面板上带个黄标写明命中了哪个词，你点开自己判断。实测依据：「マイニング」在描述里出现 2 次、2 次都是卖家在否认（「マイニング使用しておらず」），真挖过矿的不会自招——描述词做否决的误杀风险远大于拦截价值',
 
   deal_ratio    INT           NOT NULL DEFAULT 85     COMMENT '捡漏线（%）：价格低于「近30天成交中位数 × 此值%」时额外标 is_deal。0=不算捡漏，只按价格区间判',
 
-  quick_min     INT           NOT NULL DEFAULT 7      COMMENT '快轮间隔（分钟）：多久扫一次新上架。实际会在此基础上随机抖动 ±20%',
+  quick_min     INT           NOT NULL DEFAULT 7      COMMENT '扫描间隔（分钟）：多久把该关键词的在售商品全扫一遍。实际会在此基础上随机抖动 ±20%',
 
   note          VARCHAR(255)  NOT NULL DEFAULT ''     COMMENT '备注，随便写',
   created_at    DATETIME      NOT NULL,
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS rule_source_state (
 -- 「这个商品在这条规则下合不合适」本来就是两条规则各有答案，合成一行反而要额外的关联表。
 -- source 放在最前：绝大多数查询都带 rule_id + source，而不同源的 ID 空间可能撞车。
 CREATE TABLE IF NOT EXISTS item (
-  source        VARCHAR(16)   NOT NULL                COMMENT '数据源：mercari / yahoo_flea',
+  source        VARCHAR(16)   NOT NULL                COMMENT '数据源：mercari / yahoo_flea / yahoo_auction',
   item_id       VARCHAR(32)   NOT NULL                COMMENT '该数据源里的商品ID（Mercari 形如 m + 11 位数字，Yahoo 形如 f/z/u + 10 位数字）',
   rule_id       INT           NOT NULL,
 
@@ -97,8 +97,8 @@ CREATE TABLE IF NOT EXISTS item (
   status        VARCHAR(12)   NOT NULL DEFAULT 'on_sale' COMMENT 'on_sale=在售 trading=交易中 sold_out=已售出 gone=搜索结果里消失且查无此商品（下架/删除）',
   condition_id  TINYINT       NULL                    COMMENT '品相 1~6，含义见 watch_rule.condition_ids。ヤフオク 的搜索结果不给品相，会是 NULL —— 此时品相白名单【不生效】（不知道 ≠ 不符合，宁可漏筛不可误杀）',
   item_type     VARCHAR(8)    NOT NULL DEFAULT 'user' COMMENT 'user=个人出品 shop=商家出品（メルカリShops 等）',
-  category_id   INT           NULL                    COMMENT 'Mercari 分类ID',
-  brand_name    VARCHAR(64)   NOT NULL DEFAULT ''     COMMENT '品牌名（Mercari 给的，经常为空或不准）',
+  category_id   INT           NULL                    COMMENT '该平台的分类ID（各家编号体系不同，不跨源比较）',
+  brand_name    VARCHAR(64)   NOT NULL DEFAULT ''     COMMENT '品牌名。只有 Mercari 和 Yahoo!フリマ 给，且经常为空或不准；ヤフオク 恒为空',
   seller_id     VARCHAR(24)   NOT NULL DEFAULT ''     COMMENT '卖家ID',
   thumb_url     VARCHAR(255)  NOT NULL DEFAULT ''     COMMENT '缩略图，面板里显示用',
 

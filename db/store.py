@@ -5,6 +5,7 @@ PyMySQL 的连接不是线程安全的，共享一条必然在某天撞出 "Pack
 局域网内建连接约几毫秒，而我们每轮只有几十次查询，省这点开销换来的并发 bug 不划算。
 """
 import contextlib
+import re
 import statistics
 import time
 from datetime import timedelta
@@ -34,9 +35,13 @@ def conn(db: bool = True):
         c.close()
 
 
+# 【args 为空时必须不传】PyMySQL 只要 args 不是 None 就会拿 SQL 去做 % 格式化，
+# 而我们的 DDL 注释里有「±20%」「百分之多少」这类字符 —— 一执行就报
+# "not enough arguments for format string"。这个坑只在无参数 SQL 上出现，
+# 平时带参数的查询碰不到，所以藏得很深。
 def query(sql: str, args=()) -> list[dict]:
     with conn() as c, c.cursor() as cur:
-        cur.execute(sql, args)
+        cur.execute(sql, args) if args else cur.execute(sql)
         return cur.fetchall()
 
 
@@ -46,9 +51,9 @@ def one(sql: str, args=()) -> dict | None:
 
 
 def execute(sql: str, args=()) -> int:
-    """返回受影响行数。"""
+    """返回受影响行数。args 为空时不传给驱动，理由见上面 query 的注释。"""
     with conn() as c, c.cursor() as cur:
-        cur.execute(sql, args)
+        cur.execute(sql, args) if args else cur.execute(sql)
         return cur.rowcount
 
 
@@ -67,7 +72,49 @@ def init_schema() -> None:
     with conn(db=False) as c, c.cursor() as cur:
         for s in stmts:
             cur.execute(s)
+    sync_column_comments()
     seed_settings()
+
+
+_COL_LINE = re.compile(r"^\s{2}(\w+)\s+.*COMMENT\s+'", re.I)
+
+
+def sync_column_comments() -> None:
+    """把 schema.sql 里的列注释同步到【已经存在】的表。
+
+    【为什么需要这一步】CREATE TABLE IF NOT EXISTS 只在建表那一刻写注释；
+    之后你改了 schema.sql 的 COMMENT，对已有的库毫无作用 —— 而 DDL 注释正是
+    这个项目让人看懂表的主要方式（面板和 Navicat 里看到的都是库里那一份）。
+    结果就是仓库里的文档和你实际看到的说明悄悄分叉。
+
+    做法是直接拿 schema.sql 里那一行原文去 MODIFY COLUMN，所以 schema.sql
+    始终是唯一真相。只对注释真的不一样的列动手，没变化的一列都不碰。
+    """
+    sql = SCHEMA_PATH.read_text(encoding="utf-8")
+    want: dict[tuple[str, str], str] = {}     # (表, 列) -> 该列在 schema.sql 里的完整定义
+    for m in re.finditer(r"CREATE TABLE IF NOT EXISTS (\w+) \((.*?)\n\) ENGINE", sql, re.S):
+        table, body = m.group(1), m.group(2)
+        for line in body.splitlines():
+            hit = _COL_LINE.match(line)
+            if hit:
+                want[(table, hit.group(1))] = line.strip().rstrip(",")
+
+    have = {(r["TABLE_NAME"], r["COLUMN_NAME"]): r["COLUMN_COMMENT"]
+            for r in query("SELECT TABLE_NAME, COLUMN_NAME, COLUMN_COMMENT "
+                           "FROM information_schema.columns WHERE table_schema = %s",
+                           (config.DB["database"],))}
+    fixed = 0
+    for (table, col), definition in want.items():
+        cur_comment = have.get((table, col))
+        if cur_comment is None:
+            continue                          # 表还没建（首次建库时本来就带着注释）
+        m = re.search(r"COMMENT\s+'((?:[^']|'')*)'", definition)
+        if not m or m.group(1).replace("''", "'") == cur_comment:
+            continue
+        execute(f"ALTER TABLE `{table}` MODIFY COLUMN {definition}")
+        fixed += 1
+    if fixed:
+        log.info("已把 %d 列的注释同步成 schema.sql 里的版本", fixed)
 
 
 # ---------------------------------------------------------------- 全局设置

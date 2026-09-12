@@ -176,13 +176,24 @@ def hits_view() -> None:
 
             for r in rows:
                 fresh = (config.now() - r["first_seen_at"]) < timedelta(hours=24)
-                with ui.row().classes("items-center w-full gap-3 border-t pt-2"):
+                # 【这一行的三个 class 是一组，缺一个价格就会被长标题挤下去】
+                #   flex-nowrap  外层三列（图/正文/价格）绝不换行 —— 没有它，
+                #                标题一长整个价格列会被挤到下一行去
+                #   items-start  标题换成两行时，价格保持在顶部对齐而不是浮到中间
+                #   正文列的 min-w-0 + 价格列的 shrink-0 见下面，是同一件事的另一半：
+                #   flex 子项默认 min-width:auto，不写 min-w-0 的话正文列会被内容
+                #   撑到超过容器宽度，把右边挤没
+                with ui.row().classes("items-start w-full gap-3 border-t pt-2 flex-nowrap"):
                     if r["thumb_url"]:
-                        ui.image(r["thumb_url"]).classes("w-16 h-16 object-cover rounded")
+                        ui.image(r["thumb_url"]).classes(
+                            "w-16 h-16 object-cover rounded shrink-0")
                     with ui.column().classes("gap-0 grow min-w-0"):
-                        with ui.row().classes("items-center gap-2"):
-                            ui.link(r["name"][:70], item_url(r["source"], r["item_id"]),
-                                    new_tab=True).classes("font-medium truncate")
+                        # flex-wrap：标题占满一行时，后面的徽标自己换到下一行
+                        with ui.row().classes("items-center gap-2 flex-wrap"):
+                            # 标题【不截断】，长了就换行（break-words 让超长的连续
+                            # 字符串——比如日文长串型号——也能断开，不会撑破容器）
+                            ui.link(r["name"], item_url(r["source"], r["item_id"]),
+                                    new_tab=True).classes("font-medium break-words")
                             if r["is_deal"]:
                                 ui.badge("捡漏", color="green")
                             if fresh:
@@ -201,7 +212,9 @@ def hits_view() -> None:
                                 ui.label(f"已降 {yen(r['first_price'] - r['price'])}"
                                          f"（首见 {yen(r['first_price'])}）").classes("text-red-400")
                             ui.label(f"上架 {r['listed_at']:%m-%d %H:%M}" if r["listed_at"] else "")
-                    with ui.column().classes("gap-0 items-end shrink-0"):
+                    # shrink-0：价格列宽度固定，不参与压缩
+                    # whitespace-nowrap：¥1,188,800 这种数字本身也绝不折行
+                    with ui.column().classes("gap-0 items-end shrink-0 whitespace-nowrap"):
                         # 来源放在价格正上方：这两个信息是一起看的 ——
                         # 同一个价格在哪个平台，直接决定你怎么去买
                         ui.badge(source_name(r["source"]), color="blue-grey").classes("mb-1")

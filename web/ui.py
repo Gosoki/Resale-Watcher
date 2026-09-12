@@ -131,13 +131,19 @@ def freshness(r: dict, hours: int, cold_start: bool) -> str:
 
     ヤフオク 的搜索结果不给上架时间，它的商品只可能是「新发现」。
     """
-    if cold_start:
-        # 规则刚开始监控，库里所有东西都是刚抓到的 —— 那时候全是新的，标了等于没标
-        return ""
     win = timedelta(hours=hours)
     now = config.now()
+
+    # 【新上架】判的是平台给的上架时间，和我们什么时候开始监控毫无关系 ——
+    # 所以冷启动【不】抑制它。之前把它也一起抑制了，结果规则刚建起来的头两天
+    # （fresh_hours 调到 48 就是两天）整页一个徽标都看不到，正是最想看的时候。
     if r["listed_at"] and now - r["listed_at"] < win:
         return "listed"
+
+    # 【新发现】判的是"我们刚抓到"。规则刚开始监控时库里所有东西都是刚抓到的，
+    # 这个标会糊满整页，那才是真的没有信息量 —— 只抑制它。
+    if cold_start:
+        return ""
     if now - r["first_seen_at"] < win:
         return "found"
     return ""

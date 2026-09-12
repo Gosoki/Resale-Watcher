@@ -188,21 +188,25 @@ def hits_view() -> None:
                         ui.image(r["thumb_url"]).classes(
                             "w-16 h-16 object-cover rounded shrink-0")
                     with ui.column().classes("gap-0 grow min-w-0"):
-                        # flex-wrap：标题占满一行时，后面的徽标自己换到下一行
-                        with ui.row().classes("items-center gap-2 flex-wrap"):
-                            # 标题【不截断】，长了就换行（break-words 让超长的连续
-                            # 字符串——比如日文长串型号——也能断开，不会撑破容器）
-                            ui.link(r["name"], item_url(r["source"], r["item_id"]),
-                                    new_tab=True).classes("font-medium break-words")
-                            if r["is_deal"]:
-                                ui.badge("捡漏", color="green")
-                            if fresh:
-                                ui.badge("新", color="orange")
-                            if r["desc_warn"]:
-                                # 描述里命中了警示词。商品没被毙掉，这里只是提醒你点开看一眼
-                                ui.badge(f"描述: {r['desc_warn']}", color="amber") \
-                                    .tooltip("描述里出现了这些词，但可能是卖家在否认（如"
-                                             "「ジャンク品ではありません」）。点标题自己看一眼")
+                        # 【徽标在标题上方】它们是"要不要点进去"的信号，得一眼看见。
+                        # 放在标题后面的话，遇到长标题（全库最长 130 字，超 70 字的有
+                        # 一百多件）就会被推到第二三行的行尾，等于没有。
+                        # 没有任何徽标时整行不渲染，不留空档。
+                        if r["is_deal"] or fresh or r["desc_warn"]:
+                            with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
+                                if r["is_deal"]:
+                                    ui.badge("捡漏", color="green")
+                                if fresh:
+                                    ui.badge("新", color="orange")
+                                if r["desc_warn"]:
+                                    # 描述里命中了警示词。商品没被毙掉，只是提醒你点开看一眼
+                                    ui.badge(f"描述: {r['desc_warn']}", color="amber") \
+                                        .tooltip("描述里出现了这些词，但可能是卖家在否认（如"
+                                                 "「ジャンク品ではありません」）。点标题自己看一眼")
+                        # 标题【不截断】，长了就换行（break-words 让超长的连续
+                        # 字符串——比如日文长串型号——也能断开，不会撑破容器）
+                        ui.link(r["name"], item_url(r["source"], r["item_id"]),
+                                new_tab=True).classes("font-medium break-words")
                         note, color = auction_note(r)
                         if note:
                             ui.label(note).classes(f"text-xs {color}")

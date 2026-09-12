@@ -440,6 +440,33 @@ def set_status(source: str, item_id: str, rule_id: int, status: str, sold_at=Non
                 (status, sold_at, source, item_id, rule_id))
 
 
+def pending_notify(rule_id: int, only_deal: bool) -> list[dict]:
+    """还没推送过的在售命中商品。
+
+    【条件里的 status = 'on_sale' 不能省】商品卖掉之后 matched 仍然是 1
+    （它当时确实合适），推一条"快看这个好货"过去而人点进去是已售出，
+    比不推还差。
+    """
+    sql = ("SELECT source, item_id, rule_id, name, price, is_deal, deal_pct, bid_count "
+           "FROM item WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' "
+           "AND notified_at IS NULL")
+    if only_deal:
+        sql += " AND is_deal = 1"
+    # 和面板同一个排序：最划算的排最前，万一撞上限被整批跳过也是先看到好的
+    return query(sql + " ORDER BY COALESCE(deal_pct, 999), price", (rule_id,))
+
+
+def mark_notified(rows: list[dict]) -> None:
+    """标成已推。推送成功与否都要标 —— 见 core/notify.py 里「失败也标已推」的说明。"""
+    if not rows:
+        return
+    keys = [(r["source"], r["item_id"], r["rule_id"]) for r in rows]
+    holes = ",".join(["(%s,%s,%s)"] * len(keys))
+    execute(f"UPDATE item SET notified_at = %s "
+            f"WHERE (source, item_id, rule_id) IN ({holes})",
+            (config.now(), *[v for k in keys for v in k]))
+
+
 def on_sale_items(rule_id: int, source: str) -> list[dict]:
     """这条规则在这个源下仍标为在售的商品 —— 扫完要拿它和搜索结果对账，找出卖掉/下架的。
 

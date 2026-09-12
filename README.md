@@ -194,11 +194,58 @@ Alienware、GALLERIA、Legion、Predator… 永远列不完。
 面板「**设置**」页（数据库 `app_setting` 表）放的是**对所有规则生效**的全局项：
 市价样本窗口 `median_window_days` / `median_min_samples`、请求间隔 `req_delay_min/max`、
 翻页上限 `max_pages`、成交轮间隔 `sold_scan_hours`、详情预算 `detail_budget`、
-消失宽限 `missing_grace_min`、每日请求上限 `daily_request_limit`。
+消失宽限 `missing_grace_min`、每日请求上限 `daily_request_limit`、
+推送 `notify_url` / `notify_body` / `notify_on` / `notify_max_per_round`。
 
 每一项在表里和面板上都带中文说明，改完 10 秒生效，不用重启。
 
 `.env` 里只剩改了**必须重启**的两样：数据库连接、Web 端口。
+
+### 推送：面板是用来复盘的，抓现货得靠推送
+
+本项目自己的数据就是这个功能的理由：RTX 5090 成交中位数 ¥78 万，在售最低 ¥93 万——
+**¥26 万〜93 万这一整段在售是空的**。好价的卡挂出来就被买走了，
+它从来没在面板上停留到你下次打开的那一刻。
+
+所以在「设置」页填上 `notify_url` 就会开始推送，**留空＝完全关闭，一个请求都不发**。
+
+不接某一家的 SDK，就是一个 URL 加一个请求体模板，常见的几家都能用：
+
+| 服务 | `notify_url` | `notify_body` |
+|---|---|---|
+| ntfy | `https://ntfy.sh/你的主题` | 留空 |
+| Bark | `https://api.day.app/你的KEY` | 留空 |
+| Discord | webhook 地址 | `{"content": "{text}"}` |
+| 企业微信 | 群机器人 webhook | `{"msgtype":"text","text":{"content":"{text}"}}` |
+| Telegram | `https://api.telegram.org/bot<TOKEN>/sendMessage` | `{"chat_id":"你的id","text":"{text}"}` |
+
+`{text}` 是提醒正文，填进 JSON 时会自动转义——日文商品名里的引号不会把模板撑破。
+
+推出去长这样：
+
+```
+🟢 捡漏 | RTX 4090 单卡
+MSI GeForce RTX 4090 VENTUS 3X E 24G OC 3ファン搭載 グラフィックスボード
+¥350,000（市价的 81%，中位 ¥427,800）
+🔨 拍卖 · 已 1 次出价 · 还会涨
+https://page.auctions.yahoo.co.jp/jp/auction/xxxxxxxxx
+```
+
+两个默认值是刻意的：
+
+- **只推捡漏**（`notify_on=deal`）。命中只是「符合你的条件」，捡漏才是「该立刻去看」。
+  所有命中都推的话，一条规则几十件在售会让你一天之内把推送关掉。要全推就改成 `matched`。
+- **一轮最多 5 条**（`notify_max_per_round`），**超了就一条都不推、全部标成已推**。
+  挡的是三种一次性井喷：刚填上 URL（库里几十件老命中一起轰出来）、停机几天后重启
+  （攒下的过期货）、放宽规则或改价格区间（几百件同时变命中）。
+  代价是真有一波好货时会被整批跳过，但那种情况面板上看得到；被几十条通知淹掉的人
+  只会直接把推送关了。
+
+还有一条要知道：**发送失败不重试**，失败也记成已推。一条迟到一小时的提醒没有意义，
+而对着挂掉的地址每轮重试会一直拖慢抓取、把日志刷满。失败会在日志里出声。
+
+> `notify_url` 等于一把钥匙，谁拿到都能往你手机推东西。别写进截图，也别提交进仓库。
+> 面板目前**没有鉴权**，所以别把它暴露到公网。
 
 ### 面板「全部」页会告诉你每一件是被哪个词判掉的
 
@@ -296,14 +343,19 @@ requests/day ≈ 规则数 × Σ各源页数 × (1440 / quick_min) + 详情与�
 | `watch_rule` | **你自己填的规则**：关键词、**数据源**、词表、价格区间、品相、捡漏线、扫描间隔 |
 | `rule_state` | 每条规则的市价中位数（跨源合并算） |
 | `rule_source_state` | 每条规则**在每个源上**的轮询进度、在售总数、是否被截断、最近报错 |
-| `item` | 抓到的商品 + 判定结果。主键 `(source, item_id, rule_id)`。`desc_warn` 是描述警示标签（**不参与** `matched`）；`end_time`/`bid_count`/`buy_now_price` 是拍卖三件套，只有 ヤフオク 会填满 |
+| `item` | 抓到的商品 + 判定结果。主键 `(source, item_id, rule_id)`。`desc_warn` 是描述警示标签（**不参与** `matched`）；`end_time`/`bid_count`/`buy_now_price` 是拍卖三件套，只有 ヤフオク 会填满；`notified_at` 记推送过没有（失败也记，不重试） |
 | `price_log` | 价格变动历史（只在价格真的变了时写一行） |
 | `sold_sample` | 成交价样本。`source` 是哪个网站，`sample_kind` 是怎么收集到的（`scan`＝成交轮扫的、只过了标题级规则；`tracked`＝我们一路跟到成交的，拉过详情最准） |
 | `daily_stat` | 每日请求计数（**按源**分开记，便于排查是哪个源在烧请求）。上限管的是全源合计 |
-| `app_setting` | **你自己填的全局设置**：市价样本窗口、抓取节奏、详情预算、每日上限。每行都带 `note` 说明 |
+| `app_setting` | **你自己填的全局设置**：市价样本窗口、抓取节奏、详情预算、每日上限、推送地址。每行都带 `note` 说明 |
 
 时间列一律由 Python 按 **Asia/Tokyo** 写入，不用 `DEFAULT CURRENT_TIMESTAMP`——
 数据库、开发机、部署机三边时区不保证一致。
+
+**改表结构不用删库**：往 `db/schema.sql` 里加一列、或改一句 `COMMENT`，
+下次启动会自动补到已有的库上（`db/store.py` 的 `sync_schema`）。
+反过来**只增不删**——库里有而 `schema.sql` 里没有的列一律原样留着，
+自动 DROP 一列就是不可逆地删数据。
 
 ---
 
@@ -347,7 +399,8 @@ sources/base.py    数据源抽象 + 公共的请求纪律（限速、退避、�
 sources/mercari.py     メルカリ（DPoP 签名的 JSON API）
 sources/yahoo_flea.py  Yahoo!フリマ（裸 GET JSON；描述从商品页 __NEXT_DATA__ 里挖）
 sources/yahoo_auction.py  ヤフオク（HTML + data-auction-* 属性；描述以「商品説明」为锚点切）
-core/poller.py     轮询编排：每源跑「扫在售 → 售出对账 → 补详情」，再跨源「重判 → 算捡漏」
+core/poller.py     轮询编排：每源跑「扫在售 → 售出对账 → 补详情」，再跨源「重判 → 算捡漏 → 推送」
+core/notify.py     推送：通用 webhook（URL + 请求体模板），留空即关闭
 db/schema.sql      建表 DDL，每列都有中文 COMMENT
 db/store.py        全部 SQL，每次操作开一条短连接
 web/ui.py          NiceGUI 面板：命中 / 全部 / 规则 / 设置 四页

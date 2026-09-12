@@ -572,12 +572,19 @@ def settings_view() -> None:
     fields: dict = {}
     for it in store.all_settings():
         with ui.card().classes("w-full my-1 py-2"):
-            comp = ui.number(it["k"], value=it["v"],
-                             format="%d" if it["type"] == "int" else "%.1f") \
-                .classes("w-full").props("dense outlined")
+            # 【字符串项必须用 ui.input】拿 ui.number 装 URL 会直接显示成空白，
+            # 而且保存时 value 是 None —— 看起来像"填了没保存上"。
+            if it["type"] == "str":
+                comp = ui.input(it["k"], value=it["v"]).classes("w-full").props("dense outlined")
+            else:
+                comp = ui.number(it["k"], value=it["v"],
+                                 format="%d" if it["type"] == "int" else "%.1f") \
+                    .classes("w-full").props("dense outlined")
             fields[it["k"]] = (comp, it)
-            ui.label(it["note"]).classes("text-xs text-gray-400")
-            ui.label(f"默认值：{it['default']}").classes("text-xs text-gray-400")
+            # 说明里有换行（推送那几项列了各家的地址格式），预留换行才看得清
+            ui.label(it["note"]).classes("text-xs text-gray-400 whitespace-pre-line")
+            ui.label(f"默认值：{it['default']!r}" if it["type"] == "str"
+                     else f"默认值：{it['default']}").classes("text-xs text-gray-400")
 
     # 这几项填 0 不是「关闭」而是各种翻车：
     #   sold_scan_hours=0  成交轮每 30 秒重跑一次
@@ -594,6 +601,11 @@ def settings_view() -> None:
         bad, bad_zero = [], []
         for k, (comp, it) in fields.items():
             val = comp.value
+            # 【字符串项的空值是合法的】notify_url 留空就是"关掉推送"，
+            # 走下面那条 bad 分支会变成"跳过不写"，于是根本关不掉。
+            if it["type"] == "str":
+                store.save_setting(k, val or "")
+                continue
             if val is not None and k in MUST_BE_POSITIVE:
                 try:
                     if float(val) <= 0:

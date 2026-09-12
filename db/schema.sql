@@ -115,6 +115,8 @@ CREATE TABLE IF NOT EXISTS item (
   is_deal       TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '1=低于捡漏线（价格 < 成交中位数 × deal_ratio%）',
   deal_pct      INT           NULL                    COMMENT '当前价是成交中位数的百分之多少。80 就是只要市价的八成',
 
+  notified_at   DATETIME      NULL                    COMMENT '推送过这件商品的时间。NULL=还没推过。【失败也会写】推送失败不重试：一条迟到一小时的提醒没有意义，而对着挂掉的地址每轮重试会拖慢抓取',
+
   desc_checked  TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '1=已拉过详情并用警示词查过描述',
   desc_warn     VARCHAR(128)  NOT NULL DEFAULT ''     COMMENT '描述里命中的警示词，逗号分隔。空=描述干净。【不影响 matched】只是提示你点开看一眼',
   description   MEDIUMTEXT    NULL                    COMMENT '商品描述原文，只有拉过详情的才有',

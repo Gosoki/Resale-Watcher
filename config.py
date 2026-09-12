@@ -98,6 +98,41 @@ SETTINGS_SPEC: dict[str, tuple[type, object, str]] = {
         "【所以加第三条规则、或把 quick_min 从 7 调到 5，都会当天撞线】"
         "动这两个值之前先把上限一起调大。",
     ),
+    # —— 推送 ——
+    "notify_url": (
+        str, "",
+        "推送地址。【留空＝不推送，一个请求都不发】。\n"
+        "填什么都行，常见的几家（都是实际接口形状）：\n"
+        "  ntfy      https://ntfy.sh/你的主题          （请求体模板留空）\n"
+        "  Bark      https://api.day.app/你的KEY       （请求体模板留空）\n"
+        "  Discord   webhook 地址                      （模板见 notify_body）\n"
+        "  企业微信  群机器人 webhook 地址             （模板见 notify_body）\n"
+        "  Telegram  https://api.telegram.org/bot<TOKEN>/sendMessage\n"
+        "【这个地址等于一把钥匙】谁拿到都能往你手机推东西，别写进截图或仓库。",
+    ),
+    "notify_body": (
+        str, "",
+        "请求体模板（JSON）。留空＝把提醒正文当纯文本直接发（ntfy / Bark 这么用）。\n"
+        "要发 JSON 就在这里写，用 {text} 占位提醒正文，会自动转义：\n"
+        '  Discord   {"content": "{text}"}\n'
+        '  企业微信  {"msgtype":"text","text":{"content":"{text}"}}\n'
+        '  Telegram  {"chat_id":"你的chat_id","text":"{text}"}',
+    ),
+    "notify_on": (
+        str, "deal",
+        "推什么：deal＝只推捡漏（低于市价中位数 × deal_ratio%）；matched＝所有命中都推。\n"
+        "【默认只推捡漏是有意的】命中只是「符合你的条件」，捡漏才是「该立刻去看」。"
+        "所有命中都推的话，一条规则几十件在售会让你很快关掉推送。\n"
+        "还没攒够成交样本时算不出中位数，也就没有捡漏 —— 那段时间填 deal 会一条都不推。",
+    ),
+    "notify_max_per_round": (
+        int, 5,
+        "一轮最多推几条。【超过就一条都不推，只把它们标成已推】——\n"
+        "挡的是三种一次性井喷：刚填上 notify_url（库里几十件老命中一起轰出来）、"
+        "停机几天后重启（攒下的过期货）、放宽规则或改价格区间（几百件同时变命中）。\n"
+        "代价是真有一波好货时会被整批跳过，但那种情况面板上看得到；"
+        "被几十条通知淹掉的人只会直接把推送关了。",
+    ),
 }
 
 LOG_DIR = BASE_DIR / "logs"

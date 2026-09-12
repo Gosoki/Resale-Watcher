@@ -21,6 +21,7 @@ from datetime import timedelta
 
 import config
 import sources
+from core import notify
 from core.matcher import flag_desc, is_deal, judge_snap
 from db import store
 
@@ -278,7 +279,7 @@ def scan_sold(src, rule: dict) -> dict:
 def run_once(rule: dict) -> dict:
     """跑一条规则的完整一轮（遍历它启用的所有源）。面板上的「立即跑一次」也走这里。"""
     srcs = sources.for_rule(rule)
-    agg = {"total": 0, "new": 0, "price_down": 0, "details": 0, "pages": 0}
+    agg = {"total": 0, "new": 0, "price_down": 0, "details": 0, "pages": 0, "notified": 0}
 
     for src in srcs:
         # 【每个源单独 try】否则第一个源被限流就会放弃剩下所有源，
@@ -298,6 +299,14 @@ def run_once(rule: dict) -> dict:
 
     agg["rejudged"] = revalidate(rule)
     mark_deals(rule)
+    # 【必须在 mark_deals 之后】只推捡漏时，is_deal 要先算出来才知道该推谁。
+    # 【整段包 try】推送是附属功能，它坏了不该让这一轮的抓取成果丢掉 ——
+    # push_new 内部已经吞掉了单条发送的异常，这里兜的是读库、读设置这些。
+    try:
+        agg["notified"] = notify.push_new(rule)
+    except Exception as e:                  # noqa: BLE001 - 推送故障不该拖垮抓取
+        log.warning("规则「%s」推送环节失败：%s", rule["name"], e)
+        agg["notified"] = 0
     agg["matched"] = store.one("SELECT COUNT(*) n FROM item WHERE rule_id = %s AND matched = 1 "
                                "AND status = 'on_sale'", (rule["id"],))["n"]
     log.info("规则「%s」合计：在售%d件 新增%d 降价%d 改判%d → 当前命中%d",

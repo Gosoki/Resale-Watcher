@@ -409,10 +409,18 @@ def _run_round(rules, stop_event) -> bool:
             # —— 在售扫描（主功能）——
             if _due(st["last_scan_at"], rule["quick_min"]):
                 try:
-                    scan_on_sale(src, rule)
-                    fetch_details(src, rule)
+                    stat = scan_on_sale(src, rule)
+                    stat["details"] = fetch_details(src, rule)
                     worked = True
                     store.update_source_state(rid, src.key, last_error="")
+                    # 【常驻轮询也要留下这一行】这条汇总原先只写在 run_once 里，
+                    # 而 run_once 只有面板的「立即跑一次」和 ./run.sh once 会走 ——
+                    # 也就是说正常部署方式下，每轮扫了几页、拉了几个详情，
+                    # 日志里一个字都没有，只有降价/警示这类异常事件才留痕。
+                    # 结果是「今天这些请求到底花在哪了」根本查不了。
+                    log.info("[%s] 规则「%s」在售%d件/扫%d页 新增%d 降价%d 读描述%d",
+                             src.key, rule["name"], stat["total"], stat["pages"],
+                             stat["new"], stat["price_down"], stat["details"])
                 except sources.DailyLimitReached as e:
                     log.warning("%s —— 今天不再发请求，等跨日", e)
                     store.update_source_state(rid, src.key, last_error=str(e)[:255])

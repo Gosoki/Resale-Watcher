@@ -77,23 +77,55 @@ def init_schema() -> None:
     with conn(db=False) as c, c.cursor() as cur:
         for s in stmts:
             cur.execute(s)
-    sync_column_comments()
+    sync_schema()
     seed_settings()
 
 
 _COL_LINE = re.compile(r"^\s{2}(\w+)\s+.*COMMENT\s+'", re.I)
 
 
-def sync_column_comments() -> None:
-    """把 schema.sql 里的列注释同步到【已经存在】的表。
+def plan_schema_changes(want: dict, have: dict) -> tuple[list, list]:
+    """对着 schema.sql（want）和库里的现状（have）算出要执行哪些 ALTER。
 
-    【为什么需要这一步】CREATE TABLE IF NOT EXISTS 只在建表那一刻写注释；
-    之后你改了 schema.sql 的 COMMENT，对已有的库毫无作用 —— 而 DDL 注释正是
-    这个项目让人看懂表的主要方式（面板和 Navicat 里看到的都是库里那一份）。
-    结果就是仓库里的文档和你实际看到的说明悄悄分叉。
+    拆成纯函数是为了能离线测 —— 尤其是「只增不删」这条：库里有、schema.sql
+    里没有的列必须原样留着。自动 DROP 一列就是不可逆地删数据，这个函数
+    永远不该产出 DROP。
 
-    做法是直接拿 schema.sql 里那一行原文去 MODIFY COLUMN，所以 schema.sql
-    始终是唯一真相。只对注释真的不一样的列动手，没变化的一列都不碰。
+    want: {(表, 列): schema.sql 里那一行完整定义}
+    have: {(表, 列): 该列在库里的 COMMENT}
+    返回 (要新增的, 要改注释的)，元素都是 (表, 列, 定义)。
+    """
+    tables = {t for t, _ in have}          # 库里已经存在的表
+    adds, mods = [], []
+    for (table, col), definition in want.items():
+        if table not in tables:
+            continue                        # 整张表还没建：CREATE TABLE 会连列带注释一起建出来
+        if (table, col) not in have:
+            adds.append((table, col, definition))
+            continue
+        m = re.search(r"COMMENT\s+'((?:[^']|'')*)'", definition)
+        if m and m.group(1).replace("''", "'") != have[(table, col)]:
+            mods.append((table, col, definition))
+    return adds, mods
+
+
+def sync_schema() -> None:
+    """把 schema.sql 的列定义同步到【已经存在】的表：补缺的列、改变了的注释。
+
+    【为什么需要这一步】CREATE TABLE IF NOT EXISTS 只在建表那一刻生效；
+    之后你往 schema.sql 里加一列、或改一句 COMMENT，对已有的库毫无作用。
+    注释分叉的后果是仓库里的文档和你在 Navicat 里看到的说明对不上；
+    少一列的后果更直接 —— 代码 SELECT 它的时候直接报 Unknown column，
+    而唯一的出路要么手写 ALTER，要么删库重建（那会丢掉攒了几天的成交样本，
+    也就是市价中位数的全部依据）。
+
+    做法是直接拿 schema.sql 里那一行原文去 ADD / MODIFY COLUMN，
+    所以 schema.sql 始终是唯一真相。
+
+    【只增不删】库里有、schema.sql 里没有的列一律不动。自动 DROP 一列
+    等于不可逆地删数据，宁可留着一列没人用的垃圾。
+    【只认带 COMMENT 的列】_COL_LINE 要求行里有 COMMENT，这也是本项目的约定：
+    每个有意义的列都写注释。不带注释的列（自增主键之类）不参与同步。
     """
     sql = SCHEMA_PATH.read_text(encoding="utf-8")
     # 【库名以 .env 为准】schema.sql 里写死了 CREATE DATABASE / USE 的库名，
@@ -113,18 +145,18 @@ def sync_column_comments() -> None:
             for r in query("SELECT TABLE_NAME, COLUMN_NAME, COLUMN_COMMENT "
                            "FROM information_schema.columns WHERE table_schema = %s",
                            (config.DB["database"],))}
-    fixed = 0
-    for (table, col), definition in want.items():
-        cur_comment = have.get((table, col))
-        if cur_comment is None:
-            continue                          # 表还没建（首次建库时本来就带着注释）
-        m = re.search(r"COMMENT\s+'((?:[^']|'')*)'", definition)
-        if not m or m.group(1).replace("''", "'") == cur_comment:
-            continue
+    adds, mods = plan_schema_changes(want, have)
+    for table, col, definition in adds:
+        # 【补列会走一遍全表】几百行的表眨眼就完，但表大了之后这一句会卡住启动，
+        # 所以日志里把每一列都点名，出问题时一眼看得出是谁在动表。
+        log.warning("表 %s 缺列 %s，按 schema.sql 补上", table, col)
+        execute(f"ALTER TABLE `{table}` ADD COLUMN {definition}")
+    for table, col, definition in mods:
         execute(f"ALTER TABLE `{table}` MODIFY COLUMN {definition}")
-        fixed += 1
-    if fixed:
-        log.info("已把 %d 列的注释同步成 schema.sql 里的版本", fixed)
+    if adds:
+        log.info("已补 %d 列", len(adds))
+    if mods:
+        log.info("已把 %d 列的注释同步成 schema.sql 里的版本", len(mods))
 
 
 # ---------------------------------------------------------------- 全局设置

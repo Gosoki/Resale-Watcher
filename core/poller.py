@@ -29,6 +29,16 @@ log = logging.getLogger("poller")
 # 描述没读到时写进 desc_warn 的标记。和真实的警示词区分开，面板上单独显示。
 DESC_UNREAD = "(描述未读到)"
 
+# 轮询心跳。面板靠它判断「采集是不是还活着」——
+# 没有它的话，线程静默死掉后进程照常在跑、面板照常打开、旧数据照常显示，
+# 只有「上次扫描」那个时间戳冻在死亡那一刻，而界面上没有任何地方说这不正常。
+_beat: dict = {"at": None}
+
+
+def heartbeat():
+    """轮询主循环最近一次转动的时间。None＝还没开始转。"""
+    return _beat["at"]
+
 
 def _due(last, interval_min: float) -> bool:
     """到点了没。间隔上抖 ±20%，免得每条规则都卡在整分钟上发请求。"""
@@ -293,6 +303,7 @@ def loop(stop_event) -> None:
     log.info("轮询启动，数据源：%s",
              "、".join(f"{s.name}({s.key})" for s in sources.all_sources().values()))
     while not stop_event.is_set():
+        _beat["at"] = config.now()
         try:
             rules = store.get_rules(enabled_only=True)
         except Exception as e:                              # noqa: BLE001 - 库抽风不该让进程死掉
@@ -301,62 +312,76 @@ def loop(stop_event) -> None:
             continue
 
         halted = False                      # 当天配额已耗尽：停掉所有规则所有源
-        for rule in rules:
-            if stop_event.is_set() or halted:
-                break
-            rid, worked = rule["id"], False
-
-            for src in sources.for_rule(rule):
-                if stop_event.is_set() or halted:
-                    break
-                st = store.get_source_state(rid, src.key)
-
-                # —— 成交轮（可有可无，失败绝不能影响下面的在售扫描）——
-                if _due(st["last_sold_at"], rule["sold_scan_hours"] * 60):
-                    try:
-                        scan_sold(src, rule)
-                        worked = True
-                    except sources.DailyLimitReached as e:
-                        log.warning("%s —— 今天不再发请求，等跨日", e)
-                        store.update_source_state(rid, src.key, last_error=str(e)[:255])
-                        halted = True
-                        break
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("[%s] 规则「%s」成交轮失败：%s", src.key, rule["name"], e)
-                        store.update_source_state(rid, src.key, last_error=str(e)[:255])
-
-                # —— 在售扫描（主功能）——
-                if _due(st["last_scan_at"], rule["quick_min"]):
-                    try:
-                        scan_on_sale(src, rule)
-                        fetch_details(src, rule)
-                        worked = True
-                        store.update_source_state(rid, src.key, last_error="")
-                    except sources.DailyLimitReached as e:
-                        log.warning("%s —— 今天不再发请求，等跨日", e)
-                        store.update_source_state(rid, src.key, last_error=str(e)[:255])
-                        halted = True
-                        break
-                    except sources.RateLimited as e:
-                        # 客户端里已经退避睡过了。这里【必须推进 last_scan_at】，
-                        # 否则 30 秒后又来一次，每次只为换回一个 429。
-                        log.warning("[%s] 规则「%s」被限流：%s —— 推迟一个周期",
-                                    src.key, rule["name"], e)
-                        store.update_source_state(rid, src.key, last_error=str(e)[:255],
-                                                  last_scan_at=config.now())
-                    except Exception as e:  # noqa: BLE001 - 单个源出错不该拖垮整个轮询
-                        log.exception("[%s] 规则「%s」出错", src.key, rule["name"])
-                        store.update_source_state(rid, src.key, last_error=str(e)[:255],
-                                                  last_scan_at=config.now())
-
-            if worked:
-                # 跨源的收尾：重判 + 捡漏。只在真扫过东西时做，没动静就别空跑。
-                try:
-                    revalidate(rule)
-                    mark_deals(rule)
-                except Exception:           # noqa: BLE001 - 纯本地计算，出错记下继续
-                    log.exception("规则「%s」重判/捡漏失败", rule["name"])
-
-        # 配额耗尽就睡长一点，别每 30 秒空转一圈
+        # 【整块包一层】下面 get_source_state / update_source_state 本身也会抛
+        # （数据库短暂拒连就够了），而它们不在任何 try 里 —— 异常会逐层逃出
+        # while 循环，daemon 线程静默死亡，此后再也不抓任何东西。
+        try:
+            _run_round(rules, stop_event)
+        except Exception:                   # noqa: BLE001 - 循环本身永不退出
+            log.exception("轮询主循环出错，本轮跳过")
         stop_event.wait(600 if halted else 30)
     log.info("轮询停止")
+
+
+def _run_round(rules, stop_event) -> bool:
+    """跑一轮：遍历每条规则的每个源。异常由调用方兜住，保证主循环不死。
+
+    返回 True 表示当天请求配额已耗尽，调用方应该睡久一点再回来。
+    """
+    halted = False
+    for rule in rules:
+        if stop_event.is_set() or halted:
+            break
+        rid, worked = rule["id"], False
+
+        for src in sources.for_rule(rule):
+            if stop_event.is_set() or halted:
+                break
+            st = store.get_source_state(rid, src.key)
+
+            # —— 成交轮（可有可无，失败绝不能影响下面的在售扫描）——
+            if _due(st["last_sold_at"], rule["sold_scan_hours"] * 60):
+                try:
+                    scan_sold(src, rule)
+                    worked = True
+                except sources.DailyLimitReached as e:
+                    log.warning("%s —— 今天不再发请求，等跨日", e)
+                    store.update_source_state(rid, src.key, last_error=str(e)[:255])
+                    halted = True
+                    break
+                except Exception as e:  # noqa: BLE001
+                    log.warning("[%s] 规则「%s」成交轮失败：%s", src.key, rule["name"], e)
+                    store.update_source_state(rid, src.key, last_error=str(e)[:255])
+
+            # —— 在售扫描（主功能）——
+            if _due(st["last_scan_at"], rule["quick_min"]):
+                try:
+                    scan_on_sale(src, rule)
+                    fetch_details(src, rule)
+                    worked = True
+                    store.update_source_state(rid, src.key, last_error="")
+                except sources.DailyLimitReached as e:
+                    log.warning("%s —— 今天不再发请求，等跨日", e)
+                    store.update_source_state(rid, src.key, last_error=str(e)[:255])
+                    halted = True
+                    break
+                except sources.RateLimited as e:
+                    # 客户端里已经退避睡过了。这里【必须推进 last_scan_at】，
+                    # 否则 30 秒后又来一次，每次只为换回一个 429。
+                    log.warning("[%s] 规则「%s」被限流：%s —— 推迟一个周期",
+                                src.key, rule["name"], e)
+                    store.update_source_state(rid, src.key, last_error=str(e)[:255],
+                                              last_scan_at=config.now())
+                except Exception as e:  # noqa: BLE001 - 单个源出错不该拖垮整个轮询
+                    log.exception("[%s] 规则「%s」出错", src.key, rule["name"])
+                    store.update_source_state(rid, src.key, last_error=str(e)[:255],
+                                              last_scan_at=config.now())
+
+        if worked:
+            # 跨源的收尾：重判 + 捡漏。只在真扫过东西时做，没动静就别空跑。
+            try:
+                revalidate(rule)
+                mark_deals(rule)
+            except Exception:           # noqa: BLE001 - 纯本地计算，出错记下继续
+                log.exception("规则「%s」重判/捡漏失败", rule["name"])
+    return halted

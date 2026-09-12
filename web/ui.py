@@ -1,11 +1,13 @@
 """NiceGUI 面板：改规则、看命中、调排除词。
 
-三个页签各对应一件事：
-  命中  —— 平时只看这一页：通过全部规则的在售商品，最便宜的排最前
-  全部  —— 调规则时看这一页：所有入库商品按「为什么被排除」分组，用来抓误杀
-  规则  —— 你自己填的那张表
+四个页签各对应一件事：
+  命中  —— 平时只看这一页：通过全部规则的在售商品，按规则折叠，
+            组内按「市价百分比」升序（最划算的排最前）
+  全部  —— 调规则时看这一页：一张平铺表，可按规则/判定原因筛选，
+            「具体原因」列会告诉你每一件是被哪个词判掉的
+  规则  —— 你自己填的那张表，以及每条规则在各个源上的轮询状态
+  设置  —— 全局项（抓取节奏、市价样本窗口、每日上限），改完 10 秒生效
 """
-import logging
 from datetime import timedelta
 
 from nicegui import run, ui
@@ -15,8 +17,6 @@ import sources
 from core import poller
 from core.matcher import explain
 from db import store
-
-log = logging.getLogger("web")
 
 # 暗色样式：ui.dark_mode(True) + ui.colors 定主色 + 这张表修 Quasar 在暗底上的两处短板。
 DARK_CSS = (
@@ -50,6 +50,9 @@ COND = {1: "新品未使用", 2: "未使用に近い", 3: "傷汚れなし",
 REASON_LABEL = {
     "": "合适", "price_over": "超预算", "price_under": "低于下限",
     "excluded_title": "标题排除词",
+    # no_keyword 平时不会入库（第一层判定直接丢弃），但 poller.revalidate 会用当前规则
+    # 重判【已在库】的商品 —— 你把必含词改严之后，老商品就会被写成这个原因留在库里
+    "no_keyword": "关键词不匹配",
     "condition": "品相不符", "shop_item": "Shops商家品",
     # 历史遗留：描述判定改成只打标签之后就不再产生这个原因了，留着只为看懂老数据
     "excluded_desc": "描述排除词(已废弃)",
@@ -196,7 +199,7 @@ def hits_view() -> None:
         if med:
             summary.append(f"市价中位 {yen(med)}（{st['sample_count']}件成交）")
             if rule["deal_ratio"]:
-                summary.append(f"捡漏线 {yen(med * rule['deal_ratio'] // 100)}")
+                summary.append(f"低于 {yen(med * rule['deal_ratio'] // 100)} 算捡漏")
         else:
             summary.append(f"成交样本不足{rule['median_min_samples']}件，暂无市价参考")
         deals = sum(1 for r in rows if r["is_deal"])
@@ -245,7 +248,15 @@ def hits_view() -> None:
                                         f"最近 {fresh_hours} 小时内才进我们的库。商品本身可能"
                                         "早就挂着了 —— 多半是它降价进了你的价格区间。"
                                         "ヤフオク 不提供上架时间，它的商品只会有这个标")
-                                if r["desc_warn"]:
+                                if r["desc_warn"] == poller.DESC_UNREAD:
+                                    # 【这不是警示词，是降级信号】详情页打开了但描述没解析出来
+                                    # （多半是平台改版）。画成普通警示徽标、还配一句
+                                    # 「可能是卖家在否认」的解释，等于用假信息盖住了
+                                    # 「警示层对这件商品整个失效」这个事实。
+                                    ui.badge("描述未读到", color="grey").tooltip(
+                                        "详情页打开了，但描述没解析出来（平台页面结构可能变了）。"
+                                        "这件商品的描述警示【没有生效】，点进去自己看一眼")
+                                elif r["desc_warn"]:
                                     # 描述里命中了警示词。商品没被毙掉，只是提醒你点开看一眼
                                     ui.badge(f"描述: {r['desc_warn']}", color="amber") \
                                         .tooltip("描述里出现了这些词，但可能是卖家在否认（如"
@@ -296,10 +307,15 @@ def all_view(rule_id: int | None, reason: str) -> None:
     rules = {r["id"]: r for r in store.get_rules()}
 
     ui.label(f"{len(rows)} 件（最多显示 300 件，按发现时间倒序）").classes("text-sm text-gray-400")
-    ui.table(
+    tbl = ui.table(
         columns=[
             {"name": "rule", "label": "规则", "field": "rule", "align": "left"},
             {"name": "src", "label": "来源", "field": "src", "align": "left", "sortable": True},
+            # 【放原始数字，不放格式化字符串】Quasar 的默认排序先判 isNumber，
+            # 拿到 "¥1,188,800" 这种字符串就退化成字典序 —— 升序会排成
+            # ¥1,188,800 < ¥12,000 < ¥2,000，最贵的跑到最前面。
+            # 而这一页正是用来「按价格找是不是上限卡太死」的，顺序假了就白看。
+            # 显示交给下面的 body-cell-price 插槽。
             {"name": "price", "label": "价格", "field": "price", "align": "right", "sortable": True},
             {"name": "reason", "label": "判定", "field": "reason", "align": "left", "sortable": True},
             {"name": "detail", "label": "具体原因", "field": "detail", "align": "left"},
@@ -310,7 +326,7 @@ def all_view(rule_id: int | None, reason: str) -> None:
             "id": f"{r['source']}-{r['item_id']}-{r['rule_id']}",
             "rule": (rules.get(r["rule_id"]) or {}).get("name", "?"),
             "src": source_name(r["source"]),
-            "price": yen(r["price"]),
+            "price": r["price"],
             "reason": REASON_LABEL.get(r["reject_reason"], r["reject_reason"]),
             "detail": explain(rules.get(r["rule_id"]) or {}, r),
             "status": {"on_sale": "在售", "sold_out": "已售出",
@@ -320,7 +336,15 @@ def all_view(rule_id: int | None, reason: str) -> None:
             "link": item_url(r["source"], r["item_id"]),
         } for r in rows],
         row_key="id", pagination=50,
-    ).add_slot("body-cell-name", r'''
+    )
+    # 【两个 add_slot 必须分开写】Element.add_slot() 返回的是 Slot 不是 Element，
+    # 链式接第二个 add_slot 会 AttributeError: 'Slot' object has no attribute 'add_slot'
+    tbl.add_slot("body-cell-price", r'''
+        <q-td :props="props" class="text-right">
+          {{ props.value == null ? "—" : "¥" + Number(props.value).toLocaleString() }}
+        </q-td>
+    ''')
+    tbl.add_slot("body-cell-name", r'''
         <q-td :props="props">
           <a :href="props.row.link" target="_blank" rel="noopener noreferrer"
              class="text-blue-400 hover:underline">{{ props.value }}</a>
@@ -358,8 +382,9 @@ def rule_dialog(rule: dict | None) -> None:
                 ui.number("捡漏线 %", value=data["deal_ratio"], format="%d") \
                     .props("dense outlined").bind_value(data, "deal_ratio") \
                     .tooltip("低于「成交中位数 × 此值%」时标捡漏。0=关闭")
-                ui.number("扫描间隔 分", value=data["quick_min"], format="%d") \
-                    .props("dense outlined").bind_value(data, "quick_min")
+                ui.number("扫描间隔 分", value=data["quick_min"], format="%d", min=1) \
+                    .props("dense outlined").bind_value(data, "quick_min") \
+                    .tooltip("至少 1 分钟。这个值直接决定对外发请求的频率")
             ui.input("品相白名单", value=data["condition_ids"]).classes("w-full") \
                 .props("dense outlined").bind_value(data, "condition_ids") \
                 .tooltip(FIELD_HELP["condition_ids"])
@@ -373,7 +398,8 @@ def rule_dialog(rule: dict | None) -> None:
                 ui.label("数据源").classes("text-sm")
                 for k in all_keys:
                     ui.switch(sources.get(k).name, value=picked[k]).bind_value(picked, k)
-            ui.label("全不选 = 全部源。各源独立计时、独立限速，一个被限流不影响另一个"
+            ui.label("全不选 = 全部源。各源的限速状态（退避档位、上次请求时间）互相独立，"
+                     "但轮询只有一条线程 —— 某个源退避期间，别的源那一轮会被顺延"
                      ).classes("text-xs text-gray-400 -mt-2")
 
             with ui.row().classes("gap-6"):
@@ -389,6 +415,25 @@ def rule_dialog(rule: dict | None) -> None:
             if not data["name"] or not data["keyword"]:
                 notify("规则名和搜索词不能为空", type="warning")
                 return
+            # 【quick_min 必须 ≥1，不能走 clean() 的 None→0】
+            # ui.number 被清空时 value 是 None，粘贴「7 分钟」这种带非数字的文本也是 None。
+            # 一旦落成 0，poller 的 _due(last, 0) 恒为真 —— 这条规则的每个源都会在
+            # 每 30 秒一次的 tick 上被整轮重扫，几小时就撞满 daily_request_limit，
+            # 然后【所有规则所有源】一起停抓到次日。
+            # 其它数字框的 0 是合法语义（价格上下限 0=不限、捡漏线 0=关闭），所以只拦这一个。
+            try:
+                qm = int(data.get("quick_min") or 0)
+            except (TypeError, ValueError):
+                qm = 0
+            if qm < 1:
+                notify("扫描间隔至少 1 分钟（填 0 会让这条规则每 30 秒全源重扫，"
+                       "几小时就会烧穿当天的请求配额）", type="warning")
+                return
+            data["quick_min"] = qm
+            # 这三个清空＝按各自的「不限 / 关闭」语义走，是合法的
+            for k in ("price_min", "price_max", "deal_ratio"):
+                if data.get(k) is None:
+                    data[k] = 0
             # ui.number 被清空时 value 是 None，而这些列都是 NOT NULL；
             # ui.switch 给的是 bool，ui.number 给的是 float —— 统一收成 int。
             def clean(v):
@@ -484,7 +529,9 @@ async def run_now(rule: dict) -> None:
     """面板上的手动试跑。走 io_bound 扔到线程里 —— 一轮要遍历所有源、发好几个请求、
     每个之间还要等 3〜8 秒，直接在事件循环里跑会把整个面板卡死。"""
     srcs = "、".join(x.name for x in sources.for_rule(rule))
-    notify(f"开始跑「{rule['name']}」（{srcs}），每个请求间隔 3〜8 秒，请稍候…")
+    st = store.get_settings()          # 别硬编码，这两个值在设置页可改
+    notify(f"开始跑「{rule['name']}」（{srcs}），"
+           f"每个请求间隔 {st['req_delay_min']:g}〜{st['req_delay_max']:g} 秒，请稍候…")
     try:
         stat = await run.io_bound(poller.run_once, store.get_rule(rule["id"]))
         notify(f"完成：在售{stat['total']}件 新增{stat['new']} "
@@ -522,7 +569,10 @@ def settings_view() -> None:
             store.save_setting(k, val)
         settings_view.refresh()
         if bad:
-            notify(f"已保存；{'、'.join(bad)} 留空了，会按默认值走", type="warning")
+            # 【原来写的是「会按默认值走」，和事实正好相反】代码是 continue 跳过不写，
+            # 库里的旧值继续生效。照着错提示操作的人会以为自己成功恢复了默认值。
+            notify(f"已保存。{'、'.join(bad)} 留空了——【没有改动】，库里原来的值继续生效；"
+                   f"要改请填具体数字", type="warning")
         else:
             notify("已保存，10 秒内生效")
 
@@ -545,12 +595,27 @@ def create() -> None:
             status = ui.label().classes("text-sm")
 
         def tick() -> None:
-            d = store.today_stat()
-            per = "  ".join(f"{source_name(x['source'])} {x['requests']}"
-                            for x in store.today_by_source())
-            status.text = (f"今日请求 {d['requests']}/{store.get_settings()['daily_request_limit']}"
-                           + (f"（{per}）" if per else "")
-                           + f"　失败 {d['errors']}　{config.now():%H:%M:%S}")
+            # 【先看采集还活着没】轮询线程崩掉后进程照常在跑、面板照常打开、
+            # 旧数据照常显示，只有「上次扫描」的时间戳冻住 —— 不主动报的话
+            # 你可能几天都以为它在监控。
+            beat = poller.heartbeat()
+            dead = beat is None or (config.now() - beat) > timedelta(minutes=3)
+            try:
+                d = store.today_stat()
+                per = "  ".join(f"{source_name(x['source'])} {x['requests']}"
+                                for x in store.today_by_source())
+                text = (f"今日请求 {d['requests']}/{store.get_settings()['daily_request_limit']}"
+                        + (f"（{per}）" if per else "")
+                        + f"　失败 {d['errors']}　{config.now():%H:%M:%S}")
+            except Exception as e:          # noqa: BLE001 - 数据库抽风不该让状态栏整个消失
+                text = f"⚠ 读数据库失败：{str(e)[:60]}"
+            if dead:
+                gap = f"（心跳停在 {beat:%H:%M:%S}）" if beat else "（从未启动）"
+                status.text = f"⚠ 轮询已停止{gap}　" + text
+                status.classes(replace="text-sm text-red-400 font-bold")
+            else:
+                status.text = text
+                status.classes(replace="text-sm")
 
         tick()
         ui.timer(10.0, tick)

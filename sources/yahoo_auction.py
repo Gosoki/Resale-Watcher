@@ -15,6 +15,14 @@
           锚点是界面文案不是构建哈希，相对可靠，但仍然是全项目最可能哪天悄悄坏掉的一处 ——
           所以提取失败一律返回空描述，绝不返回 None（那会被上层当成「商品没了」）。
 
+【isflea=1 的要滤掉】ヤфオク 的搜索结果里混着 Yahoo!フリマ 的商品，块上带
+`data-auction-isflea="1"`。而 フリマ 我们有独立的源在抓 —— 不滤掉就是同一件商品
+进两个源：面板上出现两遍，成交样本也会被记两次把中位数带偏。
+实测当前默认排序（おすすめ順）恰好一件 フリマ 都不返回，所以今天滤不滤结果一样；
+但加上 `&s1=new&o1=d` 立刻就混进来（rtx 5090：47 件 → 91 件，多出来的 44 件
+全是 isflea=1）。也就是说今天的"干净"只靠 Yahoo 默认排序的一个隐含前提撑着，
+对方改个默认值我们就会静默开始重复计数。这一行是那个前提的保险。
+
 【成交价不做】落札相場页（closedsearch）没有 data-auction-* 属性，只有构建哈希 class。
 为多一个市价样本源去扛一个每次发版就坏的解析器不划算 —— ヤフオク 的商品用
 メルカリ + Yahoo!フリマ 合并出来的市价中位数判捡漏，一样能用。
@@ -47,13 +55,16 @@ class YahooAuction(Source):
 
         begin = int(page_token or 1)
         html = self._call("GET", SEARCH_URL.format(kw=quote(keyword), n=PAGE_SIZE, b=begin)).text
-        items = [self._parse(blk) for blk in _blocks(html)]
+        blocks = _blocks(html)
+        items = [self._parse(blk) for blk in blocks if not _attr(blk, "isflea")]
         items = [x for x in items if x["item_id"]]
 
         # 【翻页终止靠"本页有没有装满"，不靠页面上那个「N件」】
         # 总数得从 HTML 文本里正则抠，而页面上任何一处「◯◯件」都可能先匹配上；
         # 拿它算终止条件，一旦抠错就会漏页或死循环。装不满＝到底了，这个判断不会错。
-        nxt = str(begin + len(items)) if len(items) >= PAGE_SIZE else ""
+        # 【按未过滤的块数推进】b= 是"从第几件开始"的偏移量，按过滤后的件数推进
+        # 会让下一页从已经看过的位置重新开始，越滤越退回去。
+        nxt = str(begin + len(blocks)) if len(blocks) >= PAGE_SIZE else ""
         m = re.search(r"([\d,]+)件", html)
         total = int(m.group(1).replace(",", "")) if m else len(items)
         return {"items": items, "next": nxt, "total": total}

@@ -46,6 +46,17 @@ SEARCH_HTML = '''
      data-auction-isshoppingitem="1" data-auction-auc-seller-id="seller_dummy_b"></a>
   </div>
 </li>
+<li class="Product"> <div class="Product__image">
+  <a class="Product__imageLink" data-auction-id="z0000000003"
+     data-auction-category="2084211540"
+     data-auction-title="新品未開封 GeForce RTX 5090 32G"
+     data-auction-img="https://auc-pctr.c.yimg.jp/i/z.jpg"
+     data-auction-price="930000" data-auction-buynowprice="0"
+     data-auction-endtime="" data-auction-startprice="930000"
+     data-auction-isflea="1" data-auction-isfreeshipping=""
+     data-auction-isshoppingitem="" data-auction-auc-seller-id=""></a>
+  </div>
+</li>
 </ul>
 <div class="footer">全 47件</div>
 '''
@@ -54,8 +65,31 @@ SEARCH_HTML = '''
 def test_按商品块切分_不会把同一件数成多件():
     # 【这是最容易踩的坑】整页 findall data-auction-id 会把一件商品数成两三件：
     # 实测一页 47 件商品能抠出 141 个 id
-    assert len(_blocks(SEARCH_HTML)) == 2
-    assert SEARCH_HTML.count('data-auction-id=') == 3      # 确认 fixture 里确实有重复
+    assert len(_blocks(SEARCH_HTML)) == 3
+    assert SEARCH_HTML.count('data-auction-id=') == 4      # 确认 fixture 里确实有重复
+
+
+def test_フリマ商品被滤掉_不和独立的フリマ源重复():
+    """搜索结果里 isflea=1 的是 Yahoo!フリマ 的货，我们有独立的源在抓它们。
+
+    不滤掉＝同一件商品进两个源：面板上出现两遍，成交样本记两次把中位数带偏。
+    fixture 里第三件就是 isflea=1，必须被挡在外面。
+    """
+    kept = [b for b in _blocks(SEARCH_HTML) if not _attr(b, "isflea")]
+    assert [_attr(b, "id") for b in kept] == ["m0000000001", "u0000000002"]
+    assert _attr(_blocks(SEARCH_HTML)[2], "isflea") == "1"   # 确认 fixture 里真有一件
+
+
+def test_翻页偏移按未过滤的块数推进():
+    """b= 是"从第几件开始"的偏移量，按过滤后的件数推进会退回去重抓。
+
+    3 个块里滤掉 1 个 フリマ，下一页仍必须从 +3 处开始，不是 +2。
+    """
+    blocks = _blocks(SEARCH_HTML)
+    kept = [b for b in blocks if not _attr(b, "isflea")]
+    assert len(blocks) == 3 and len(kept) == 2
+    assert 1 + len(blocks) == 4      # 正确：下一页从第 4 件开始
+    assert 1 + len(kept) == 3        # 错误的写法会退回去重抓第 3 件
 
 
 def test_取属性只取块里第一个():
@@ -164,8 +198,10 @@ def test_本页装不满就是最后一页():
     src = YahooAuction()
     src._call = lambda *a, **k: type("R", (), {"text": SEARCH_HTML, "status_code": 200})()
     r = src.search("RTX 5090")
+    # fixture 是 3 个块，其中 1 件 isflea=1 被滤掉 —— 这个 2 是"3 减 1"，
+    # 不是"fixture 里有 2 件"。终止判断用的是过滤【前】的 3 块。
     assert len(r["items"]) == 2
-    assert r["next"] == ""              # 只有 2 件 < PAGE_SIZE，到底了
+    assert r["next"] == ""              # 3 块 < PAGE_SIZE，到底了
 
 
 def test_成交检索直接返回空_不发请求():

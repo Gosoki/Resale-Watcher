@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.env*
+!.env.example
+logs/
+*.log
+.pytest_cache/
+
+# macOS / 编辑器（现在没有，但迟早会自己冒出来）
+.DS_Store
+.idea/
+.vscode/
+
+# 运行时可能产生的本地数据（现在没有，先占位）
+data/
+*.sqlite3

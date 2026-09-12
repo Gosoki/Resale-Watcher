@@ -1,0 +1,41 @@
+"""文本归一化 —— 「精准」的地基。
+
+Mercari 的标题是人手打的，同一块卡实测有这些写法：
+    RTX 5090 / RTX5090 / ＲＴＸ５０９０ / rtx-5090 / GeForce　RTX　5090（全角空格）
+「ジャンク」也有 ジャンク / ｼﾞｬﾝｸ / じゃんく 三种。
+如果不归一化，你就得在规则表里手工穷举所有变体，那张表会变得没法维护。
+
+做法：NFKC → 小写 → 只保留字母数字假名汉字（空格和 -・/ 这类符号全删）。
+归一化后一律用子串判断，所以规则里填「5090」就能命中上面全部写法。
+"""
+import re
+import unicodedata
+
+_SPLIT = re.compile(r"[,，、;；\n\r\t]+")
+
+
+def norm(text: str | None) -> str:
+    if not text:
+        return ""
+    # NFKC 一步搞定全角英数→半角、半角片假名→全角片假名（ｼﾞｬﾝｸ→ジャンク）。
+    s = unicodedata.normalize("NFKC", text).lower()
+    # isalnum() 对假名和汉字都是 True，对长音符「ー」也是 True（Unicode 类别 Lm），
+    # 所以 ゲーミング 不会被拆坏；空格、-、・、/、【】等符号则全部消失。
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def word_pairs(csv: str | None) -> list[tuple[str, str]]:
+    """返回 [(你填的原词, 归一化后的词), …]。
+
+    匹配要用归一化后的，但面板上的警示标签要显示你填进去的那个写法 ——
+    回显「ジャンク」比回显归一化结果更容易看懂自己的词表哪里写错了。
+    """
+    if not csv:
+        return []
+    return [(p.strip(), norm(p)) for p in _SPLIT.split(csv) if norm(p)]
+
+
+def words(csv: str | None) -> list[str]:
+    """把规则表里逗号分隔的词表拆开并逐个归一化。半角/全角逗号、顿号、分号、换行都认。"""
+    return [n for _raw, n in word_pairs(csv)]
+

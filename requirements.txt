@@ -1,0 +1,10 @@
+# 采集：httpx（HTTP/2，这几家站点都只提供 HTTP/2）；cryptography 用来给 Mercari 的 DPoP 头做 ES256 签名
+httpx[http2]>=0.27
+cryptography>=42.0
+# 存储：只用 PyMySQL + 手写 SQL。表就四张，上 ORM 换不来任何好处，
+# 反而会让 DDL 里的中文 COMMENT（你在面板和 GUI 客户端里看到的那些说明）没地方写。
+pymysql>=1.1
+# 面板
+nicegui>=1.4
+python-dotenv>=1.0
+pytest>=8.0   # 匹配逻辑的回归测试：./run.sh test

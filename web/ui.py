@@ -182,11 +182,16 @@ def hits_view() -> None:
                 #   正文列的 min-w-0 + 价格列的 shrink-0 见下面，是同一件事的另一半：
                 #   flex 子项默认 min-width:auto，不写 min-w-0 的话正文列会被内容
                 #   撑到超过容器宽度，把右边挤没
-                with ui.row().classes("items-start w-full gap-3 border-t pt-2 flex-nowrap"):
+                with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
                     if r["thumb_url"]:
+                        # 96px：正文列在「徽标+标题两行+拍卖提示+品相行」时约 90px 高，
+                        # 图跟着长到差不多，两边才齐。64px 时右边明显空一块，
+                        # 看起来就像行距被撑开了。
                         ui.image(r["thumb_url"]).classes(
-                            "w-16 h-16 object-cover rounded shrink-0")
-                    with ui.column().classes("gap-0 grow min-w-0"):
+                            "w-24 h-24 object-cover rounded shrink-0")
+                    # leading-snug：正文是 3~4 行小字堆起来的，默认行高留白偏多，
+                    # 累积下来整张卡片会显得松垮
+                    with ui.column().classes("gap-0 grow min-w-0 leading-snug"):
                         # 【徽标在标题上方】它们是"要不要点进去"的信号，得一眼看见。
                         # 放在标题后面的话，遇到长标题（全库最长 130 字，超 70 字的有
                         # 一百多件）就会被推到第二三行的行尾，等于没有。

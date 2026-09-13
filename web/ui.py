@@ -609,16 +609,18 @@ def track_view() -> None:
 
 def _track_row(r: dict, rule: dict, st: dict) -> None:
     """布局和命中页同一套，理由见那边的注释。"""
-    gone = r["status"] in ("sold_out", "gone")
     with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
         # 和命中页同一颗星：这里它一定是实心的，点一下就是取消追踪
         thumb_with_star(r, r["rule_id"])
         with ui.column().classes("gap-0 grow min-w-0 leading-snug self-stretch"):
             with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
-                if r["status"] == "sold_out":
-                    ui.badge("已卖掉", color="grey")
-                elif r["status"] == "gone":
-                    ui.badge("已下架", color="grey")
+                # 【这里不会有"已卖掉"】商品一进终态就被自动摘掉追踪了（见
+                # store.set_status），所以这一页只剩还活着的。
+                # trading 是唯一会出现的非在售状态，而且它最值得标出来：
+                # 有人正在买，你要么立刻跟，要么死心。
+                if r["status"] == "trading":
+                    ui.badge("交易中", color="amber").tooltip(
+                        "有人已经在买了。Mercari 上付款后会先进这个状态，成交才变已售出")
                 elif r["is_deal"]:
                     ui.badge("捡漏", color="green")
                 if r["price"] < r["first_price"]:
@@ -629,7 +631,7 @@ def _track_row(r: dict, rule: dict, st: dict) -> None:
             ui.link(r["name"], item_url(r["source"], r["item_id"]),
                     new_tab=True).classes("font-medium break-words")
             note, color = auction_note(r)
-            if note and not gone:
+            if note:
                 ui.label(note).classes(f"text-xs {color}")
             with ui.row().classes(
                     "gap-3 text-xs text-gray-400 items-center mt-auto pt-1"):
@@ -641,8 +643,7 @@ def _track_row(r: dict, rule: dict, st: dict) -> None:
         with ui.column().classes(
                 "gap-0 items-end shrink-0 whitespace-nowrap self-stretch"):
             ui.badge(source_name(r["source"])).classes(BADGE_LABEL + " mb-1")
-            ui.label(yen(r["price"])).classes(
-                "text-lg font-bold" + (" line-through text-gray-500" if gone else ""))
+            ui.label(yen(r["price"])).classes("text-lg font-bold")
             if r["deal_pct"]:
                 ui.label(f"市价的 {r['deal_pct']}%").classes(
                     "text-xs " + ("text-green-400" if r["deal_pct"] < 100 else "text-gray-400"))

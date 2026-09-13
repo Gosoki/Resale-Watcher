@@ -332,9 +332,10 @@ def refresh_tracked() -> int:
         # 下一轮它照样到点、照样白烧一个请求 —— 和售出对账那边是同一个坑。
         store.touch_seen(r["source"], r["item_id"], r["rule_id"])
         store.update_tracked(r["source"], r["item_id"], r["rule_id"], d, r["price"])
-        if d["status"] == "sold_out":
-            log.info("[%s] 追踪中的「%s」卖掉了 ¥%s",
-                     r["source"], r["name"][:30], f"{d['price']:,}")
+        if d["status"] in store.TERMINAL:
+            log.info("[%s] 追踪中的「%s」%s ¥%s —— 已自动取消追踪，去「成交」页看",
+                     r["source"], r["name"][:30],
+                     "卖掉了" if d["status"] == "sold_out" else "下架了", f"{d['price']:,}")
     if done:
         log.info("追踪刷新 %d 件（追踪中共 %d 件，每轮上限 %d）",
                  done, len(store.tracked_items()), s["track_budget"])

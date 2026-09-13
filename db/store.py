@@ -452,14 +452,28 @@ def set_deal(source: str, item_id: str, rule_id: int, is_deal: int, deal_pct: in
             (is_deal, deal_pct, source, item_id, rule_id))
 
 
+# 终态：到了这两个状态，商品不会再变了
+TERMINAL = ("sold_out", "gone")
+
+
 def set_status(source: str, item_id: str, rule_id: int, status: str, sold_at=None) -> None:
+    """改状态。【进终态时顺手摘掉追踪】
+
+    卖掉/下架的商品再追也没意义 —— tracked_due 本来就不会再为它发请求，
+    但不摘的话它会一直挂在追踪页上，追的件数越积越多，而那个数字正是
+    "每天多烧多少请求"的分母，看着就不准了。
+    在这里摘是因为【所有改终态的路径都经过这个函数】（poller 里 6 个调用点），
+    放到调用方去摘迟早会漏掉一条，而漏掉的表现是"有商品永远摘不掉"。
+    商品本身不会丢：它照常出现在「成交」页。
+    """
+    clear = ", tracked_at = NULL" if status in TERMINAL else ""
     if sold_at is None:
-        execute("UPDATE item SET status = %s "
-                "WHERE source = %s AND item_id = %s AND rule_id = %s",
+        execute(f"UPDATE item SET status = %s{clear} "
+                f"WHERE source = %s AND item_id = %s AND rule_id = %s",
                 (status, source, item_id, rule_id))
     else:
-        execute("UPDATE item SET status = %s, sold_at = %s "
-                "WHERE source = %s AND item_id = %s AND rule_id = %s",
+        execute(f"UPDATE item SET status = %s, sold_at = %s{clear} "
+                f"WHERE source = %s AND item_id = %s AND rule_id = %s",
                 (status, sold_at, source, item_id, rule_id))
 
 
@@ -511,6 +525,10 @@ def update_tracked(source: str, item_id: str, rule_id: int, d: dict, old_price: 
         sets.append("status = %s"); args.append(d["status"])
         if d["status"] == "sold_out":
             sets.append("sold_at = %s"); args.append(now)
+        # 【这里也要摘】这个函数绕开了 set_status 直接写 status，
+        # 只在那边摘的话，恰好在追踪刷新里卖掉的商品会漏网。
+        if d["status"] in TERMINAL:
+            sets.append("tracked_at = NULL")
     if d.get("bid_count") is not None:
         sets.append("bid_count = %s"); args.append(d["bid_count"])
     if d.get("ship_from"):

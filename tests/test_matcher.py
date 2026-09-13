@@ -225,3 +225,22 @@ def test_手动价填0等于没填():
 def test_百分比照常给出_pct_供参考():
     """pct 是给人看的参考，和判定是两件事：手动价生效时它照样按中位数算。"""
     assert is_deal(650_000, 785_000, 0, 700_000)[1] == 82
+
+
+# ---------------------------------------------------------------- 追踪的终态
+
+def test_进终态就摘掉追踪_每条路径都要覆盖():
+    """【为什么写在 store 层而不是调用方】把 status 改成 sold_out/gone 的路径有两条：
+    set_status（poller 里 6 个调用点都走它）和 update_tracked（追踪刷新自己写）。
+    放到调用方去摘迟早漏掉一条，而漏掉的表现是「有商品永远摘不掉」——
+    追的件数是"每天多烧多少请求"的分母，挂着死货会让那个数字失真。
+    """
+    import inspect
+
+    from db import store
+
+    assert store.TERMINAL == ("sold_out", "gone")
+    for fn in (store.set_status, store.update_tracked):
+        src = inspect.getsource(fn)
+        assert "tracked_at = NULL" in src, f"{fn.__name__} 进终态时没摘追踪"
+        assert "TERMINAL" in src, f"{fn.__name__} 应该用 TERMINAL 判终态，别各写各的"

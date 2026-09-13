@@ -67,7 +67,15 @@ class YahooFlea(Source):
             "description": item.get("description") or "",
             "price": int(item.get("price") or 0),
             "name": item.get("title") or "",
-            "status": {"OPEN": "on_sale", "SOLD": "sold_out"}.get(item.get("itemStatus"), ""),
+            # 【详情页叫 status，搜索接口叫 itemStatus】同一个源两套字段名：
+            # 搜索结果里是 itemStatus='OPEN'，商品页的 __NEXT_DATA__ 里是 status='SOLD'，
+            # 而且两边互相没有对方那个键。这里原先照搬了搜索那套名字，于是
+            # detail() 对【每一件】フリマ 商品都返回空状态 —— 售出对账拿到空串就
+            # 「保持原状下轮再看」，结果是这个源的商品【永远确认不了卖掉】：
+            # 卖掉的货一直挂在命中页上，tracked 成交样本（最准的市价依据）一条都采不到。
+            # 实测 z682112666 平台上是 SOLD，我们库里却一直是在售。
+            "status": {"OPEN": "on_sale", "SOLD": "sold_out"}.get(
+                item.get("status") or item.get("itemStatus"), ""),
             "ship_from": pref_of(item.get("location")),
         }
 

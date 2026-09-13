@@ -69,3 +69,34 @@ def test_不能用切到第一个都道府県字的写法():
     assert pref_of("京都府 左京区") == "京都府"
     # 反过来：東京都 不能被误判成 京都府
     assert pref_of("東京都") == "東京都"
+
+
+# ---------------------------------------------------------------- 售出状态
+
+def test_フリマ的详情页和搜索接口用两套字段名():
+    """【这条是踩出来的，代价很大】同一个源：
+      搜索接口   itemStatus='OPEN'   （没有 status 键）
+      商品详情页 status='SOLD'        （没有 itemStatus 键）
+    detail() 原先照搬了搜索那套名字，于是【每一件】フリマ 商品的详情都返回空状态。
+    售出对账拿到空串走「保持原状下轮再看」—— 这个源的商品永远确认不了卖掉：
+    卖掉的货一直挂在命中页上，tracked 成交样本（最准的市价依据）一条都采不到。
+    库里实测：yahoo_flea 124 件在售、0 件已售出。
+    """
+    import inspect
+
+    from sources import yahoo_flea
+
+    src = inspect.getsource(yahoo_flea.YahooFlea.detail)
+    assert 'item.get("status")' in src, "detail() 必须读详情页的 status 字段"
+
+
+def test_两个字段名的映射都认():
+    """留着 itemStatus 兜底：万一哪天详情页改回去，不至于又整源失效。"""
+    m = {"OPEN": "on_sale", "SOLD": "sold_out"}
+    for item, want in (({"status": "SOLD"}, "sold_out"),
+                       ({"status": "OPEN"}, "on_sale"),
+                       ({"itemStatus": "SOLD"}, "sold_out"),
+                       ({"status": None, "itemStatus": "OPEN"}, "on_sale"),
+                       ({}, "")):
+        got = m.get(item.get("status") or item.get("itemStatus"), "")
+        assert got == want, (item, got, want)

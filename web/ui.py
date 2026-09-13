@@ -372,6 +372,138 @@ def _act_label(row: dict, rule: dict) -> str:
     return "拉黑" if _can_blacklist(row, rule) else "已拉黑"
 
 
+# ------------------------------------------------------------------ 成交页
+
+@ui.refreshable
+def sold_view() -> None:
+    """成交页：市场实际用什么价把什么货清掉了。
+
+    【为什么要单独一栏】命中页回答「现在有什么能买」，靠的是和市价中位数比。
+    但那个中位数是个单一数字，看不出它底下的分布：是十几件挤在一个价位，
+    还是从 40 万到 90 万拉了一条长线。定价前要看的是后者。
+
+    两类数据粒度不同，都得摆出来：
+      跟到成交的  item.status='sold_out'，有标题缩略图，能看清「什么货、什么价、
+                  降了多少才卖掉」。只有走完「我们一直在跟 → 它从搜索结果消失 →
+                  对账确认售出」这条链路的才会进来，所以量少但信息最全。
+      成交价样本  sold_sample，只有价格和时间（成交轮按标题级规则扫来的，没拉详情），
+                  量大，是中位数的实际依据。
+    """
+    rules = store.get_rules()
+    if not rules:
+        ui.label("还没有规则，去「规则」页新建一条。").classes("text-gray-400 p-4")
+        return
+
+    for rule in rules:
+        rid = rule["id"]
+        st = store.get_state(rid)
+        med = st["median_price"]
+        tracked = store.query(
+            "SELECT * FROM item WHERE rule_id = %s AND status = 'sold_out' "
+            "ORDER BY sold_at DESC", (rid,))
+        samples = store.query(
+            "SELECT source, price, sold_at, sample_kind FROM sold_sample "
+            "WHERE rule_id = %s ORDER BY sold_at DESC LIMIT 80", (rid,))
+
+        # 折叠摘要：折起来后这一行就是全部，所以中位数和价格区间都要在里面
+        cap = [f"近{rule['median_window_days']}天"]
+        if samples:
+            ps = sorted(x["price"] for x in samples)
+            cap.append(f"成交 {len(samples)} 件　{yen(ps[0])} 〜 {yen(ps[-1])}")
+        if med:
+            cap.append(f"中位 {yen(med)}")
+            if rule["deal_ratio"]:
+                cap.append(f"捡漏线 {yen(med * rule['deal_ratio'] // 100)}")
+        else:
+            cap.append(f"样本不足 {rule['median_min_samples']} 件，暂不出中位数")
+        head = f"{rule['name']}　成交样本 {len(samples)} 件" + (
+            f"　🔗 跟到成交 {len(tracked)} 件" if tracked else "")
+
+        with ui.expansion(head, caption="　·　".join(cap), value=True) \
+                .classes("w-full mb-3").props("header-class=text-base"):
+            if not samples and not tracked:
+                ui.label("还没有成交数据。成交轮每 "
+                         f"{rule['sold_scan_hours']} 小时跑一次，跑过之后这里才有东西。"
+                         ).classes("text-gray-400 text-sm")
+                continue
+
+            if tracked:
+                ui.label("我们一路跟到成交的（拉过详情、过了完整规则，信息最全）") \
+                    .classes("text-sm text-gray-300 mt-1")
+                with ui.element("div").classes(
+                        "grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
+                    for r in tracked:
+                        _sold_row(r, med)
+
+            if samples:
+                ui.label(f"成交价样本（{len(samples)} 件，中位数就是按这些算的）") \
+                    .classes("text-sm text-gray-300 mt-3")
+                _sample_table(samples, med)
+
+
+def _sold_row(r: dict, med: int | None) -> None:
+    """一件跟到成交的商品。布局和命中页同一套，理由见那边的注释。"""
+    with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
+        if r["thumb_url"]:
+            ui.image(r["thumb_url"]).classes("w-24 h-24 object-cover rounded shrink-0")
+        with ui.column().classes("gap-0 grow min-w-0 leading-snug"):
+            with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
+                ui.badge("已成交", color="grey")
+                if r["ship_from"] == TOKYO:
+                    ui.badge(TOKYO, color="teal")
+                if r["is_deal"]:
+                    # 卖掉的捡漏货 = 你错过的那些。摆出来是为了让你知道
+                    # 这个价位真的会被人买走，下次别犹豫。
+                    ui.badge("曾是捡漏", color="green").tooltip(
+                        "它在售时低于捡漏线 —— 也就是这个价位确实有人接")
+            ui.link(r["name"], item_url(r["source"], r["item_id"]),
+                    new_tab=True).classes("font-medium break-words")
+            with ui.row().classes("gap-3 text-xs text-gray-400 items-center"):
+                ui.label(f"{r['sold_at']:%m-%d %H:%M} 成交" if r["sold_at"] else "成交时间未知")
+                if r["ship_from"]:
+                    ui.label(f"发货 {r['ship_from']}")
+                # 【降了多少才卖掉】这是定价最直接的参考：挂多少没人要、降到多少成交
+                if r["price"] < r["first_price"]:
+                    ui.label(f"从 {yen(r['first_price'])} 降了 "
+                             f"{yen(r['first_price'] - r['price'])} 才卖掉").classes("text-red-400")
+        with ui.column().classes("gap-0 items-end shrink-0 whitespace-nowrap"):
+            ui.badge(source_name(r["source"]), color="blue-grey").classes("mb-1")
+            ui.label(yen(r["price"])).classes("text-lg font-bold")
+            if med:
+                ui.label(f"市价的 {r['price'] * 100 // med}%").classes("text-xs text-gray-400")
+
+
+def _sample_table(samples: list[dict], med: int | None) -> None:
+    tbl = ui.table(
+        columns=[
+            {"name": "sold_at", "label": "成交时间", "field": "sold_at", "align": "left",
+             "sortable": True},
+            {"name": "src", "label": "来源", "field": "src", "align": "left", "sortable": True},
+            # 【放原始数字】和「全部」页同一个理由：字符串价格会让排序退化成字典序
+            {"name": "price", "label": "成交价", "field": "price", "align": "right",
+             "sortable": True},
+            {"name": "pct", "label": "占中位", "field": "pct", "align": "right", "sortable": True},
+            {"name": "kind", "label": "怎么来的", "field": "kind", "align": "left"},
+        ],
+        rows=[{
+            "id": f"{x['source']}-{x['sold_at']}-{x['price']}",
+            "sold_at": f"{x['sold_at']:%m-%d %H:%M}",
+            "src": source_name(x["source"]),
+            "price": x["price"],
+            "pct": (f"{x['price'] * 100 // med}%" if med else "—"),
+            # scan＝成交检索扫来的，只过了标题级规则，没拉详情；
+            # tracked＝我们一直在跟、亲眼看着它卖掉的，最准
+            "kind": "跟到成交" if x["sample_kind"] == "tracked" else "成交检索",
+        } for x in samples],
+        row_key="id", pagination=25,
+    )
+    tbl.add_slot("body-cell-price", r'''
+        <q-td :props="props" class="text-right">
+          {{ "¥" + Number(props.value).toLocaleString() }}
+        </q-td>
+    ''')
+
+
 # ------------------------------------------------------------------ 全部页
 
 @ui.refreshable
@@ -846,6 +978,7 @@ def create() -> None:
 
         with ui.tabs().classes("w-full") as tabs:
             t_hit = ui.tab("命中")
+            t_sold = ui.tab("成交")
             t_all = ui.tab("全部")
             t_rule = ui.tab("规则")
             t_set = ui.tab("设置")
@@ -858,6 +991,12 @@ def create() -> None:
                     ui.button("刷新", on_click=hits_view.refresh).props("flat dense no-caps") \
                         .tooltip("只重画页面，不发请求")
                 hits_view()
+            with ui.tab_panel(t_sold):
+                with ui.row().classes("items-center gap-2"):
+                    ui.button("刷新", on_click=sold_view.refresh).props("flat dense no-caps")
+                    ui.label("市场实际用什么价清掉了什么货 —— 定价前先看这一页的分布，"
+                             "别只看中位数那一个数字").classes("text-xs text-gray-400")
+                sold_view()
             with ui.tab_panel(t_all):
                 rules = store.get_rules()
                 opts = {None: "全部规则", **{r["id"]: r["name"] for r in rules}}

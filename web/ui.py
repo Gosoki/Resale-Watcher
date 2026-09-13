@@ -1104,6 +1104,44 @@ async def fetch_all() -> None:
     all_view.refresh()
 
 
+async def pull_tracked() -> None:
+    """追踪页的一键拉取：追踪中的每件立刻单独拉一次详情，不等 track_min 到点。
+
+    【和「一键抓取」共用同一个闸，是故意的】两边打的是同一批源、烧的是同一份
+    每日配额。各自一个闸的话，两个按钮同时点就是两拨请求并发出去 ——
+    源自己的 _lock 会把它们串起来，所以不会超速，但你会对着一个几分钟不动的
+    页面完全不知道在等什么。
+    """
+    if _fetching["busy"]:
+        notify("已经在抓了，等这一轮跑完再点", type="warning")
+        return
+    n = len(store.tracked_items())
+    if not n:
+        notify("还没有追踪任何商品", type="warning")
+        return
+    _fetching["busy"] = True
+    try:
+        st = store.get_settings()
+        notify(f"开始拉 {n} 件的详情，每个请求间隔 "
+               f"{st['req_delay_min']:g}〜{st['req_delay_max']:g} 秒…")
+        done = await run.io_bound(poller.refresh_tracked, True)
+        msg = f"拉完 {done} 件"
+        if done < n:
+            # 【差额要说出来】卖掉的会被自动摘掉追踪，读不出详情的会被跳过，
+            # 两种都让件数对不上。不提的话，人只会觉得这按钮没干完活。
+            msg += f"（另外 {n - done} 件没拉到，原因看日志）"
+        notify(msg, type="positive" if done else "warning")
+    except Exception as e:          # noqa: BLE001 - 手动拉取失败只弹提示
+        notify(f"失败：{e}", type="negative")
+    finally:
+        # 理由同 fetch_all：不解锁的话这按钮就永久点不动了
+        _fetching["busy"] = False
+    track_view.refresh()
+    # 拉到卖掉的会被自动摘掉追踪，那件商品会从这一页消失、出现在成交页
+    sold_view.refresh()
+    hits_view.refresh()
+
+
 async def run_now(rule: dict) -> None:
     """面板上的手动试跑。走 io_bound 扔到线程里 —— 一轮要遍历所有源、发好几个请求、
     每个之间还要等 3〜8 秒，直接在事件循环里跑会把整个面板卡死。"""
@@ -1258,7 +1296,11 @@ def create() -> None:
             with ui.tab_panel(t_track):
                 with toolbar("盯住的几件。它们被单独拉详情刷新，价格、出价数、"
                              "是否卖掉都比整轮扫描快得多"):
-                    ui.button("刷新", on_click=track_view.refresh).props(BTN_QUIET)
+                    ui.button("一键拉取", on_click=pull_tracked).props(BTN_PRIMARY) \
+                        .tooltip("追踪中的每件立刻各拉一次详情，不等刷新间隔到点。"
+                                 "请求之间要隔几秒，件数多就得等一会")
+                    ui.button("刷新", on_click=track_view.refresh).props(BTN_QUIET) \
+                        .tooltip("只重画页面，不发请求")
                 track_view()
             with ui.tab_panel(t_sold):
                 with toolbar("市场实际用什么价清掉了什么货 —— 定价前先看分布，"

@@ -293,8 +293,10 @@ def scan_sold(src, rule: dict) -> dict:
 
 # ------------------------------------------------------------------ 追踪刷新
 
-def refresh_tracked() -> int:
+def refresh_tracked(force: bool = False) -> int:
     """把追踪中的商品单独拉一遍详情。返回实际刷新的件数。
+
+    force=True 是面板上那个「一键拉取」：两道闸都不走，追踪中的全拉一遍。
 
     【这是全项目唯一按件发请求的地方】平时价格和状态只在整轮关键词扫描时更新
     （每条规则 quick_min，而且一轮要遍历所有源）；追踪的商品直接拉它自己的详情页，
@@ -308,7 +310,14 @@ def refresh_tracked() -> int:
     不值当 —— 真追到重复的，你自己取消一个就行。
     """
     s = store.get_settings()
-    rows = store.tracked_due(s["track_min"], s["track_budget"])
+    if force:
+        # 【手动拉取不封顶】你点那个按钮就是因为等不及了，这时候还按 track_budget
+        # 切一刀，剩下的得再点一次 —— 而页面上并不会告诉你还剩几件没拉。
+        # 追几件是你自己选的、追踪页顶上一直显示着；真正兜底的是
+        # daily_request_limit，它谁也绕不过，这里不需要第二道。
+        rows = store.tracked_due(0, len(store.tracked_items()))
+    else:
+        rows = store.tracked_due(s["track_min"], s["track_budget"])
     if not rows:
         return 0
     done = 0

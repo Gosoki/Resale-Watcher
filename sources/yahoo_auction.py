@@ -99,13 +99,23 @@ class YahooAuction(Source):
 
         return {
             "description": _extract_desc(html),
-            "price": int(item.get("price") or 0),
+            # 【必须取 taxinPrice，不是 price】详情 JSON 里两个字段并存：
+            #   price      = 318182  税抜
+            #   taxinPrice = 350000  税込（taxRate=10）
+            # 而搜索页的 data-auction-price 给的是【税込】。取错的话同一件商品
+            # 从搜索切到详情就凭空掉 9%：追踪时误报「已降」、污染价格历史，
+            # 更要命的是 reconcile_sold 用它存成交样本 —— ヤフオク 的每一条成交价
+            # 都会低 9%，直接把市价中位数往下拽，而那是捡漏判定的全部依据。
+            "price": int(item.get("taxinPrice") or item.get("price") or 0),
             "name": item.get("title") or "",
             "status": mapped,
             # seller.location.prefecture，已经是「東京都」这种日文写法
             # 【可能带市区町村】实测有卖家填「東京都 板橋区」，归一到都道府県
             "ship_from": pref_of((((item.get("seller") or {}).get("location") or {})
                                   .get("prefecture"))),
+            # 【追踪拍卖主要就看这个数】出价数一涨说明有人在抢，当前价还会往上走。
+            # 状态解析不出来时（mapped 为空）别给 0 —— 那会被读成「还没人出价」。
+            "bid_count": bids if mapped else None,
         }
 
     def _parse(self, blk: str) -> dict:

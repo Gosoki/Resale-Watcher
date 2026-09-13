@@ -112,7 +112,7 @@ class Mercari(Source):
         # 返回 description=None 表示「我们读不到」，status="" 表示「状态未知」——
         # 上层会保持原状，和详情页解析失败走同一条路。
         if not item_id.startswith("m"):
-            return {"description": None, "price": 0, "name": "", "status": "", "ship_from": ""}
+            return {"description": None, "price": 0, "name": "", "status": "", "ship_from": "", "bid_count": None}
         resp = self._call("GET", DETAIL_URL,
                           params={"id": item_id, "country_code": "", "view": "1"})
         if resp.status_code == 404:
@@ -128,6 +128,7 @@ class Mercari(Source):
             "status": d.get("status") or "",
             # 形如 {"id": 13, "name": "東京都"}
             "ship_from": pref_of((d.get("shipping_from_area") or {}).get("name")),
+            "bid_count": None,          # メルカリ 是定价销售，没有拍卖那套
         }
 
     def _parse(self, raw: dict) -> dict:

@@ -55,14 +55,14 @@ class YahooFlea(Source):
         # warn_desc 这一层对整个源静默失效，而面板上还写着「✓ 描述已查，干净」。
         # 返回整个 dict 而不是 None：None 是"商品没了"的语义，会让上层把它标成下架。
         if not m:
-            return {"description": None, "price": 0, "name": "", "status": "", "ship_from": ""}
+            return {"description": None, "price": 0, "name": "", "status": "", "ship_from": "", "bid_count": None}
         try:
             blob = json.loads(m.group(1))
         except json.JSONDecodeError:
-            return {"description": None, "price": 0, "name": "", "status": "", "ship_from": ""}
+            return {"description": None, "price": 0, "name": "", "status": "", "ship_from": "", "bid_count": None}
         item = _find_item(blob, item_id)
         if item is None:
-            return {"description": None, "price": 0, "name": "", "status": "", "ship_from": ""}
+            return {"description": None, "price": 0, "name": "", "status": "", "ship_from": "", "bid_count": None}
         return {
             "description": item.get("description") or "",
             "price": int(item.get("price") or 0),
@@ -77,6 +77,7 @@ class YahooFlea(Source):
             "status": {"OPEN": "on_sale", "SOLD": "sold_out"}.get(
                 item.get("status") or item.get("itemStatus"), ""),
             "ship_from": pref_of(item.get("location")),
+            "bid_count": None,          # フリマ 是定价销售
         }
 
     def _parse(self, raw: dict) -> dict:

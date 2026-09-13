@@ -119,6 +119,8 @@ CREATE TABLE IF NOT EXISTS item (
   is_deal       TINYINT(1)    NOT NULL DEFAULT 0      COMMENT '1=低于捡漏线（价格 < 成交中位数 × deal_ratio%）',
   deal_pct      INT           NULL                    COMMENT '当前价是成交中位数的百分之多少。80 就是只要市价的八成',
 
+  tracked_at    DATETIME      NULL                    COMMENT '开始追踪的时间。NULL=没在追踪。【追踪的商品会单独拉详情刷新】不等整轮关键词扫描，所以价格/出价数/是否卖掉更新得快得多——代价是每件每次刷新都是一个真实请求，所以有 track_min 间隔和 track_budget 每轮上限两道闸',
+
   notified_at   DATETIME      NULL                    COMMENT '推送过这件商品的时间。NULL=还没推过。【失败也会写】推送失败不重试：一条迟到一小时的提醒没有意义，而对着挂掉的地址每轮重试会拖慢抓取',
 
   ship_from     VARCHAR(16)   NOT NULL DEFAULT ''     COMMENT '发货地都道府县，如「東京都」。【只有拉过详情的商品才有】三个源都只在详情响应里给这个字段，搜索结果里没有；没拉过详情的是空串＝未知，不打标签（不知道≠不是）。メルカリShops 的商品详情接口不支持，永远是空',

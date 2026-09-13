@@ -463,6 +463,67 @@ def set_status(source: str, item_id: str, rule_id: int, status: str, sold_at=Non
                 (status, sold_at, source, item_id, rule_id))
 
 
+def set_tracked(source: str, item_id: str, rule_id: int, on: bool) -> None:
+    execute("UPDATE item SET tracked_at = %s "
+            "WHERE source = %s AND item_id = %s AND rule_id = %s",
+            (config.now() if on else None, source, item_id, rule_id))
+
+
+def tracked_items(rule_id: int | None = None) -> list[dict]:
+    """追踪中的商品，最近追的排前面。rule_id 为 None 时返回全部规则的。"""
+    if rule_id is None:
+        return query("SELECT * FROM item WHERE tracked_at IS NOT NULL "
+                     "ORDER BY tracked_at DESC")
+    return query("SELECT * FROM item WHERE tracked_at IS NOT NULL AND rule_id = %s "
+                 "ORDER BY tracked_at DESC", (rule_id,))
+
+
+def tracked_due(track_min: int, limit: int) -> list[dict]:
+    """该刷新的追踪商品。
+
+    【用 last_seen_at 判到点，不另开一列】它的语义是「最后一次拿到这件商品的新数据」，
+    而整轮扫描和单独拉详情都算「拿到新数据」。这样刚被整轮扫过的商品不会立刻再被
+    单独拉一次 —— 搜索结果里已经有价格和状态了，再发一个请求纯属浪费。
+
+    【最久没刷新的优先】追的件数超过 limit 时轮着来，不会有谁被永久饿死。
+    已经卖掉/下架的不再刷新：状态是终态了，再拉也不会变。
+    """
+    return query("SELECT source, item_id, rule_id, price, name FROM item "
+                 "WHERE tracked_at IS NOT NULL AND status IN ('on_sale', 'trading') "
+                 "AND last_seen_at < %s ORDER BY last_seen_at ASC LIMIT %s",
+                 (config.now() - timedelta(minutes=track_min), limit))
+
+
+def update_tracked(source: str, item_id: str, rule_id: int, d: dict, old_price: int) -> None:
+    """把追踪刷新拿到的详情写回去：价格、状态、出价数、发货地。
+
+    【状态为空串时不动 status】详情页解析不出状态是常有的事（平台改版、异常页），
+    猜一个会把还在售的商品从列表里抹掉 —— 和售出对账那边遵守同一条规矩。
+    【价格变了才写 price_log】每次都写会让那张表毫无信息量地暴涨。
+    """
+    now = config.now()
+    price = int(d.get("price") or 0)
+    sets, args = [], []
+    if price > 0:
+        sets += ["price = %s", "min_price = LEAST(min_price, %s)"]
+        args += [price, price]
+    if d.get("status"):
+        sets.append("status = %s"); args.append(d["status"])
+        if d["status"] == "sold_out":
+            sets.append("sold_at = %s"); args.append(now)
+    if d.get("bid_count") is not None:
+        sets.append("bid_count = %s"); args.append(d["bid_count"])
+    if d.get("ship_from"):
+        sets.append("ship_from = %s"); args.append(d["ship_from"])
+    if not sets:
+        return
+    execute(f"UPDATE item SET {', '.join(sets)} "
+            f"WHERE source = %s AND item_id = %s AND rule_id = %s",
+            args + [source, item_id, rule_id])
+    if price > 0 and price != old_price:
+        add_price_log(source, item_id, price, now)
+
+
 def pending_notify(rule_id: int, only_deal: bool) -> list[dict]:
     """还没推送过的在售命中商品。
 

@@ -228,6 +228,22 @@ def auction_note(r: dict) -> tuple[str, str]:
            ("text-red-400" if urgent else "text-gray-400")
 
 
+def toggle_track(source: str, item_id: str, rule_id: int, on: bool) -> None:
+    """加入/取消追踪。追踪中的商品会被单独拉详情刷新，比整轮扫描快得多。"""
+    store.set_tracked(source, item_id, rule_id, on)
+    n = len(store.tracked_items())
+    if on:
+        st = store.get_settings()
+        # 【必须把代价说清楚】这是全项目唯一按件发请求的功能，追得多会烧穿配额，
+        # 而配额一满是所有规则所有源一起停。让人在加的那一刻就看到数字。
+        notify(f"已加入追踪（共 {n} 件）。每 {st['track_min']} 分钟单独刷新一次，"
+               f"每轮最多 {st['track_budget']} 件 —— 追得越多，每件实际间隔越长")
+    else:
+        notify(f"已取消追踪（还剩 {n} 件）")
+    hits_view.refresh()
+    track_view.refresh()
+
+
 def blacklist_seller(rule_id: int, seller_id: str) -> None:
     """把这个卖家加进该规则的黑名单，并【立刻】重判一次。
 
@@ -467,23 +483,33 @@ def hits_view(host=None) -> None:
                                 ui.label(f"市价的 {r['deal_pct']}%").classes(
                                     "text-xs " + ("text-green-400" if r["deal_pct"] < 100
                                                   else "text-gray-400"))
-                            # 【拉黑挪到这里】原先它在卡片左下角、红字，整页重复十几次，
-                            # 红是危险色，于是它成了最抢眼的东西，把捡漏/已降这些真信号压下去。
-                            # 放价格列底部：位置固定、不挡左边的阅读动线，要用时找得到。
-                            # 【必须用默认参数绑死 rid/sid】它们是循环变量，直接引用的话
-                            # 等你点下去时早就指向最后一件商品了 —— 每个按钮拉黑同一个人。
-                            # 卖家ID为空时不给按钮：ヤフオク 有一部分商品不给卖家ID，
-                            # 没有可拉黑的对象，画个点不动的按钮只会让人以为坏了。
-                            if r["seller_id"]:
+                            # 操作按钮并排放在价格列底部：位置固定、不挡左边的阅读动线。
+                            # 追踪是常用的正向操作，排在前面；拉黑少用且是负向的，排后面。
+                            with ui.row().classes("items-center gap-1 mt-auto"):
+                                tracked = r["tracked_at"] is not None
                                 ui.button(
-                                    "拉黑卖家",
-                                    on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
-                                        blacklist_seller(rid, sid),
-                                ).props(BTN_DANGER + " size=sm").classes("btn-muted mt-auto") \
-                                 .tooltip(
-                                    f"卖家 {r['seller_id']}\n"
-                                    "拉黑后这条规则下他的全部商品立刻判为不合适。"
-                                    "想反悔就去规则页把 ID 从 exclude_sellers 里删掉")
+                                    "追踪中" if tracked else "追踪",
+                                    on_click=lambda _, so=r["source"], ii=r["item_id"],
+                                    ri=rule["id"], t=tracked: toggle_track(so, ii, ri, not t),
+                                ).props((BTN_GHOST if tracked else BTN_QUIET) + " size=sm") \
+                                 .classes("" if tracked else "btn-muted").tooltip(
+                                    "取消追踪" if tracked else
+                                    "加入追踪：这件会被单独拉详情刷新，价格、出价数、"
+                                    "是否卖掉都比整轮扫描快得多。代价是每次刷新一个请求")
+                                # 【必须用默认参数绑死 rid/sid】它们是循环变量，直接引用的话
+                                # 等你点下去时早就指向最后一件商品了 —— 每个按钮拉黑同一个人。
+                                # 卖家ID为空时不给按钮：ヤフオク 有一部分商品不给卖家ID，
+                                # 没有可拉黑的对象，画个点不动的按钮只会让人以为坏了。
+                                if r["seller_id"]:
+                                    ui.button(
+                                        "拉黑卖家",
+                                        on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
+                                            blacklist_seller(rid, sid),
+                                    ).props(BTN_DANGER + " size=sm").classes("btn-muted") \
+                                     .tooltip(
+                                        f"卖家 {r['seller_id']}\n"
+                                        "拉黑后这条规则下他的全部商品立刻判为不合适。"
+                                        "想反悔就去规则页把 ID 从 exclude_sellers 里删掉")
 
 
 def _can_blacklist(row: dict, rule: dict) -> bool:
@@ -524,6 +550,77 @@ def save_deal_price(rule_id: int, value) -> None:
         notify(f"「{rule['name']}」已清空手动价，回到按成交中位数的百分比判")
     hits_view.refresh()
     sold_view.refresh()
+
+
+# ------------------------------------------------------------------ 追踪页
+
+@ui.refreshable
+def track_view() -> None:
+    """追踪中的商品。这一页的数据比别处都新 —— 它们是被单独拉详情刷新的。"""
+    rows = store.tracked_items()
+    st = store.get_settings()
+    if not rows:
+        ui.label("还没有追踪任何商品。在「命中」页每件商品右下角点「追踪」加进来。"
+                 ).classes("text-gray-400 text-sm")
+        return
+
+    rules = {r["id"]: r for r in store.get_rules()}
+    # 【把代价摆在最上面】追的件数 × 刷新频率直接决定每天多烧多少请求，
+    # 而配额一满是所有规则所有源一起停。这个数得让人随时看得见。
+    per_day = int(len(rows) * (1440 / max(st["track_min"], 1)))
+    ui.label(f"共 {len(rows)} 件 · 每 {st['track_min']} 分钟刷新一次、每轮最多 "
+             f"{st['track_budget']} 件 · 满负荷约 {per_day:,} 次请求/天"
+             f"（今日上限 {st['daily_request_limit']:,}）"
+             ).classes("text-xs text-gray-400 mb-3")
+
+    with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
+        for r in rows:
+            _track_row(r, rules.get(r["rule_id"]) or {}, st)
+
+
+def _track_row(r: dict, rule: dict, st: dict) -> None:
+    """布局和命中页同一套，理由见那边的注释。"""
+    gone = r["status"] in ("sold_out", "gone")
+    with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
+        if r["thumb_url"]:
+            ui.image(r["thumb_url"]).classes("w-24 h-24 object-cover rounded shrink-0")
+        with ui.column().classes("gap-0 grow min-w-0 leading-snug self-stretch"):
+            with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
+                if r["status"] == "sold_out":
+                    ui.badge("已卖掉", color="grey")
+                elif r["status"] == "gone":
+                    ui.badge("已下架", color="grey")
+                elif r["is_deal"]:
+                    ui.badge("捡漏", color="green")
+                if r["price"] < r["first_price"]:
+                    ui.badge(f"已降 {yen(r['first_price'] - r['price'])}", color="red")
+                if r["ship_from"] == TOKYO:
+                    ui.badge(TOKYO, color="purple")
+                ui.label(rule.get("name", "?")).classes("text-xs text-gray-400")
+            ui.link(r["name"], item_url(r["source"], r["item_id"]),
+                    new_tab=True).classes("font-medium break-words")
+            note, color = auction_note(r)
+            if note and not gone:
+                ui.label(note).classes(f"text-xs {color}")
+            with ui.row().classes(
+                    "gap-3 text-xs text-gray-400 items-center mt-auto pt-1"):
+                # 【上次刷新要显示出来】这一页的卖点就是"数据比别处新"，
+                # 不把刷新时间摆出来，人没法判断眼前这个价还作不作数。
+                ui.label(f"{r['last_seen_at']:%m-%d %H:%M} 刷新")
+                if r["ship_from"]:
+                    ui.label(f"发货 {r['ship_from']}")
+        with ui.column().classes(
+                "gap-0 items-end shrink-0 whitespace-nowrap self-stretch"):
+            ui.badge(source_name(r["source"])).classes(BADGE_LABEL + " mb-1")
+            ui.label(yen(r["price"])).classes(
+                "text-lg font-bold" + (" line-through text-gray-500" if gone else ""))
+            if r["deal_pct"]:
+                ui.label(f"市价的 {r['deal_pct']}%").classes(
+                    "text-xs " + ("text-green-400" if r["deal_pct"] < 100 else "text-gray-400"))
+            ui.button("取消追踪",
+                      on_click=lambda _, so=r["source"], ii=r["item_id"], ri=r["rule_id"]:
+                      toggle_track(so, ii, ri, False)) \
+                .props(BTN_QUIET + " size=sm").classes("btn-muted mt-auto")
 
 
 # ------------------------------------------------------------------ 成交页
@@ -1116,6 +1213,7 @@ def create() -> None:
 
         with ui.tabs().classes("w-full") as tabs:
             t_hit = ui.tab("命中")
+            t_track = ui.tab("追踪")
             t_sold = ui.tab("成交")
             t_all = ui.tab("全部")
             t_rule = ui.tab("规则")
@@ -1129,6 +1227,11 @@ def create() -> None:
                     ui.button("刷新", on_click=hits_view.refresh).props(BTN_QUIET) \
                         .tooltip("只重画页面，不发请求")
                 hits_view(dialog_host)
+            with ui.tab_panel(t_track):
+                with toolbar("盯住的几件。它们被单独拉详情刷新，价格、出价数、"
+                             "是否卖掉都比整轮扫描快得多"):
+                    ui.button("刷新", on_click=track_view.refresh).props(BTN_QUIET)
+                track_view()
             with ui.tab_panel(t_sold):
                 with toolbar("市场实际用什么价清掉了什么货 —— 定价前先看分布，"
                              "别只看中位数那一个数字"):

@@ -61,7 +61,10 @@ class Source(ABC):
 
     @abstractmethod
     def detail(self, item_id: str) -> dict | None:
-        """返回 {'description', 'price', 'name', 'status', 'ship_from'}；商品已删除时返回 None。
+        """返回 {'description','price','name','status','ship_from','bid_count'}；已删除返回 None。
+
+        bid_count 只有拍卖有（ヤフオク），别的源恒为 None —— None 的意思是
+        「这不是拍卖」，0 的意思是「是拍卖但还没人出价」，两者不能混。
 
         ship_from 是发货地都道府县（如「東京都」），取不到就给空串 ——
         三个源都【只在详情里】给这个字段，搜索结果里一律没有。

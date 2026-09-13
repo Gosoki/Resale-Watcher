@@ -213,3 +213,21 @@ def test_成交检索直接返回空_不发请求():
     r = src.search("RTX 5090", sold=True)
     assert r == {"items": [], "next": "", "total": 0}
     assert not called
+
+
+def test_详情价必须取税込_不是税抜():
+    """【这条是踩出来的】ヤフオク 详情 JSON 里 price 和 taxinPrice 并存：
+      price      = 318182  税抜
+      taxinPrice = 350000  税込（taxRate=10）
+    而搜索页的 data-auction-price 给的是税込。取错的话同一件商品从搜索切到详情
+    就凭空掉 9% —— 追踪时误报「已降」、污染价格历史，更要命的是 reconcile_sold
+    拿它存成交样本，ヤフオク 的每条成交价都低 9%，把市价中位数整体往下拽。
+    """
+    import inspect
+
+    from sources import yahoo_auction
+
+    src = inspect.getsource(yahoo_auction.YahooAuction.detail)
+    assert 'item.get("taxinPrice")' in src, "detail() 必须优先取税込价"
+    # 兜底顺序：taxinPrice 优先，没有才退回 price
+    assert src.index('taxinPrice') < src.index('or item.get("price")')

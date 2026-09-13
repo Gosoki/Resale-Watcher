@@ -291,6 +291,56 @@ def scan_sold(src, rule: dict) -> dict:
     return {"added": added, "median": median, "samples": n}
 
 
+# ------------------------------------------------------------------ 追踪刷新
+
+def refresh_tracked() -> int:
+    """把追踪中的商品单独拉一遍详情。返回实际刷新的件数。
+
+    【这是全项目唯一按件发请求的地方】平时价格和状态只在整轮关键词扫描时更新
+    （每条规则 quick_min，而且一轮要遍历所有源）；追踪的商品直接拉它自己的详情页，
+    所以快得多 —— 拍卖的出价数也只有这条路能及时拿到，而那恰恰是你盯一件拍卖的理由。
+
+    【两道闸】track_min 控间隔、track_budget 控每轮件数。少了任何一道，
+    追十几件就能把每日配额烧穿，而配额一满是【所有规则所有源】一起停。
+
+    【不跨规则去重】同一件商品被两条规则抓到就是两行，各追各的、各发各的请求。
+    看着浪费，但合并的话「这件在这条规则下算不算命中」就得引入额外的关联表，
+    不值当 —— 真追到重复的，你自己取消一个就行。
+    """
+    s = store.get_settings()
+    rows = store.tracked_due(s["track_min"], s["track_budget"])
+    if not rows:
+        return 0
+    done = 0
+    for r in rows:
+        src = sources.get(r["source"])
+        if src is None:
+            continue
+        try:
+            d = src.detail(r["item_id"])
+        except sources.DailyLimitReached:
+            raise                       # 配额耗尽要一路抛到主循环，停掉所有活儿
+        except Exception as e:          # noqa: BLE001 - 单件失败不该拖垮整批
+            log.warning("[%s] 追踪刷新 %s 失败：%s", r["source"], r["item_id"], e)
+            continue
+        done += 1
+        if d is None:                   # 404，商品被删了
+            store.set_status(r["source"], r["item_id"], r["rule_id"], "gone")
+            log.info("[%s] 追踪中的 %s 已下架", r["source"], r["item_id"])
+            continue
+        # 【无论详情读出什么都要 touch】不 touch 的话 last_seen_at 停在旧值，
+        # 下一轮它照样到点、照样白烧一个请求 —— 和售出对账那边是同一个坑。
+        store.touch_seen(r["source"], r["item_id"], r["rule_id"])
+        store.update_tracked(r["source"], r["item_id"], r["rule_id"], d, r["price"])
+        if d["status"] == "sold_out":
+            log.info("[%s] 追踪中的「%s」卖掉了 ¥%s",
+                     r["source"], r["name"][:30], f"{d['price']:,}")
+    if done:
+        log.info("追踪刷新 %d 件（追踪中共 %d 件，每轮上限 %d）",
+                 done, len(store.tracked_items()), s["track_budget"])
+    return done
+
+
 # ------------------------------------------------------------------ 主循环
 
 def finalize(rule_id: int) -> dict:
@@ -380,8 +430,22 @@ def loop(stop_event) -> None:
         # 【整块包一层】下面 get_source_state / update_source_state 本身也会抛
         # （数据库短暂拒连就够了），而它们不在任何 try 里 —— 异常会逐层逃出
         # while 循环，daemon 线程静默死亡，此后再也不抓任何东西。
+        # 【放在整轮扫描之前】一轮要遍历 4 条规则 × 3 个源、每个请求还要等 3~8 秒，
+        # 跑满可能要几分钟。追踪刷新排在后面的话，"更新快"就无从谈起了。
         try:
-            _run_round(rules, stop_event)
+            refresh_tracked()
+        except sources.DailyLimitReached as e:
+            log.warning("%s —— 今天不再发请求，等跨日", e)
+            halted = True
+        except Exception:                   # noqa: BLE001 - 追踪坏了不该拖垮主循环
+            log.exception("追踪刷新出错，本轮跳过")
+
+        try:
+            # 【必须接住返回值】它返回「当天配额是否已耗尽」，原先这里丢掉了，
+            # 于是 halted 恒为 False，下面那句「耗尽就睡 10 分钟」从来没生效过：
+            # 配额满了之后照样每 30 秒空转一轮，每轮都把所有规则所有源重走一遍
+            # 才在第一个请求处被 _check_quota 拦下。
+            halted = _run_round(rules, stop_event) or halted
         except Exception:                   # noqa: BLE001 - 循环本身永不退出
             log.exception("轮询主循环出错，本轮跳过")
         stop_event.wait(600 if halted else 30)

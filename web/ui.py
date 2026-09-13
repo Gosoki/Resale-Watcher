@@ -271,7 +271,12 @@ def thumb_with_star(r: dict, rule_id: int) -> None:
     tracked = r["tracked_at"] is not None
     with ui.element("div").classes("relative shrink-0 w-24 h-24"):
         if r["thumb_url"]:
-            ui.image(r["thumb_url"]).classes("w-24 h-24 object-cover rounded")
+            # 【ratio=1 不能省】q-img 的高度是按图片真实宽高比撑出来的，
+            # Tailwind 的 h-24 管不住它（object-cover 是给原生 <img> 的，
+            # 这里外层是 Quasar 组件）。不写 ratio 的话一列里 96px 高和
+            # 44px 高的缩略图混着排，每行正文的起点都不在一条线上。
+            ui.image(r["thumb_url"]).props("fit=cover ratio=1") \
+                .classes("w-24 h-24 rounded")
         else:
             ui.element("div").classes("w-24 h-24 rounded bg-white/5")
         # 【必须用默认参数绑死】它们是循环变量，直接引用的话等你点下去时
@@ -721,12 +726,19 @@ def _sold_row(r: dict, med: int | None) -> None:
     """一件跟到成交的商品。布局和命中页同一套，理由见那边的注释。"""
     with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
         if r["thumb_url"]:
-            ui.image(r["thumb_url"]).classes("w-24 h-24 object-cover rounded shrink-0")
+            ui.image(r["thumb_url"]).props("fit=cover ratio=1") \
+                .classes("w-24 h-24 rounded shrink-0")
+        else:
+            # 【占位框不能省】理由同 thumb_with_star：没有它，缺缩略图的那一行
+            # 正文会顶到最左边，和上下几行错开
+            ui.element("div").classes("w-24 h-24 rounded bg-white/5 shrink-0")
         # self-stretch + 下面那行的 mt-auto：和命中页同一套贴底做法。
         # 漏了的话宽屏两列时矮的那张卡片小字悬在半空，两列对不齐。
         with ui.column().classes("gap-0 grow min-w-0 leading-snug self-stretch"):
             with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
-                ui.badge("已成交", color="grey")
+                # 【这里不放「已成交」徽标】这一整页就是成交记录，每行再标一次
+                # 等于没说，而它还占着每行第一个徽标位 —— 真正有信息的
+                # 「東京都」「曾是捡漏」被它挤到后面去了。
                 if r["ship_from"] == TOKYO:
                     ui.badge(TOKYO, color="purple")
                 if r["is_deal"]:
@@ -827,10 +839,14 @@ def all_view(rule_id: int | None, reason: str) -> None:
           {{ props.value == null ? "—" : "¥" + Number(props.value).toLocaleString() }}
         </q-td>
     ''')
+    # 【必须放开 white-space 并封宽】Quasar 的表格单元格默认 nowrap，标题又是贪婪列，
+    # 于是长标题直接被切在视口边缘 —— 没有省略号，看不出后面还有字。
+    # 这一页正是用来核对「是哪个词把它判掉的」，而被切掉的往往就是那个词。
+    # 所以让它折行而不是省略：宁可行高不齐，也不能把判定依据藏起来。
     tbl.add_slot("body-cell-name", r'''
-        <q-td :props="props">
+        <q-td :props="props" style="white-space:normal;max-width:34rem">
           <a :href="props.row.link" target="_blank" rel="noopener noreferrer"
-             class="text-blue-400 hover:underline">{{ props.value }}</a>
+             class="text-blue-400 hover:underline break-words">{{ props.value }}</a>
         </q-td>
     ''')
     # 【这一格用 NiceGUI 元素，不用裸 HTML】上面两个插槽是纯展示，裸模板就够了；
@@ -1057,7 +1073,9 @@ def rules_view(host=None) -> None:
                     if ss["last_error"]:
                         ui.label(f"⚠ {ss['last_error'][:60]}").classes("text-red-400")
             if rule["note"]:
-                ui.label(rule["note"]).classes("text-xs text-gray-400")
+                # 封行宽，理由同设置页的说明：一行拉到 150 多字就没法读了
+                ui.label(rule["note"]).classes(
+                    "text-xs text-gray-400 max-w-4xl leading-relaxed")
             with ui.row().classes("gap-2"):
                 ui.button("编辑", on_click=lambda r=rule: rule_dialog(r, host)).props(BTN_GHOST)
                 ui.button("立即跑一轮", on_click=lambda r=rule: run_now(r)).props(BTN_GHOST)
@@ -1161,31 +1179,50 @@ async def run_now(rule: dict) -> None:
 
 # ------------------------------------------------------------------ 设置页
 
+def _setting_note(it: dict) -> None:
+    """说明栏：英文键 + 默认值一行，正文说明一行。
+
+    【英文键必须留着】日志、报错、规则页备注里引用的都是它（"先把
+    daily_request_limit 调大"），只显示中文名的话对不上号。
+    【默认值并进同一行】它原先独占一行，16 项就白占 16 行，而它只在
+    "我是不是改坏了"的时候才有人看。
+    """
+    d = repr(it["default"]) if it["type"] == "str" else it["default"]
+    ui.label(f"{it['k']} · 默认 {d}").classes("text-xs text-gray-500")
+    # 【必须封行宽】不封的话一行拉到 150 多字，眼睛从行尾回到下一行行首要重新找位置。
+    # 说明里有换行（推送那几项列了各家的地址格式），预留换行才看得清。
+    ui.label(it["note"]).classes(
+        "text-xs text-gray-400 whitespace-pre-line leading-relaxed max-w-4xl")
+
+
+def _setting_row(it: dict, label: str, fields: dict) -> None:
+    """设置页的一行。
+
+    【左右分栏，不是上下排】原先一项一张卡、输入框和说明各占一行，16 项拉出三屏多，
+    而右边 80% 是空的。分栏之后整页短了一多半，同组的几个值能一眼看全 ——
+    这几个值恰恰是要互相参照着调的（间隔下限对上限、每日上限对每轮页数）。
+
+    【字符串项例外】notify_url 是一串地址、notify_body 是 JSON 模板，
+    塞进左边那个窄栏没法编辑，所以这两项仍旧上下排、输入框拉满。
+    """
+    with ui.element("div").classes("w-full border-t py-2"):
+        if it["type"] == "str":
+            comp = ui.input(label, value=it["v"]).classes("w-full max-w-3xl").props(INPUT)
+            _setting_note(it)
+        else:
+            with ui.row().classes("items-start w-full gap-4 flex-nowrap"):
+                with ui.column().classes("gap-0 shrink-0 w-64"):
+                    comp = ui.number(label, value=it["v"],
+                                     format="%d" if it["type"] == "int" else "%.1f") \
+                        .classes("w-full").props(INPUT)
+                with ui.column().classes("gap-1 grow min-w-0 pt-1"):
+                    _setting_note(it)
+    fields[it["k"]] = (comp, it)
+
+
 @ui.refreshable
 def settings_view() -> None:
     fields: dict = {}
-    for it in store.all_settings():
-        with ui.card().classes(CARD + " py-2"):
-            # 【字符串项必须用 ui.input】拿 ui.number 装 URL 会直接显示成空白，
-            # 而且保存时 value 是 None —— 看起来像"填了没保存上"。
-            # 【宽度按内容给，别一律 w-full】这一页原先所有输入框都是整屏宽：
-            # 一个装「48」的框拉到 1600px，看着就是没调过。
-            # 数字项给固定窄框；字符串项是 URL 和 JSON 模板，需要长，但也封个上限。
-            if it["type"] == "str":
-                comp = ui.input(it["k"], value=it["v"]) \
-                    .classes("w-full max-w-3xl").props(INPUT)
-            else:
-                comp = ui.number(it["k"], value=it["v"],
-                                 format="%d" if it["type"] == "int" else "%.1f") \
-                    .classes("w-56").props(INPUT)
-            fields[it["k"]] = (comp, it)
-            # 说明里有换行（推送那几项列了各家的地址格式），预留换行才看得清。
-            # 【必须封行宽】不封的话一行拉到 150 多字，眼睛从行尾回到下一行行首要重新找位置，
-            # 读长说明会很累。max-w-5xl 约 1024px，中日文一行 50 字上下，是舒服的档。
-            ui.label(it["note"]).classes(
-                "text-xs text-gray-400 whitespace-pre-line max-w-5xl leading-relaxed")
-            ui.label(f"默认值：{it['default']!r}" if it["type"] == "str"
-                     else f"默认值：{it['default']}").classes("text-xs text-gray-500")
 
     # 这几项填 0 不是「关闭」而是各种翻车：
     #   sold_scan_hours=0  成交轮每 30 秒重跑一次
@@ -1230,7 +1267,23 @@ def settings_view() -> None:
         else:
             notify("已保存，10 秒内生效")
 
-    ui.button("保存全部", on_click=save).props(BTN_PRIMARY).classes("mt-2")
+    # 【保存按钮必须跟着滚】这一页十几项、好几屏长，按钮原先只在最底下：
+    # 改完最上面那个「请求间隔下限」要一路滚到底才点得到，中途很容易忘了保存就切页，
+    # 而这一页没有任何"有未保存改动"的提示 —— 改了等于没改，还看不出来。
+    with ui.row().classes("sticky top-0 z-20 w-full items-center gap-3 py-2 mb-2 "
+                          "backdrop-blur bg-black/60 rounded"):
+        ui.button("保存全部", on_click=save).props(BTN_PRIMARY)
+        ui.label("对所有规则生效。改完保存，10 秒内自动生效，不用重启"
+                 ).classes("text-xs text-gray-400")
+
+    # 【按 SETTING_GROUPS 渲染，不是按 all_settings 的顺序】没分组的项会整个看不见，
+    # 所以 tests/test_settings_ui.py 锁死了两边的键必须完全一致。
+    items = {it["k"]: it for it in store.all_settings()}
+    for group, keys in config.SETTING_GROUPS.items():
+        with ui.card().classes(CARD):
+            ui.label(group).classes("text-sm font-medium text-gray-300")
+            for k, label in keys:
+                _setting_row(items[k], label, fields)
 
 
 # ------------------------------------------------------------------ 组装
@@ -1326,6 +1379,6 @@ def create() -> None:
                               on_click=lambda: rule_dialog(None, dialog_host)).props(BTN_PRIMARY)
                 rules_view(dialog_host)
             with ui.tab_panel(t_set):
-                with toolbar("对所有规则生效。改完保存，10 秒内自动生效，不用重启"):
-                    pass
+                # 【这一页不用 toolbar】保存按钮和那句说明都在 settings_view 顶上的
+                # sticky 条里 —— 放这儿的话它不跟着滚，等于白放。
                 settings_view()

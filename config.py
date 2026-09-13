@@ -156,4 +156,45 @@ SETTINGS_SPEC: dict[str, tuple[type, object, str]] = {
     ),
 }
 
+# 面板上怎么显示这些设置项：分组 → [(键, 中文名), ...]
+#
+# 【为什么不塞进 SETTINGS_SPEC 的元组里】那个元组被 store.py 在四处解包成
+# (typ, default, note)，加一项就得同步改四处，而这里加的纯粹是界面文案，
+# 跟取值、类型、落库都没关系。分开放，改 UI 文案不碰数据层。
+#
+# 【为什么中文名旁边还要留英文键】日志、报错、规则页的备注里引用的都是英文键
+# （"先把 daily_request_limit 调大"），只显示中文名的话对不上号。
+#
+# 【顺序就是页面顺序】从"最常改的"到"基本不动的"排。
+# 漏写一项会被 tests/test_settings_ui.py 拦下来 —— 漏了的表现是它在面板上
+# 整个消失（不在任何分组里就不会被渲染），而库里的值照常生效，很难发现。
+SETTING_GROUPS: dict[str, list[tuple[str, str]]] = {
+    "抓取节奏（直接决定会不会被风控）": [
+        ("req_delay_min", "请求间隔下限（秒）"),
+        ("req_delay_max", "请求间隔上限（秒）"),
+        ("daily_request_limit", "每日请求上限（次）"),
+        ("max_pages", "每轮最多翻几页"),
+        ("detail_budget", "详情请求预算（次）"),
+        ("missing_grace_min", "失踪多久才去核实（分钟）"),
+        ("sold_scan_hours", "成交轮间隔（小时）"),
+    ],
+    "市价基准": [
+        ("median_window_days", "中位数统计窗口（天）"),
+        ("median_min_samples", "出中位数最少要几件成交"),
+    ],
+    "追踪": [
+        ("track_min", "追踪刷新间隔（分钟）"),
+        ("track_budget", "每轮最多刷新几件"),
+    ],
+    "推送": [
+        ("notify_url", "推送地址"),
+        ("notify_body", "请求体模板（JSON）"),
+        ("notify_on", "推什么"),
+        ("notify_max_per_round", "一轮最多推几条"),
+    ],
+    "面板显示": [
+        ("fresh_hours", "「新上架/新发现」时间窗（小时）"),
+    ],
+}
+
 LOG_DIR = BASE_DIR / "logs"

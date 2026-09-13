@@ -229,18 +229,32 @@ def test_百分比照常给出_pct_供参考():
 
 # ---------------------------------------------------------------- 追踪的终态
 
-def test_进终态就摘掉追踪_每条路径都要覆盖():
-    """【为什么写在 store 层而不是调用方】把 status 改成 sold_out/gone 的路径有两条：
-    set_status（poller 里 6 个调用点都走它）和 update_tracked（追踪刷新自己写）。
-    放到调用方去摘迟早漏掉一条，而漏掉的表现是「有商品永远摘不掉」——
-    追的件数是"每天多烧多少请求"的分母，挂着死货会让那个数字失真。
+def test_成交了也要留在追踪里():
+    """卖掉/下架的商品【不摘追踪】—— 你盯了几天的东西，最该看的就是它最后卖了多少，
+    一成交就从列表里消失等于把结果藏起来。
+
+    写 status 的路径有两条：set_status（poller 里 6 个调用点都走它）和
+    update_tracked（追踪刷新自己写）。任何一条偷偷清了 tracked_at，表现都是
+    「追着追着东西不见了」，而且只在商品刚好成交的那一刻发生，很难复现。
     """
     import inspect
 
     from db import store
 
-    assert store.TERMINAL == ("sold_out", "gone")
     for fn in (store.set_status, store.update_tracked):
         src = inspect.getsource(fn)
-        assert "tracked_at = NULL" in src, f"{fn.__name__} 进终态时没摘追踪"
-        assert "TERMINAL" in src, f"{fn.__name__} 应该用 TERMINAL 判终态，别各写各的"
+        assert "tracked_at = NULL" not in src, (
+            f"{fn.__name__} 把 tracked_at 清了 —— 成交的商品会从追踪页消失")
+
+
+def test_终态的不再发请求刷新():
+    """留在页面上和继续刷新是两回事：状态到了终态就不会再变，再拉详情纯属烧配额。
+    tracked_due 必须只挑还在动的那两种状态。
+    """
+    import inspect
+
+    from db import store
+
+    assert store.LIVE == ("on_sale", "trading")
+    assert "LIVE" in inspect.getsource(store.tracked_due), (
+        "tracked_due 要按 LIVE 过滤，否则卖掉的商品每轮还会各花一个请求")

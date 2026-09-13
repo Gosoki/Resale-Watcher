@@ -457,23 +457,21 @@ TERMINAL = ("sold_out", "gone")
 
 
 def set_status(source: str, item_id: str, rule_id: int, status: str, sold_at=None) -> None:
-    """改状态。【进终态时顺手摘掉追踪】
+    """改状态。
 
-    卖掉/下架的商品再追也没意义 —— tracked_due 本来就不会再为它发请求，
-    但不摘的话它会一直挂在追踪页上，追的件数越积越多，而那个数字正是
-    "每天多烧多少请求"的分母，看着就不准了。
-    在这里摘是因为【所有改终态的路径都经过这个函数】（poller 里 6 个调用点），
-    放到调用方去摘迟早会漏掉一条，而漏掉的表现是"有商品永远摘不掉"。
-    商品本身不会丢：它照常出现在「成交」页。
+    【进终态不摘追踪】卖掉/下架的商品会【留在追踪页上】。你盯一件东西盯了几天，
+    结果它一成交就从你的列表里消失 —— 最该看的那一刻（最后卖了多少、被谁抬上去的）
+    反而没了。追踪页就是你自己挑出来的那几件，它们的结局属于那一页。
+    不刷新它们是另一回事：tracked_due 只挑 on_sale/trading，终态的一个请求都不会再发，
+    所以留着不花任何代价。
     """
-    clear = ", tracked_at = NULL" if status in TERMINAL else ""
     if sold_at is None:
-        execute(f"UPDATE item SET status = %s{clear} "
-                f"WHERE source = %s AND item_id = %s AND rule_id = %s",
+        execute("UPDATE item SET status = %s "
+                "WHERE source = %s AND item_id = %s AND rule_id = %s",
                 (status, source, item_id, rule_id))
     else:
-        execute(f"UPDATE item SET status = %s, sold_at = %s{clear} "
-                f"WHERE source = %s AND item_id = %s AND rule_id = %s",
+        execute("UPDATE item SET status = %s, sold_at = %s "
+                "WHERE source = %s AND item_id = %s AND rule_id = %s",
                 (status, sold_at, source, item_id, rule_id))
 
 
@@ -483,13 +481,22 @@ def set_tracked(source: str, item_id: str, rule_id: int, on: bool) -> None:
             (config.now() if on else None, source, item_id, rule_id))
 
 
+# 还在动的商品：只有这两种状态才值得再发请求刷新
+LIVE = ("on_sale", "trading")
+
+
 def tracked_items(rule_id: int | None = None) -> list[dict]:
-    """追踪中的商品，最近追的排前面。rule_id 为 None 时返回全部规则的。"""
+    """追踪中的商品。还在售的排前面，已经卖掉/下架的沉到底，各自按最近追的在前。
+
+    【终态的要沉底，不能按 tracked_at 混排】卖掉的会一直留着（你盯的东西的结局
+    属于这一页），日子久了就比在售的多。不沉底的话，真正还能出手的那几件会被
+    埋在一堆已成交里 —— 而这一页存在的理由就是"还能动手的那几件"。
+    """
+    order = ("ORDER BY status IN ('sold_out', 'gone'), tracked_at DESC")
     if rule_id is None:
-        return query("SELECT * FROM item WHERE tracked_at IS NOT NULL "
-                     "ORDER BY tracked_at DESC")
-    return query("SELECT * FROM item WHERE tracked_at IS NOT NULL AND rule_id = %s "
-                 "ORDER BY tracked_at DESC", (rule_id,))
+        return query(f"SELECT * FROM item WHERE tracked_at IS NOT NULL {order}")
+    return query(f"SELECT * FROM item WHERE tracked_at IS NOT NULL AND rule_id = %s {order}",
+                 (rule_id,))
 
 
 def tracked_due(track_min: int, limit: int) -> list[dict]:
@@ -500,10 +507,11 @@ def tracked_due(track_min: int, limit: int) -> list[dict]:
     单独拉一次 —— 搜索结果里已经有价格和状态了，再发一个请求纯属浪费。
 
     【最久没刷新的优先】追的件数超过 limit 时轮着来，不会有谁被永久饿死。
-    已经卖掉/下架的不再刷新：状态是终态了，再拉也不会变。
+    已经卖掉/下架的不再刷新：状态是终态了，再拉也不会变 —— 但它们【仍然留在
+    追踪页上】，只是不花请求。
     """
     return query("SELECT source, item_id, rule_id, price, name FROM item "
-                 "WHERE tracked_at IS NOT NULL AND status IN ('on_sale', 'trading') "
+                 f"WHERE tracked_at IS NOT NULL AND status IN {LIVE} "
                  "AND last_seen_at < %s ORDER BY last_seen_at ASC LIMIT %s",
                  (config.now() - timedelta(minutes=track_min), limit))
 
@@ -525,10 +533,6 @@ def update_tracked(source: str, item_id: str, rule_id: int, d: dict, old_price: 
         sets.append("status = %s"); args.append(d["status"])
         if d["status"] == "sold_out":
             sets.append("sold_at = %s"); args.append(now)
-        # 【这里也要摘】这个函数绕开了 set_status 直接写 status，
-        # 只在那边摘的话，恰好在追踪刷新里卖掉的商品会漏网。
-        if d["status"] in TERMINAL:
-            sets.append("tracked_at = NULL")
     if d.get("bid_count") is not None:
         sets.append("bid_count = %s"); args.append(d["bid_count"])
     if d.get("ship_from"):

@@ -342,7 +342,8 @@ def refresh_tracked(force: bool = False) -> int:
         store.touch_seen(r["source"], r["item_id"], r["rule_id"])
         store.update_tracked(r["source"], r["item_id"], r["rule_id"], d, r["price"])
         if d["status"] in store.TERMINAL:
-            log.info("[%s] 追踪中的「%s」%s ¥%s —— 已自动取消追踪，去「成交」页看",
+            # 留在追踪页上，只是不再刷新（tracked_due 只挑 on_sale/trading）
+            log.info("[%s] 追踪中的「%s」%s ¥%s —— 结果留在追踪页，不再刷新",
                      r["source"], r["name"][:30],
                      "卖掉了" if d["status"] == "sold_out" else "下架了", f"{d['price']:,}")
     if done:

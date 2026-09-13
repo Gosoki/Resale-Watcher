@@ -232,6 +232,13 @@ def auction_note(r: dict) -> tuple[str, str]:
     if r.get("bid_count") is None:
         return "", ""
     bids = r["bid_count"]
+    # 【结束了就换一套说法】追踪页现在会留着已成交的商品，那一行原先照旧写
+    # "竞价中 · 当前价还会涨 · 已结束" —— 自己跟自己打架。结束之后
+    # 唯一还有意义的是"最后被多少人抬到这个价"，那是下次出价的参考。
+    if r.get("status") in ("sold_out", "gone"):
+        if bids > 0:
+            return f"🔨 拍卖结束 · 共 {bids} 次出价，这是最终成交价", "text-gray-400"
+        return "🔨 拍卖结束 · 无人出价", "text-gray-400"
     left = time_left(r.get("end_time"))
     urgent = r.get("end_time") and (r["end_time"] - config.now()).total_seconds() < 3600
     if bids > 0:
@@ -422,13 +429,17 @@ def hits_view(host=None) -> None:
                 for r in rows:
                     fresh = freshness(r, fresh_hours, cold_start)
                     # 【这一行的三个 class 是一组，缺一个价格就会被长标题挤下去】
-                    #   flex-nowrap  外层三列（图/正文/价格）绝不换行 —— 没有它，
-                    #                标题一长整个价格列会被挤到下一行去
+                    #   sm:flex-nowrap  ≥640px 时三列（图/正文/价格）绝不换行 ——
+                    #                没有它，标题一长整个价格列会被挤到下一行去。
+                    #   【但手机上必须换行】430px 宽时三列排不下，nowrap 的结果是
+                    #                价格列整个被推出视口：价格、市价百分比、拉黑
+                    #                全都看不见，而且没有横向滚动条提示你右边还有东西。
+                    #                宁可价格掉到第二行，也不能让它消失。
                     #   items-start  标题换成两行时，价格保持在顶部对齐而不是浮到中间
                     #   正文列的 min-w-0 + 价格列的 shrink-0 见下面，是同一件事的另一半：
                     #   flex 子项默认 min-width:auto，不写 min-w-0 的话正文列会被内容
                     #   撑到超过容器宽度，把右边挤没
-                    with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
+                    with ui.row().classes("items-start w-full gap-3 border-t py-2 sm:flex-nowrap"):
                         # 96px：正文列在「徽标+标题两行+拍卖提示+品相行」时约 90px 高，
                         # 图跟着长到差不多，两边才齐。64px 时右边明显空一块，
                         # 看起来就像行距被撑开了。
@@ -599,12 +610,16 @@ def track_view() -> None:
         return
 
     rules = {r["id"]: r for r in store.get_rules()}
-    # 【把代价摆在最上面】追的件数 × 刷新频率直接决定每天多烧多少请求，
-    # 而配额一满是所有规则所有源一起停。这个数得让人随时看得见。
-    per_day = int(len(rows) * (1440 / max(st["track_min"], 1)))
-    ui.label(f"共 {len(rows)} 件 · 每 {st['track_min']} 分钟刷新一次、每轮最多 "
+    # 【分母只能是还在刷新的那些】卖掉/下架的会留在这一页（你盯的东西的结局
+    # 属于这里），但它们一个请求都不再发。拿总件数去估每天烧多少，
+    # 挂的死货越多这个数越假 —— 而这个数正是用来决定"还能不能再追一件"的。
+    live = sum(1 for r in rows if r["status"] in store.LIVE)
+    per_day = int(live * (1440 / max(st["track_min"], 1)))
+    done = len(rows) - live
+    ui.label(f"在追 {live} 件 · 每 {st['track_min']} 分钟刷新一次、每轮最多 "
              f"{st['track_budget']} 件 · 满负荷约 {per_day:,} 次请求/天"
              f"（今日上限 {st['daily_request_limit']:,}）"
+             + (f" · 另有 {done} 件已结束，留着看结果，不再发请求" if done else "")
              ).classes("text-xs text-gray-400 mb-3")
 
     with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
@@ -614,16 +629,20 @@ def track_view() -> None:
 
 def _track_row(r: dict, rule: dict, st: dict) -> None:
     """布局和命中页同一套，理由见那边的注释。"""
-    with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
+    with ui.row().classes("items-start w-full gap-3 border-t py-2 sm:flex-nowrap"):
         # 和命中页同一颗星：这里它一定是实心的，点一下就是取消追踪
         thumb_with_star(r, r["rule_id"])
         with ui.column().classes("gap-0 grow min-w-0 leading-snug self-stretch"):
             with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
-                # 【这里不会有"已卖掉"】商品一进终态就被自动摘掉追踪了（见
-                # store.set_status），所以这一页只剩还活着的。
-                # trading 是唯一会出现的非在售状态，而且它最值得标出来：
-                # 有人正在买，你要么立刻跟，要么死心。
-                if r["status"] == "trading":
+                # 【终态的留在这一页】卖掉/下架的不会被摘掉追踪，所以这三种
+                # 状态都会出现。已卖掉排在最前面判，因为它一旦成立，
+                # 「捡漏」「已降」这些还能不能买的信息就都没意义了。
+                if r["status"] == "sold_out":
+                    ui.badge("已卖掉", color="grey").tooltip("最终成交价见右边")
+                elif r["status"] == "gone":
+                    ui.badge("已下架", color="grey").tooltip(
+                        "商品页没了。可能是卖家撤了，也可能是平台删了")
+                elif r["status"] == "trading":
                     ui.badge("交易中", color="amber").tooltip(
                         "有人已经在买了。Mercari 上付款后会先进这个状态，成交才变已售出")
                 elif r["is_deal"]:
@@ -642,7 +661,12 @@ def _track_row(r: dict, rule: dict, st: dict) -> None:
                     "gap-3 text-xs text-gray-400 items-center mt-auto pt-1"):
                 # 【上次刷新要显示出来】这一页的卖点就是"数据比别处新"，
                 # 不把刷新时间摆出来，人没法判断眼前这个价还作不作数。
-                ui.label(f"{r['last_seen_at']:%m-%d %H:%M} 刷新")
+                # 但已成交的不一样：它的价格不会再变了，"刷新时间"毫无意义，
+                # 该说的是它什么时候成交的。
+                if r["status"] == "sold_out" and r["sold_at"]:
+                    ui.label(f"{r['sold_at']:%m-%d %H:%M} 成交")
+                else:
+                    ui.label(f"{r['last_seen_at']:%m-%d %H:%M} 刷新")
                 if r["ship_from"]:
                     ui.label(f"发货 {r['ship_from']}")
         with ui.column().classes(
@@ -682,9 +706,13 @@ def sold_view() -> None:
         rid = rule["id"]
         st = store.get_state(rid)
         med = st["median_price"]
+        # 【必须加 matched = 1】不加的话这一页会混进被规则判掉的货：
+        # 部品取り、GPUなし、纯散热器、笔记本 —— 实测 19 件里有 13 件是这类，
+        # 价格从 ¥1,600 到 ¥14,000。它们和你要的卡不是一个东西，
+        # 摆在成交页上只会把"这个货色卖多少钱"这个判断整个带偏。
         tracked = store.query(
             "SELECT * FROM item WHERE rule_id = %s AND status = 'sold_out' "
-            "ORDER BY sold_at DESC", (rid,))
+            "AND matched = 1 ORDER BY sold_at DESC", (rid,))
         samples = store.query(
             "SELECT source, price, sold_at, sample_kind FROM sold_sample "
             "WHERE rule_id = %s ORDER BY sold_at DESC LIMIT 80", (rid,))
@@ -724,7 +752,7 @@ def sold_view() -> None:
 
 def _sold_row(r: dict, med: int | None) -> None:
     """一件跟到成交的商品。布局和命中页同一套，理由见那边的注释。"""
-    with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
+    with ui.row().classes("items-start w-full gap-3 border-t py-2 sm:flex-nowrap"):
         if r["thumb_url"]:
             ui.image(r["thumb_url"]).props("fit=cover ratio=1") \
                 .classes("w-24 h-24 rounded shrink-0")
@@ -1191,8 +1219,10 @@ def _setting_note(it: dict) -> None:
     ui.label(f"{it['k']} · 默认 {d}").classes("text-xs text-gray-500")
     # 【必须封行宽】不封的话一行拉到 150 多字，眼睛从行尾回到下一行行首要重新找位置。
     # 说明里有换行（推送那几项列了各家的地址格式），预留换行才看得清。
+    # break-words：说明里有 "(1440 / quick_min)" 这种断不开的串，
+    # 手机宽度下会把整行顶出视口右边
     ui.label(it["note"]).classes(
-        "text-xs text-gray-400 whitespace-pre-line leading-relaxed max-w-4xl")
+        "text-xs text-gray-400 whitespace-pre-line leading-relaxed max-w-4xl break-words")
 
 
 def _setting_row(it: dict, label: str, fields: dict) -> None:
@@ -1210,7 +1240,7 @@ def _setting_row(it: dict, label: str, fields: dict) -> None:
             comp = ui.input(label, value=it["v"]).classes("w-full max-w-3xl").props(INPUT)
             _setting_note(it)
         else:
-            with ui.row().classes("items-start w-full gap-4 flex-nowrap"):
+            with ui.row().classes("items-start w-full gap-4 sm:flex-nowrap"):
                 with ui.column().classes("gap-0 shrink-0 w-64"):
                     comp = ui.number(label, value=it["v"],
                                      format="%d" if it["type"] == "int" else "%.1f") \
@@ -1270,8 +1300,11 @@ def settings_view() -> None:
     # 【保存按钮必须跟着滚】这一页十几项、好几屏长，按钮原先只在最底下：
     # 改完最上面那个「请求间隔下限」要一路滚到底才点得到，中途很容易忘了保存就切页，
     # 而这一页没有任何"有未保存改动"的提示 —— 改了等于没改，还看不出来。
-    with ui.row().classes("sticky top-0 z-20 w-full items-center gap-3 py-2 mb-2 "
-                          "backdrop-blur bg-black/60 rounded"):
+    # 【top 不能是 0】ui.header() 是 Quasar 的 fixed-top，实测高 45px
+    #（q-page-container 的 padding-top 就是它撑出来的）。top-0 的话这根条子
+    # 一滚就钻到顶栏底下，按钮点不着 —— 比原先放在页面最底部还糟。
+    with ui.row().classes("sticky top-[45px] z-20 w-full items-center gap-3 py-2 mb-2 "
+                          "backdrop-blur bg-black/80 rounded"):
         ui.button("保存全部", on_click=save).props(BTN_PRIMARY)
         ui.label("对所有规则生效。改完保存，10 秒内自动生效，不用重启"
                  ).classes("text-xs text-gray-400")

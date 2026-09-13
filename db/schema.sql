@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS watch_rule (
   check_desc    TINYINT(1)    NOT NULL DEFAULT 1      COMMENT '1=初筛通过后再拉一次商品详情读描述，用下面的 warn_desc 查一遍并打警示标签。关掉就完全不拉详情',
   warn_desc     VARCHAR(1024) NOT NULL DEFAULT ''     COMMENT '描述警示词，逗号分隔，只在描述里查。【命中只打标签，不会把商品毙掉】商品照样进命中列表，面板上带个黄标写明命中了哪个词，你点开自己判断。实测依据：「マイニング」在描述里出现 2 次、2 次都是卖家在否认（「マイニング使用しておらず」），真挖过矿的不会自招——描述词做否决的误杀风险远大于拦截价值',
 
-  deal_ratio    INT           NOT NULL DEFAULT 85     COMMENT '捡漏线（%）：价格低于「近30天成交中位数 × 此值%」时额外标 is_deal。0=不算捡漏，只按价格区间判',
+  deal_price    INT           NOT NULL DEFAULT 0      COMMENT '手动捡漏价（日元）：低于它就算捡漏。【填了就完全盖过 deal_ratio】0=不用手动价，按下面的百分比算。手动价的意义在于它【不依赖成交样本】——刚建规则、或者某个型号成交太少算不出中位数时，百分比那套整个不工作，而你自己心里是有价的',
+
+  deal_ratio    INT           NOT NULL DEFAULT 85     COMMENT '捡漏线（%）：价格低于「近30天成交中位数 × 此值%」时额外标 is_deal。0=不算捡漏，只按价格区间判。deal_price 填了的话这一项不生效',
 
   quick_min     INT           NOT NULL DEFAULT 7      COMMENT '扫描间隔（分钟）：多久把该关键词的在售商品全扫一遍。实际会在此基础上随机抖动 ±20%',
 

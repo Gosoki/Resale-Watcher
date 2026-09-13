@@ -253,7 +253,7 @@ RULE_COLUMNS = (
     "name, enabled, keyword, sources, include_all, include_any, exclude_any, warn_desc, "
     "exclude_sellers, "
     "price_min, price_max, condition_ids, allow_shops, check_desc, "
-    "deal_ratio, quick_min, note"
+    "deal_price, deal_ratio, quick_min, note"
 )
 # 精确的列名元组。别拿上面那个字符串做成员判断 ——「id」是「condition_ids」的子串，
 # `"id" in RULE_COLUMNS` 会返回 True。

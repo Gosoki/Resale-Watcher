@@ -238,7 +238,7 @@ def mark_deals(rule: dict) -> None:
     for it in store.query(
             "SELECT source, item_id, price FROM item WHERE rule_id = %s AND matched = 1 "
             "AND status = 'on_sale'", (rid,)):
-        deal, pct = is_deal(it["price"], median, rule["deal_ratio"])
+        deal, pct = is_deal(it["price"], median, rule["deal_ratio"], rule.get("deal_price") or 0)
         store.set_deal(it["source"], it["item_id"], rid, deal, pct)
 
 

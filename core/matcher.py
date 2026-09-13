@@ -137,8 +137,15 @@ def explain(rule: dict, row: dict) -> str:
     return ""
 
 
-def is_deal(price: int, median: int | None, deal_ratio: int) -> tuple[int, int | None]:
-    """捡漏判定。返回 (is_deal, deal_pct)。median 为 None（样本不足）时不判，也不出 pct。
+def is_deal(price: int, median: int | None, deal_ratio: int,
+            deal_price: int = 0) -> tuple[int, int | None]:
+    """捡漏判定。返回 (is_deal, deal_pct)。
+
+    【手动价优先，而且不依赖成交样本】deal_price 一旦填了就完全盖过 deal_ratio。
+    这正是它存在的理由：百分比那套要先有中位数，而中位数要先攒够成交样本 ——
+    规则刚建起来、或者某个型号本来就成交稀少时，百分比整个不工作，
+    捡漏徽标永远不亮，而你自己心里其实是有价的。
+    pct 照常算（只要有中位数），因为它是给你看的参考，和判定是两件事。
 
     【判定用未取整的比较，pct 只供显示】原先是先 pct = round(price*100/median)
     再比 pct < deal_ratio，于是「面板宣称的捡漏线」和「真会被判捡漏的价格」差了半个百分点：
@@ -147,12 +154,12 @@ def is_deal(price: int, median: int | None, deal_ratio: int) -> tuple[int, int |
     ¥608,401〜¥612,000 这一段全部卡在「摘要说在线下、后端说不是」的夹缝里。
     改成直接比乘积之后，和 schema.sql 的列注释、规则对话框的 tooltip、面板摘要完全一致。
     """
-    if not median:
-        return 0, None
     # 【用 floor 不用 round】对整数 deal_ratio 有 floor(x) < r ⟺ x < r，
     # 所以显示的百分比和判定结果数学上完全等价 —— 不会出现「写着 85%、
     # 却挂着捡漏徽标」这种看起来自相矛盾的行。round 会。
-    pct = int(price * 100 / median)
-    if not deal_ratio:
-        return 0, pct          # 关掉捡漏判定时仍然给出百分比，纯做参考
+    pct = int(price * 100 / median) if median else None
+    if deal_price:
+        return (1 if price < deal_price else 0), pct
+    if not median or not deal_ratio:
+        return 0, pct          # 没中位数、或关掉百分比判定时仍给 pct，纯做参考
     return (1 if price * 100 < median * deal_ratio else 0), pct

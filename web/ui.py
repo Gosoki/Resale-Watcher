@@ -241,10 +241,14 @@ def hits_view() -> None:
         summary = [f"预算 {yen(rule['price_min'])}〜{yen(rule['price_max'])}"]
         if med:
             summary.append(f"市价中位 {yen(med)}（{st['sample_count']}件成交）")
-            if rule["deal_ratio"]:
-                summary.append(f"低于 {yen(med * rule['deal_ratio'] // 100)} 算捡漏")
         else:
             summary.append(f"成交样本不足{rule['median_min_samples']}件，暂无市价参考")
+        # 【手动价填了就盖过百分比】摘要必须如实反映当前生效的那一个，
+        # 否则你会对着「低于 ¥706,500 算捡漏」纳闷为什么 ¥70 万的没标捡漏。
+        if rule["deal_price"]:
+            summary.append(f"手动捡漏价 {yen(rule['deal_price'])}")
+        elif med and rule["deal_ratio"]:
+            summary.append(f"低于 {yen(med * rule['deal_ratio'] // 100)} 算捡漏")
         deals = sum(1 for r in rows if r["is_deal"])
         head = f"{rule['name']}　{len(rows)} 件" + (f"　🟢 {deals} 件捡漏" if deals else "")
 
@@ -252,6 +256,18 @@ def hits_view() -> None:
         # 这正是想要的：命中列表是每次打开都要从头扫一遍的东西。
         with ui.expansion(head, caption=" · ".join(summary), value=True) \
                 .classes("w-full mb-3").props("header-class=text-base"):
+            # 【放在「没有商品」判断之前】一件都没命中的时候，恰恰是你最想调这个价的时候。
+            with ui.row().classes("items-center gap-2 mb-2 flex-wrap"):
+                ui.label("手动捡漏价 ¥").classes("text-xs text-gray-400")
+                # 【必须用默认参数绑死 rid/comp】这两个是循环变量，直接引用的话
+                # 等你点保存时它们早就指向最后一条规则了 —— 每个按钮都会改同一条。
+                inp = ui.number(value=rule["deal_price"] or None, format="%d") \
+                    .props("dense outlined").classes("w-40")
+                ui.button("保存", on_click=lambda _, rid=rule["id"], c=inp:
+                          save_deal_price(rid, c.value)) \
+                    .props("flat dense no-caps size=sm color=primary")
+                ui.label("低于它就算捡漏，填了就盖过下面的百分比；留空或 0 = 回到按成交中位数判"
+                         ).classes("text-xs text-gray-400")
             if not rows:
                 ui.label("当前没有符合条件的在售商品。").classes("text-gray-400 text-sm")
                 continue
@@ -372,6 +388,34 @@ def _act_label(row: dict, rule: dict) -> str:
     return "拉黑" if _can_blacklist(row, rule) else "已拉黑"
 
 
+def save_deal_price(rule_id: int, value) -> None:
+    """设手动捡漏价，并【立刻】重算一遍，不用等下一轮。
+
+    立刻重算是因为这是个手动动作：你就是想马上看到哪些变成捡漏了。
+    mark_deals 是纯 CPU、不发请求，同步跑一次只是几十行 UPDATE。
+    """
+    try:
+        v = int(float(value or 0))
+    except (TypeError, ValueError):
+        notify("捡漏价要填数字", type="warning")
+        return
+    if v < 0:
+        notify("捡漏价不能是负数", type="warning")
+        return
+    rule = store.get_rule(rule_id)
+    if not rule:
+        notify("这条规则不在了（可能刚被删掉）", type="warning")
+        return
+    store.update_rule(rule_id, {"deal_price": v})
+    poller.mark_deals(store.get_rule(rule_id))
+    if v:
+        notify(f"「{rule['name']}」捡漏价设为 {yen(v)}，已重算")
+    else:
+        notify(f"「{rule['name']}」已清空手动价，回到按成交中位数的百分比判")
+    hits_view.refresh()
+    sold_view.refresh()
+
+
 # ------------------------------------------------------------------ 成交页
 
 @ui.refreshable
@@ -435,10 +479,7 @@ def sold_view() -> None:
                     for r in tracked:
                         _sold_row(r, med)
 
-            if samples:
-                ui.label(f"成交价样本（{len(samples)} 件，中位数就是按这些算的）") \
-                    .classes("text-sm text-gray-300 mt-3")
-                _sample_table(samples, med)
+
 
 
 def _sold_row(r: dict, med: int | None) -> None:
@@ -473,35 +514,6 @@ def _sold_row(r: dict, med: int | None) -> None:
                 ui.label(f"市价的 {r['price'] * 100 // med}%").classes("text-xs text-gray-400")
 
 
-def _sample_table(samples: list[dict], med: int | None) -> None:
-    tbl = ui.table(
-        columns=[
-            {"name": "sold_at", "label": "成交时间", "field": "sold_at", "align": "left",
-             "sortable": True},
-            {"name": "src", "label": "来源", "field": "src", "align": "left", "sortable": True},
-            # 【放原始数字】和「全部」页同一个理由：字符串价格会让排序退化成字典序
-            {"name": "price", "label": "成交价", "field": "price", "align": "right",
-             "sortable": True},
-            {"name": "pct", "label": "占中位", "field": "pct", "align": "right", "sortable": True},
-            {"name": "kind", "label": "怎么来的", "field": "kind", "align": "left"},
-        ],
-        rows=[{
-            "id": f"{x['source']}-{x['sold_at']}-{x['price']}",
-            "sold_at": f"{x['sold_at']:%m-%d %H:%M}",
-            "src": source_name(x["source"]),
-            "price": x["price"],
-            "pct": (f"{x['price'] * 100 // med}%" if med else "—"),
-            # scan＝成交检索扫来的，只过了标题级规则，没拉详情；
-            # tracked＝我们一直在跟、亲眼看着它卖掉的，最准
-            "kind": "跟到成交" if x["sample_kind"] == "tracked" else "成交检索",
-        } for x in samples],
-        row_key="id", pagination=25,
-    )
-    tbl.add_slot("body-cell-price", r'''
-        <q-td :props="props" class="text-right">
-          {{ "¥" + Number(props.value).toLocaleString() }}
-        </q-td>
-    ''')
 
 
 # ------------------------------------------------------------------ 全部页
@@ -617,7 +629,7 @@ def rule_dialog(rule: dict | None, host=None) -> None:
         "exclude_any": "", "warn_desc": "", "exclude_sellers": "",
         "price_min": 0, "price_max": 0,
         "condition_ids": "", "allow_shops": 0, "check_desc": 1,
-        "deal_ratio": 85, "quick_min": 7, "note": "",
+        "deal_price": 0, "deal_ratio": 85, "quick_min": 7, "note": "",
     }
     with (host or ui.context.client.content):
         dlg = ui.dialog()
@@ -637,9 +649,15 @@ def rule_dialog(rule: dict | None, host=None) -> None:
                     .props("dense outlined").bind_value(data, "price_min")
                 ui.number("价格上限 ¥（0=不限）", value=data["price_max"], format="%d") \
                     .props("dense outlined").bind_value(data, "price_max")
+                ui.number("手动捡漏价 ¥（0=不用）", value=data["deal_price"], format="%d") \
+                    .props("dense outlined").bind_value(data, "deal_price") \
+                    .tooltip("低于它就算捡漏。【填了就完全盖过右边的百分比】"
+                             "它的意义是不依赖成交样本 —— 规则刚建、或某个型号成交太少"
+                             "算不出中位数时，百分比那套整个不工作，而你心里是有价的")
                 ui.number("捡漏线 %", value=data["deal_ratio"], format="%d") \
                     .props("dense outlined").bind_value(data, "deal_ratio") \
-                    .tooltip("低于「成交中位数 × 此值%」时标捡漏。0=关闭")
+                    .tooltip("低于「成交中位数 × 此值%」时标捡漏。0=关闭。"
+                             "左边填了手动价的话这一项不生效")
                 ui.number("扫描间隔 分", value=data["quick_min"], format="%d", min=1) \
                     .props("dense outlined").bind_value(data, "quick_min") \
                     .tooltip("至少 1 分钟。这个值直接决定对外发请求的频率")
@@ -689,7 +707,7 @@ def rule_dialog(rule: dict | None, host=None) -> None:
                 return
             data["quick_min"] = qm
             # 这三个清空＝按各自的「不限 / 关闭」语义走，是合法的
-            for k in ("price_min", "price_max", "deal_ratio"):
+            for k in ("price_min", "price_max", "deal_ratio", "deal_price"):
                 if data.get(k) is None:
                     data[k] = 0
             # ui.number 被清空时 value 是 None，而这些列都是 NOT NULL；

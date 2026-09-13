@@ -8,6 +8,7 @@
   规则  —— 你自己填的那张表，以及每条规则在各个源上的轮询状态
   设置  —— 全局项（抓取节奏、市价样本窗口、每日上限），改完 10 秒生效
 """
+from contextlib import contextmanager
 from datetime import timedelta
 
 from nicegui import run, ui
@@ -22,7 +23,18 @@ from db import store
 # 暗色样式：ui.dark_mode(True) + ui.colors 定主色 + 这张表修 Quasar 在暗底上的两处短板。
 DARK_CSS = (
     "<style>"
-    "body{font-size:14px}"
+    # 【必须显式指定字体族】不指定的话，日文用什么字完全看浏览器挑：
+    # 同一页里商品标题（日文）和界面文案（中文）会落到两套不同的字形上，
+    # 笔画粗细和字面大小对不齐，看着就是"没做过设计"。
+    # 按操作系统各自的系统字排：macOS 走 SF Pro + ヒラギノ，Windows 走 Segoe + 游ゴシック。
+    'body,.q-field,.q-btn,.q-table,.q-badge,.q-tab{font-family:'
+    'system-ui,-apple-system,"Segoe UI",'
+    '"Hiragino Sans","Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic UI","Meiryo",'
+    '"PingFang SC","Microsoft YaHei",sans-serif}'
+    # 【等宽数字】这是个盯价格的工具，一整列 ¥ 数字不等宽的话，
+    # 位数不同的价格左右横跳，扫一眼比大小要重新对焦。
+    # 对汉字假名没有任何影响，只管阿拉伯数字。
+    "body{font-size:14px;font-variant-numeric:tabular-nums}"
     # Quasar 的卡片/表格默认带投影，那是给亮底设计的；暗底上投影看不见，只会糊成一团。
     # 换成极淡的白色描边来分层。
     ".q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
@@ -43,6 +55,14 @@ DARK_CSS = (
     # 亮底一律改配深色前景。
     ".q-badge.bg-green,.q-badge.bg-orange,.q-badge.bg-amber,.q-badge.bg-grey,"
     ".q-badge.bg-teal,.q-badge.bg-red{color:#18181b!important}"
+    # 【来源是标签，不是信号】メルカリ/ヤフオク 这类徽标回答的是"它在哪"，
+    # 而捡漏/已降/新上架回答的是"要不要点进去"。两者同样是实心色块的话，
+    # 一行里五六个色块抢注意力，真正的信号反而沉下去了。
+    # 改成描边：同样占位、同样可读，但视觉重量降一档。
+    ".q-badge.badge-label{background:transparent!important;color:rgba(255,255,255,.55)!important;"
+    "border:1px solid rgba(255,255,255,.22);font-weight:400}"
+    # Quasar 的按钮为大写英文留了字距，中日文标签上只会显得松散
+    ".q-btn{letter-spacing:0}"
     "}"
     "</style>"
 )
@@ -50,6 +70,19 @@ DARK_CSS = (
 # 发货地标签只标这一个 —— 你要的是「在不在东京都内」，其余都道府县
 # 照常显示在下面那行小字里，但不占徽标位。
 TOKYO = "東京都"
+
+# 【按钮只有这几种角色，别再发明第四种】改之前这里有 8 种 props 写法，
+# 有的带 dense 有的不带（高度差一截）、有的浮起有的扁平，同一行里就能看出参差。
+# 统一到角色之后，加新按钮时照抄一个常量即可，不用再逐个拍板。
+BTN_PRIMARY = "unelevated dense no-caps color=primary"        # 主操作：一键抓取、保存
+BTN_GHOST = "flat dense no-caps color=primary"                # 次操作：设置、编辑、跑一轮
+BTN_QUIET = "flat dense no-caps"                              # 轻操作：刷新、取消
+BTN_DANGER = "flat dense no-caps color=negative"              # 危险：拉黑、删除
+BTN_DANGER_SOLID = "unelevated dense no-caps color=negative"  # 危险且要确认：删除对话框
+INPUT = "dense outlined"                                      # 所有输入框
+
+# 徽标分两类：信号（实心，抢眼）和标签（描边，只说明"它是什么"）
+BADGE_LABEL = "badge-label"
 
 COND = {1: "新品未使用", 2: "未使用に近い", 3: "傷汚れなし",
         4: "やや傷汚れ", 5: "傷や汚れあり", 6: "状態が悪い"}
@@ -217,6 +250,19 @@ def blacklist_seller(rule_id: int, seller_id: str) -> None:
     all_view.refresh()
 
 
+@contextmanager
+def toolbar(desc: str):
+    """每一页顶上那一行：左边操作按钮，右边一句话说明。
+
+    统一它是因为原先五个页各长各的 —— 有的有说明有的没有，成交页的说明跟在
+    按钮后面、设置页的塞在正文第一行，字号和间距也各不相同。
+    页面一多，这种参差比任何单点的丑都更显得没收拾过。
+    """
+    with ui.row().classes("items-center gap-2 mb-3 flex-wrap w-full"):
+        yield
+        ui.label(desc).classes("text-xs text-gray-400")
+
+
 # ------------------------------------------------------------------ 命中页
 
 @ui.refreshable
@@ -263,16 +309,16 @@ def hits_view(host=None) -> None:
                 # hits_view 自己的刷新容器内 —— refresh() 的第一步是 container.clear()，
                 # 会把还开着的对话框连同你敲了一半的内容一起删掉，而且不给任何提示。
                 ui.button("设置规则", on_click=lambda _, r=rule: rule_dialog(r, host)) \
-                    .props("flat dense no-caps size=sm color=primary") \
+                    .props(BTN_GHOST + " size=sm") \
                     .tooltip("改关键词、词表、价格区间、数据源 —— 和「规则」页是同一个框")
                 ui.label("手动捡漏价 ¥").classes("text-xs text-gray-400")
                 # 【必须用默认参数绑死 rid/comp】这两个是循环变量，直接引用的话
                 # 等你点保存时它们早就指向最后一条规则了 —— 每个按钮都会改同一条。
                 inp = ui.number(value=rule["deal_price"] or None, format="%d") \
-                    .props("dense outlined").classes("w-40")
+                    .props(INPUT).classes("w-40")
                 ui.button("保存", on_click=lambda _, rid=rule["id"], c=inp:
                           save_deal_price(rid, c.value)) \
-                    .props("flat dense no-caps size=sm color=primary")
+                    .props(BTN_GHOST + " size=sm")
                 ui.label("低于它就算捡漏，填了就盖过下面的百分比；留空或 0 = 回到按成交中位数判"
                          ).classes("text-xs text-gray-400")
             if not rows:
@@ -379,7 +425,7 @@ def hits_view(host=None) -> None:
                                         "拉黑卖家",
                                         on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
                                             blacklist_seller(rid, sid),
-                                    ).props("flat dense no-caps size=sm color=negative") \
+                                    ).props(BTN_DANGER + " size=sm") \
                                      .classes("text-xs px-1").tooltip(
                                         f"卖家 {r['seller_id']}\n"
                                         "拉黑后这条规则下他的全部商品立刻判为不合适。"
@@ -399,7 +445,7 @@ def hits_view(host=None) -> None:
                         with ui.column().classes("gap-0 items-end shrink-0 whitespace-nowrap"):
                             # 来源放在价格正上方：这两个信息是一起看的 ——
                             # 同一个价格在哪个平台，直接决定你怎么去买
-                            ui.badge(source_name(r["source"]), color="blue-grey").classes("mb-1")
+                            ui.badge(source_name(r["source"])).classes(BADGE_LABEL + " mb-1")
                             ui.label(yen(r["price"])).classes("text-lg font-bold")
                             if r["deal_pct"]:
                                 ui.label(f"市价的 {r['deal_pct']}%").classes(
@@ -503,7 +549,7 @@ def sold_view() -> None:
 
             if tracked:
                 ui.label("我们一路跟到成交的（拉过详情、过了完整规则，信息最全）") \
-                    .classes("text-sm text-gray-300 mt-1")
+                    .classes("text-sm text-gray-400 mt-1")
                 with ui.element("div").classes(
                         "grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
                     for r in tracked:
@@ -538,7 +584,7 @@ def _sold_row(r: dict, med: int | None) -> None:
                     ui.label(f"从 {yen(r['first_price'])} 降了 "
                              f"{yen(r['first_price'] - r['price'])} 才卖掉").classes("text-red-400")
         with ui.column().classes("gap-0 items-end shrink-0 whitespace-nowrap"):
-            ui.badge(source_name(r["source"]), color="blue-grey").classes("mb-1")
+            ui.badge(source_name(r["source"])).classes(BADGE_LABEL + " mb-1")
             ui.label(yen(r["price"])).classes("text-lg font-bold")
             if med:
                 ui.label(f"市价的 {r['price'] * 100 // med}%").classes("text-xs text-gray-400")
@@ -630,7 +676,7 @@ def all_view(rule_id: int | None, reason: str) -> None:
     with tbl.add_slot("body-cell-act"):
         with tbl.cell("act"):
             ui.button().props(
-                'flat dense no-caps size=sm color=negative '
+                BTN_DANGER + ' size=sm '
                 ':label="props.row.act" :disable="!props.row.can_bl"'
             ).on(
                 "click",
@@ -667,35 +713,35 @@ def rule_dialog(rule: dict | None, host=None) -> None:
         ui.label("编辑规则" if rule else "新建规则").classes("text-lg font-bold")
         with ui.column().classes("w-full gap-2"):
             for f in ("name", "keyword", "include_all", "include_any"):
-                ui.input(f, value=data[f]).classes("w-full").props("dense outlined") \
+                ui.input(f, value=data[f]).classes("w-full").props(INPUT) \
                     .bind_value(data, f).tooltip(FIELD_HELP.get(f, ""))
                 ui.label(FIELD_HELP.get(f, "")).classes("text-xs text-gray-400 -mt-2")
             for f in ("exclude_any", "warn_desc", "exclude_sellers"):
-                ui.textarea(f, value=data[f]).classes("w-full").props("dense outlined rows=3") \
+                ui.textarea(f, value=data[f]).classes("w-full").props(INPUT + " rows=3") \
                     .bind_value(data, f)
                 ui.label(FIELD_HELP.get(f, "")).classes("text-xs text-gray-400 -mt-2")
             with ui.row().classes("w-full gap-3"):
                 ui.number("价格下限 ¥", value=data["price_min"], format="%d") \
-                    .props("dense outlined").bind_value(data, "price_min")
+                    .props(INPUT).bind_value(data, "price_min")
                 ui.number("价格上限 ¥（0=不限）", value=data["price_max"], format="%d") \
-                    .props("dense outlined").bind_value(data, "price_max")
+                    .props(INPUT).bind_value(data, "price_max")
                 ui.number("手动捡漏价 ¥（0=不用）", value=data["deal_price"], format="%d") \
-                    .props("dense outlined").bind_value(data, "deal_price") \
+                    .props(INPUT).bind_value(data, "deal_price") \
                     .tooltip("低于它就算捡漏。【填了就完全盖过右边的百分比】"
                              "它的意义是不依赖成交样本 —— 规则刚建、或某个型号成交太少"
                              "算不出中位数时，百分比那套整个不工作，而你心里是有价的")
                 ui.number("捡漏线 %", value=data["deal_ratio"], format="%d") \
-                    .props("dense outlined").bind_value(data, "deal_ratio") \
+                    .props(INPUT).bind_value(data, "deal_ratio") \
                     .tooltip("低于「成交中位数 × 此值%」时标捡漏。0=关闭。"
                              "左边填了手动价的话这一项不生效")
                 ui.number("扫描间隔 分", value=data["quick_min"], format="%d", min=1) \
-                    .props("dense outlined").bind_value(data, "quick_min") \
+                    .props(INPUT).bind_value(data, "quick_min") \
                     .tooltip("至少 1 分钟。这个值直接决定对外发请求的频率")
             ui.input("品相白名单", value=data["condition_ids"]).classes("w-full") \
-                .props("dense outlined").bind_value(data, "condition_ids") \
+                .props(INPUT).bind_value(data, "condition_ids") \
                 .tooltip(FIELD_HELP["condition_ids"])
             ui.label(FIELD_HELP["condition_ids"]).classes("text-xs text-gray-400 -mt-2")
-            ui.input("备注", value=data["note"]).classes("w-full").props("dense outlined") \
+            ui.input("备注", value=data["note"]).classes("w-full").props(INPUT) \
                 .bind_value(data, "note")
             # 数据源多选：全不选＝全部源（和 sources 列留空等价）
             all_keys = list(sources.all_sources())
@@ -777,8 +823,8 @@ def rule_dialog(rule: dict | None, host=None) -> None:
             dlg.delete()
 
         with ui.row().classes("w-full justify-end gap-2"):
-            ui.button("取消", on_click=close).props("flat")
-            ui.button("保存", on_click=save).props("color=primary")
+            ui.button("取消", on_click=close).props(BTN_QUIET)
+            ui.button("保存", on_click=save).props(BTN_PRIMARY)
     dlg.open()
 
 
@@ -801,14 +847,14 @@ def confirm_delete(rule: dict, host=None) -> None:
             notify("已删除")
 
         with ui.row().classes("w-full justify-end gap-2"):
-            ui.button("取消", on_click=close).props("flat")
-            ui.button("删除", on_click=do).props("color=negative")
+            ui.button("取消", on_click=close).props(BTN_QUIET)
+            ui.button("删除", on_click=do).props(BTN_DANGER_SOLID)
     dlg.open()
 
 
 @ui.refreshable
 def rules_view(host=None) -> None:
-    ui.button("新建规则", on_click=lambda: rule_dialog(None, host)).props("color=primary")
+    # 「新建规则」已经移到页面顶上的 toolbar 里，这里只列规则卡片
     for rule in store.get_rules():
         st = store.get_state(rule["id"])
         # 【命中＝当前在售的命中】和「命中」页显示的是同一批。
@@ -836,7 +882,7 @@ def rules_view(host=None) -> None:
                               "FROM item WHERE rule_id = %s AND source = %s",
                               (rule["id"], src.key))
                 with ui.row().classes("gap-3 text-xs text-gray-400 items-center"):
-                    ui.badge(src.name, color="blue-grey")
+                    ui.badge(src.name).classes(BADGE_LABEL)
                     ui.label(f"上次扫描 {ss['last_scan_at']:%m-%d %H:%M}"
                              if ss["last_scan_at"] else "还没扫过")
                     ui.label(f"在售 {ss['last_total']}")
@@ -848,10 +894,10 @@ def rules_view(host=None) -> None:
             if rule["note"]:
                 ui.label(rule["note"]).classes("text-xs text-gray-400")
             with ui.row().classes("gap-2"):
-                ui.button("编辑", on_click=lambda r=rule: rule_dialog(r, host)).props("flat dense")
-                ui.button("立即跑一轮", on_click=lambda r=rule: run_now(r)).props("flat dense")
+                ui.button("编辑", on_click=lambda r=rule: rule_dialog(r, host)).props(BTN_GHOST)
+                ui.button("立即跑一轮", on_click=lambda r=rule: run_now(r)).props(BTN_GHOST)
                 ui.button("删除", on_click=lambda r=rule: confirm_delete(r, host)
-                          ).props("flat dense color=negative")
+                          ).props(BTN_DANGER)
 
 
 # 【进程级的重入闸】面板是多标签页的，而抓取是服务端动作 ——
@@ -914,20 +960,17 @@ async def run_now(rule: dict) -> None:
 
 @ui.refreshable
 def settings_view() -> None:
-    ui.label("这些是全局设置，对所有规则生效。改完保存，10 秒内自动生效，不用重启。").classes(
-        "text-sm text-gray-400")
-
     fields: dict = {}
     for it in store.all_settings():
         with ui.card().classes("w-full my-1 py-2"):
             # 【字符串项必须用 ui.input】拿 ui.number 装 URL 会直接显示成空白，
             # 而且保存时 value 是 None —— 看起来像"填了没保存上"。
             if it["type"] == "str":
-                comp = ui.input(it["k"], value=it["v"]).classes("w-full").props("dense outlined")
+                comp = ui.input(it["k"], value=it["v"]).classes("w-full").props(INPUT)
             else:
                 comp = ui.number(it["k"], value=it["v"],
                                  format="%d" if it["type"] == "int" else "%.1f") \
-                    .classes("w-full").props("dense outlined")
+                    .classes("w-full").props(INPUT)
             fields[it["k"]] = (comp, it)
             # 说明里有换行（推送那几项列了各家的地址格式），预留换行才看得清
             ui.label(it["note"]).classes("text-xs text-gray-400 whitespace-pre-line")
@@ -977,7 +1020,7 @@ def settings_view() -> None:
         else:
             notify("已保存，10 秒内生效")
 
-    ui.button("保存全部", on_click=save).props("color=primary").classes("mt-2")
+    ui.button("保存全部", on_click=save).props(BTN_PRIMARY).classes("mt-2")
 
 
 # ------------------------------------------------------------------ 组装
@@ -1032,32 +1075,37 @@ def create() -> None:
             t_set = ui.tab("设置")
         with ui.tab_panels(tabs, value=t_hit).classes("w-full"):
             with ui.tab_panel(t_hit):
-                with ui.row().classes("items-center gap-2"):
-                    ui.button("一键抓取", on_click=fetch_all).props("color=primary dense no-caps") \
+                with toolbar("当前符合条件的在售商品，按「市价的百分之多少」从低到高排"):
+                    ui.button("一键抓取", on_click=fetch_all).props(BTN_PRIMARY) \
                         .tooltip("所有启用的规则立刻各跑一轮。常驻轮询照常继续，"
                                  "两边共用同一套限速，不会因此发得更快")
-                    ui.button("刷新", on_click=hits_view.refresh).props("flat dense no-caps") \
+                    ui.button("刷新", on_click=hits_view.refresh).props(BTN_QUIET) \
                         .tooltip("只重画页面，不发请求")
                 hits_view(dialog_host)
             with ui.tab_panel(t_sold):
-                with ui.row().classes("items-center gap-2"):
-                    ui.button("刷新", on_click=sold_view.refresh).props("flat dense no-caps")
-                    ui.label("市场实际用什么价清掉了什么货 —— 定价前先看这一页的分布，"
-                             "别只看中位数那一个数字").classes("text-xs text-gray-400")
+                with toolbar("市场实际用什么价清掉了什么货 —— 定价前先看分布，"
+                             "别只看中位数那一个数字"):
+                    ui.button("刷新", on_click=sold_view.refresh).props(BTN_QUIET)
                 sold_view()
             with ui.tab_panel(t_all):
                 rules = store.get_rules()
                 opts = {None: "全部规则", **{r["id"]: r["name"] for r in rules}}
-                with ui.row().classes("items-center gap-3"):
-                    sel_rule = ui.select(opts, value=None).props("dense outlined")
+                with toolbar("抓到的每一件，含被判掉的。「具体原因」那一列说清是哪个词、"
+                             "哪个阈值判的"):
+                    sel_rule = ui.select(opts, value=None).props(INPUT)
                     sel_reason = ui.select(["全部"] + list(REASON_LABEL.values()),
-                                           value="全部").props("dense outlined")
+                                           value="全部").props(INPUT)
                     ui.button("刷新", on_click=lambda: all_view.refresh(
-                        sel_rule.value, sel_reason.value)).props("flat dense")
+                        sel_rule.value, sel_reason.value)).props(BTN_QUIET)
                 sel_rule.on_value_change(lambda: all_view.refresh(sel_rule.value, sel_reason.value))
                 sel_reason.on_value_change(lambda: all_view.refresh(sel_rule.value, sel_reason.value))
                 all_view(None, "全部")
             with ui.tab_panel(t_rule):
+                with toolbar("关键词、词表、价格区间、数据源都在这里。改完下一轮生效"):
+                    ui.button("新建规则",
+                              on_click=lambda: rule_dialog(None, dialog_host)).props(BTN_PRIMARY)
                 rules_view(dialog_host)
             with ui.tab_panel(t_set):
+                with toolbar("对所有规则生效。改完保存，10 秒内自动生效，不用重启"):
+                    pass
                 settings_view()

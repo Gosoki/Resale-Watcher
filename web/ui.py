@@ -54,7 +54,7 @@ DARK_CSS = (
     # 而上面这批背景亮度在 70%~83% —— amber 上白字只有 1.7:1、green 2.2:1，全线看不清。
     # 亮底一律改配深色前景。
     ".q-badge.bg-green,.q-badge.bg-orange,.q-badge.bg-amber,.q-badge.bg-grey,"
-    ".q-badge.bg-teal,.q-badge.bg-red{color:#18181b!important}"
+    ".q-badge.bg-teal,.q-badge.bg-red,.q-badge.bg-purple{color:#18181b!important}"
     # 【来源是标签，不是信号】メルカリ/ヤフオク 这类徽标回答的是"它在哪"，
     # 而捡漏/已降/新上架回答的是"要不要点进去"。两者同样是实心色块的话，
     # 一行里五六个色块抢注意力，真正的信号反而沉下去了。
@@ -63,6 +63,13 @@ DARK_CSS = (
     "border:1px solid rgba(255,255,255,.22);font-weight:400}"
     # Quasar 的按钮为大写英文留了字距，中日文标签上只会显得松散
     ".q-btn{letter-spacing:0}"
+    # 【淡化的危险按钮】拉黑这类操作每行都有一个，全红会把整页压成一片红。
+    # 平时压到 40% 不透明度，鼠标移上去才满 —— 要用时找得到，不用时不碍眼。
+    ".btn-muted{opacity:.55;transition:opacity .15s}"
+    ".btn-muted:hover{opacity:1}"
+    # 東京都 原先用 teal，和「捡漏」的绿是相邻色相，扫一眼分不开，而这俩语义
+    # 完全不同（一个说地点、一个说机会）。换到紫档，和绿/橙/红/琥珀/灰都拉开。
+    ".q-badge.bg-purple{background:oklch(71.4% 0.203 305.504)!important}"    # purple-400
     "}"
     "</style>"
 )
@@ -308,23 +315,29 @@ def hits_view(host=None) -> None:
         with ui.expansion(head, caption=" · ".join(summary), value=True) \
                 .classes(CARD).props("header-class=text-base"):
             # 【放在「没有商品」判断之前】一件都没命中的时候，恰恰是你最想调这个价的时候。
-            with ui.row().classes("items-center gap-2 mb-2 flex-wrap"):
+            # 原先这一行是五个元素平铺：按钮、标签、输入框、按钮、一长串说明 ——
+            # 输入框比周围都高、两个按钮同色同权重、说明拖着很长的尾巴，像堆在一起的。
+            # 改成：左边一个带 ¥ 前缀和内嵌保存键的紧凑输入框，右边一个次要入口，
+            # 说明收进 tooltip（要看的人 hover 一下就有，不看的人不用被它占一行）。
+            with ui.row().classes("items-center gap-3 mb-3 flex-wrap"):
+                # 【必须用默认参数绑死 rid/comp】这两个是循环变量，直接引用的话
+                # 等你点保存时它们早就指向最后一条规则了 —— 每个按钮都会改同一条。
+                inp = ui.number(value=rule["deal_price"] or None, format="%d",
+                                placeholder="不填＝按市价百分比") \
+                    .props(INPUT + ' prefix="捡漏价 ¥" input-class=text-right') \
+                    .classes("w-64").tooltip(
+                        "低于这个价就算捡漏。填了就完全盖过「成交中位数 × 百分比」那套，"
+                        "而且不依赖成交样本 —— 样本不够、或挂单价整体高于成交价时，"
+                        "百分比那条线永远碰不到，只能用它。留空或 0 = 回到按百分比判")
+                ui.button("保存", on_click=lambda _, rid=rule["id"], c=inp:
+                          save_deal_price(rid, c.value)) \
+                    .props(BTN_PRIMARY + " size=sm")
                 # 【host 必须一路传进来】对话框要建在页面级容器里，不能建在
                 # hits_view 自己的刷新容器内 —— refresh() 的第一步是 container.clear()，
                 # 会把还开着的对话框连同你敲了一半的内容一起删掉，而且不给任何提示。
                 ui.button("设置规则", on_click=lambda _, r=rule: rule_dialog(r, host)) \
                     .props(BTN_GHOST + " size=sm") \
                     .tooltip("改关键词、词表、价格区间、数据源 —— 和「规则」页是同一个框")
-                ui.label("手动捡漏价 ¥").classes("text-xs text-gray-400")
-                # 【必须用默认参数绑死 rid/comp】这两个是循环变量，直接引用的话
-                # 等你点保存时它们早就指向最后一条规则了 —— 每个按钮都会改同一条。
-                inp = ui.number(value=rule["deal_price"] or None, format="%d") \
-                    .props(INPUT).classes("w-40")
-                ui.button("保存", on_click=lambda _, rid=rule["id"], c=inp:
-                          save_deal_price(rid, c.value)) \
-                    .props(BTN_GHOST + " size=sm")
-                ui.label("低于它就算捡漏，填了就盖过下面的百分比；留空或 0 = 回到按成交中位数判"
-                         ).classes("text-xs text-gray-400")
             if not rows:
                 ui.label("当前没有符合条件的在售商品。").classes("text-gray-400 text-sm")
                 continue
@@ -376,7 +389,7 @@ def hits_view(host=None) -> None:
                                             f"我们首次发现它时是 {yen(r['first_price'])}，"
                                             f"现在 {yen(r['price'])}")
                                     if r["ship_from"] == TOKYO:
-                                        ui.badge(TOKYO, color="teal").tooltip(
+                                        ui.badge(TOKYO, color="purple").tooltip(
                                             "发货地在东京都内。【只有拉过详情的商品才知道发货地】"
                                             "三个源都只在详情里给这个字段，搜索结果里没有——"
                                             "没这个标不等于不在东京，可能只是还没拉详情")
@@ -414,26 +427,10 @@ def hits_view(host=None) -> None:
                             # 配合正文列的 self-stretch（让它撑满卡片高度）才生效。
                             with ui.row().classes(
                                     "gap-3 text-xs text-gray-400 items-center mt-auto pt-1"):
-                                # 【这一行永远只有这四项，固定顺序】
-                                #   拉黑卖家 → 品相 → 发货地 → 上架时间
-                                # 别再往这里塞东西：它贴在卡片底部、两列之间要对齐，
-                                # 多一项少一项都会让两边错位。会变的信息一律做成徽标
-                                # 放到标题上方（降价就是这么挪上去的）。
-                                # 【必须用默认参数绑死 rid/sid】这两个是循环变量，
-                                # 直接在 lambda 里引用 rule/r 的话，等你点下去时它们
-                                # 早就指向循环的最后一件商品了 —— 每个按钮都会拉黑同一个人。
-                                # 卖家ID为空时不给按钮：ヤフオク 有一部分商品不给卖家ID，
-                                # 没有可拉黑的对象，画个点不动的按钮只会让人以为坏了。
-                                if r["seller_id"]:
-                                    ui.button(
-                                        "拉黑卖家",
-                                        on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
-                                            blacklist_seller(rid, sid),
-                                    ).props(BTN_DANGER + " size=sm") \
-                                     .classes("text-xs px-1").tooltip(
-                                        f"卖家 {r['seller_id']}\n"
-                                        "拉黑后这条规则下他的全部商品立刻判为不合适。"
-                                        "想反悔就去规则页把 ID 从 exclude_sellers 里删掉")
+                                # 【这一行永远只有这三项，固定顺序】品相 → 发货地 → 上架时间
+                                # 别再往这里塞东西：它贴卡片底部、两列之间要横向对齐，
+                                # 多一项少一项都会让两边错位。会变的信息一律做成徽标放标题上方
+                                # （降价就是这么挪上去的），操作按钮放右边价格列（拉黑同理）。
                                 ui.label(COND.get(r["condition_id"], "品相未标"))
                                 # 非东京的也显示出来 —— 不然「这件为什么没有东京标」
                                 # 你分不清是「不在东京」还是「还没拉详情」
@@ -446,14 +443,39 @@ def hits_view(host=None) -> None:
 
                         # shrink-0：价格列宽度固定，不参与压缩
                         # whitespace-nowrap：¥1,188,800 这种数字本身也绝不折行
-                        with ui.column().classes("gap-0 items-end shrink-0 whitespace-nowrap"):
+                        # self-stretch：和正文列一样撑满卡片高度，下面拉黑按钮的 mt-auto
+                        # 才能把它压到底 —— 否则它悬在半空，和左边那行小字不在同一条基线上。
+                        with ui.column().classes(
+                                "gap-0 items-end shrink-0 whitespace-nowrap self-stretch"):
                             # 来源放在价格正上方：这两个信息是一起看的 ——
                             # 同一个价格在哪个平台，直接决定你怎么去买
                             ui.badge(source_name(r["source"])).classes(BADGE_LABEL + " mb-1")
                             ui.label(yen(r["price"])).classes("text-lg font-bold")
                             if r["deal_pct"]:
+                                # 【颜色按百分比本身，不按 is_deal】跟着 is_deal 走的话，
+                                # 手动捡漏价一开，「市价的 110%」会显示成绿色 —— 绿色读作
+                                # 「便宜」，而 110% 是贵了一成，界面在自相矛盾。
+                                # 是不是捡漏由上面那个绿徽标说，这里只说贵还是便宜。
                                 ui.label(f"市价的 {r['deal_pct']}%").classes(
-                                    "text-xs " + ("text-green-400" if r["is_deal"] else "text-gray-400"))
+                                    "text-xs " + ("text-green-400" if r["deal_pct"] < 100
+                                                  else "text-gray-400"))
+                            # 【拉黑挪到这里】原先它在卡片左下角、红字，整页重复十几次，
+                            # 红是危险色，于是它成了最抢眼的东西，把捡漏/已降这些真信号压下去。
+                            # 放价格列底部：位置固定、不挡左边的阅读动线，要用时找得到。
+                            # 【必须用默认参数绑死 rid/sid】它们是循环变量，直接引用的话
+                            # 等你点下去时早就指向最后一件商品了 —— 每个按钮拉黑同一个人。
+                            # 卖家ID为空时不给按钮：ヤフオク 有一部分商品不给卖家ID，
+                            # 没有可拉黑的对象，画个点不动的按钮只会让人以为坏了。
+                            if r["seller_id"]:
+                                ui.button(
+                                    "拉黑卖家",
+                                    on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
+                                        blacklist_seller(rid, sid),
+                                ).props(BTN_DANGER + " size=sm").classes("btn-muted mt-auto") \
+                                 .tooltip(
+                                    f"卖家 {r['seller_id']}\n"
+                                    "拉黑后这条规则下他的全部商品立刻判为不合适。"
+                                    "想反悔就去规则页把 ID 从 exclude_sellers 里删掉")
 
 
 def _can_blacklist(row: dict, rule: dict) -> bool:
@@ -573,7 +595,7 @@ def _sold_row(r: dict, med: int | None) -> None:
             with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
                 ui.badge("已成交", color="grey")
                 if r["ship_from"] == TOKYO:
-                    ui.badge(TOKYO, color="teal")
+                    ui.badge(TOKYO, color="purple")
                 if r["is_deal"]:
                     # 卖掉的捡漏货 = 你错过的那些。摆出来是为了让你知道
                     # 这个价位真的会被人买走，下次别犹豫。
@@ -636,8 +658,11 @@ def all_view(rule_id: int | None, reason: str) -> None:
             {"name": "reason", "label": "判定", "field": "reason", "align": "left", "sortable": True},
             {"name": "detail", "label": "具体原因", "field": "detail", "align": "left"},
             {"name": "status", "label": "状态", "field": "status", "align": "left"},
-            {"name": "name", "label": "标题（点击打开商品页）", "field": "name", "align": "left"},
+            # 【卖家列必须排在标题前面】标题是贪婪列（没给宽度，吃掉剩余空间），
+            # 把卖家放它后面的话，整列会被挤出视口 —— 那一页的拉黑按钮就点不到了，
+            # 而且表格横向滚动条在暗色下几乎看不见，人根本不知道右边还有东西。
             {"name": "act", "label": "卖家", "field": "act", "align": "left"},
+            {"name": "name", "label": "标题（点击打开商品页）", "field": "name", "align": "left"},
         ],
         rows=[{
             "id": f"{r['source']}-{r['item_id']}-{r['rule_id']}",
@@ -880,7 +905,7 @@ def rules_view(host=None) -> None:
                 ui.label(f"入库 {stats['total'] or 0} · 在售命中 {int(stats['hit'] or 0)}"
                          ).classes("text-sm text-gray-400")
             ui.label(f"市价中位 {yen(st['median_price'])}"
-                     f"（跨源 {st['sample_count']} 件成交）").classes("text-xs text-blue-400")
+                     f"（跨源 {st['sample_count']} 件成交）").classes("text-xs text-gray-300")
 
             # 每个数据源单独一行：各源独立计时、独立限速，状态也分开看
             for src in sources.for_rule(rule):
@@ -972,17 +997,24 @@ def settings_view() -> None:
         with ui.card().classes(CARD + " py-2"):
             # 【字符串项必须用 ui.input】拿 ui.number 装 URL 会直接显示成空白，
             # 而且保存时 value 是 None —— 看起来像"填了没保存上"。
+            # 【宽度按内容给，别一律 w-full】这一页原先所有输入框都是整屏宽：
+            # 一个装「48」的框拉到 1600px，看着就是没调过。
+            # 数字项给固定窄框；字符串项是 URL 和 JSON 模板，需要长，但也封个上限。
             if it["type"] == "str":
-                comp = ui.input(it["k"], value=it["v"]).classes("w-full").props(INPUT)
+                comp = ui.input(it["k"], value=it["v"]) \
+                    .classes("w-full max-w-3xl").props(INPUT)
             else:
                 comp = ui.number(it["k"], value=it["v"],
                                  format="%d" if it["type"] == "int" else "%.1f") \
-                    .classes("w-full").props(INPUT)
+                    .classes("w-56").props(INPUT)
             fields[it["k"]] = (comp, it)
-            # 说明里有换行（推送那几项列了各家的地址格式），预留换行才看得清
-            ui.label(it["note"]).classes("text-xs text-gray-400 whitespace-pre-line")
+            # 说明里有换行（推送那几项列了各家的地址格式），预留换行才看得清。
+            # 【必须封行宽】不封的话一行拉到 150 多字，眼睛从行尾回到下一行行首要重新找位置，
+            # 读长说明会很累。max-w-5xl 约 1024px，中日文一行 50 字上下，是舒服的档。
+            ui.label(it["note"]).classes(
+                "text-xs text-gray-400 whitespace-pre-line max-w-5xl leading-relaxed")
             ui.label(f"默认值：{it['default']!r}" if it["type"] == "str"
-                     else f"默认值：{it['default']}").classes("text-xs text-gray-400")
+                     else f"默认值：{it['default']}").classes("text-xs text-gray-500")
 
     # 这几项填 0 不是「关闭」而是各种翻车：
     #   sold_scan_hours=0  成交轮每 30 秒重跑一次

@@ -150,3 +150,48 @@ class Source(ABC):
             return datetime.fromisoformat(v).astimezone(config.JST).replace(tzinfo=None)
         except (ValueError, TypeError):
             return None
+
+# ---------------------------------------------------------------- 发货地
+# 三个源给的形态各不一样，必须在这里就地归一成同一种，否则库里会混着好几种写法，
+# 而面板的「東京都」判断得跟着写好几套 —— 漏写一套就是静默失效（已经栽过一次：
+# ヤフオク 有的卖家会填「東京都 板橋区」，用 == "東京都" 比就把它漏掉了）。
+#   メルカリ      shipping_from_area.name → 「愛知県」，偶尔是「未定」（卖家没设）
+#   ヤフオク      seller.location.prefecture → 「香川県」，也可能带市区町村
+#   Yahoo!フリマ  item.location → 「KAGAWA」大写罗马字
+_ROMAJI = {
+    "HOKKAIDO": "北海道", "AOMORI": "青森県", "IWATE": "岩手県", "MIYAGI": "宮城県",
+    "AKITA": "秋田県", "YAMAGATA": "山形県", "FUKUSHIMA": "福島県", "IBARAKI": "茨城県",
+    "TOCHIGI": "栃木県", "GUNMA": "群馬県", "SAITAMA": "埼玉県", "CHIBA": "千葉県",
+    "TOKYO": "東京都", "KANAGAWA": "神奈川県", "NIIGATA": "新潟県", "TOYAMA": "富山県",
+    "ISHIKAWA": "石川県", "FUKUI": "福井県", "YAMANASHI": "山梨県", "NAGANO": "長野県",
+    "GIFU": "岐阜県", "SHIZUOKA": "静岡県", "AICHI": "愛知県", "MIE": "三重県",
+    "SHIGA": "滋賀県", "KYOTO": "京都府", "OSAKA": "大阪府", "HYOGO": "兵庫県",
+    "NARA": "奈良県", "WAKAYAMA": "和歌山県", "TOTTORI": "鳥取県", "SHIMANE": "島根県",
+    "OKAYAMA": "岡山県", "HIROSHIMA": "広島県", "YAMAGUCHI": "山口県", "TOKUSHIMA": "徳島県",
+    "KAGAWA": "香川県", "EHIME": "愛媛県", "KOCHI": "高知県", "FUKUOKA": "福岡県",
+    "SAGA": "佐賀県", "NAGASAKI": "長崎県", "KUMAMOTO": "熊本県", "OITA": "大分県",
+    "MIYAZAKI": "宮崎県", "KAGOSHIMA": "鹿児島県", "OKINAWA": "沖縄県",
+}
+
+# 47 个都道府県的日文名。【不能用"切到第一个 都/道/府/県"这种写法】——
+# 「京都府」的「都」在第二个字，那样会被切成「京都」。只能拿已知名做前缀匹配。
+_PREF_JA = tuple(_ROMAJI.values())
+
+
+def pref_of(raw) -> str:
+    """把各源的发货地归一成都道府県。
+
+    认不出的原样返回（截断到 16 字）—— 抹成空等于谎报「未知」，
+    而未知会让面板既不打标签也不显示小字，你就分不清是「卖家没设」还是「我们没拉到」。
+    「未定」就是这么一个必须留住的合法取值。
+    """
+    v = str(raw or "").strip()
+    if not v:
+        return ""
+    ja = _ROMAJI.get(v.upper())
+    if ja:
+        return ja
+    for p in _PREF_JA:
+        if v.startswith(p):          # 「東京都 板橋区」→「東京都」
+            return p
+    return v[:16]

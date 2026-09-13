@@ -14,41 +14,58 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from sources.yahoo_flea import _pref  # noqa: E402
+from sources.base import _ROMAJI, pref_of  # noqa: E402
 
 
 def test_罗马字归一成日文():
-    assert _pref("TOKYO") == "東京都"
-    assert _pref("KAGAWA") == "香川県"
-    assert _pref("HOKKAIDO") == "北海道"      # 不是「県」
-    assert _pref("OSAKA") == "大阪府"          # 府
-    assert _pref("KYOTO") == "京都府"
+    assert pref_of("TOKYO") == "東京都"
+    assert pref_of("KAGAWA") == "香川県"
+    assert pref_of("HOKKAIDO") == "北海道"      # 不是「県」
+    assert pref_of("OSAKA") == "大阪府"          # 府
+    assert pref_of("KYOTO") == "京都府"
 
 
 def test_大小写和空白都容忍():
-    assert _pref("tokyo") == "東京都"
-    assert _pref("  TOKYO  ") == "東京都"
+    assert pref_of("tokyo") == "東京都"
+    assert pref_of("  TOKYO  ") == "東京都"
 
 
 def test_认不出的原样留着_不抹成空():
     """抹成空就等于谎报「未知」，而未知会让面板不打标签 ——
     真出现没见过的取值时，留着原文才看得出是对方加了新值。"""
-    assert _pref("NEW_AREA_X") == "NEW_AREA_X"
+    assert pref_of("NEW_AREA_X") == "NEW_AREA_X"
 
 
 def test_空值就是未知():
     for v in (None, "", "   "):
-        assert _pref(v) == ""
+        assert pref_of(v) == ""
 
 
 def test_四十七个都道府県一个不少():
     """少一个就是那个县的商品永远显示成罗马字。"""
-    from sources.yahoo_flea import _PREF
-    assert len(_PREF) == 47
-    assert len(set(_PREF.values())) == 47      # 没有重复映射
+    assert len(_ROMAJI) == 47
+    assert len(set(_ROMAJI.values())) == 47      # 没有重复映射
 
 
 def test_面板用的东京常量和归一结果对得上():
     """两边对不上的话，东京的商品永远不会被打标签，而且没有任何报错。"""
     from web.ui import TOKYO
-    assert _pref("TOKYO") == TOKYO
+    assert pref_of("TOKYO") == TOKYO
+
+
+def test_带市区町村的要归一到都道府県():
+    """【这条是踩出来的】ヤフオク 有卖家填「東京都 板橋区」，
+    而面板用 == "東京都" 比对 —— 这件在东京的商品当场被漏掉，
+    而且没有任何报错，你只会觉得「标签时灵时不灵」。"""
+    assert pref_of("東京都 板橋区") == "東京都"
+    assert pref_of("大阪府 堺市") == "大阪府"
+
+
+def test_不能用切到第一个都道府県字的写法():
+    """「京都府」的「都」在第二个字 —— 按字符切会切成「京都」，
+    于是京都府的商品永远匹配不上任何一个已知都道府県。
+    所以只能拿 47 个已知名做前缀匹配。"""
+    assert pref_of("京都府") == "京都府"
+    assert pref_of("京都府 左京区") == "京都府"
+    # 反过来：東京都 不能被误判成 京都府
+    assert pref_of("東京都") == "東京都"

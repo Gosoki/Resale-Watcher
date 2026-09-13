@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
-from sources.base import UA, Source
+from sources.base import UA, Source, pref_of
 
 SEARCH_URL = "https://api.mercari.jp/v2/entities:search"
 DETAIL_URL = "https://api.mercari.jp/items/get"
@@ -127,7 +127,7 @@ class Mercari(Source):
             # Mercari 详情接口给的状态字符串和我们库里的取值恰好同名，不用映射
             "status": d.get("status") or "",
             # 形如 {"id": 13, "name": "東京都"}
-            "ship_from": ((d.get("shipping_from_area") or {}).get("name") or "")[:16],
+            "ship_from": pref_of((d.get("shipping_from_area") or {}).get("name")),
         }
 
     def _parse(self, raw: dict) -> dict:

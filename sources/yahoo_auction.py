@@ -31,7 +31,7 @@ import json
 import re
 from urllib.parse import quote
 
-from sources.base import Source
+from sources.base import Source, pref_of
 
 SEARCH_URL = "https://auctions.yahoo.co.jp/search/search?p={kw}&n={n}&b={b}"
 ITEM_PAGE = "https://page.auctions.yahoo.co.jp/jp/auction/{}"
@@ -103,8 +103,9 @@ class YahooAuction(Source):
             "name": item.get("title") or "",
             "status": mapped,
             # seller.location.prefecture，已经是「東京都」这种日文写法
-            "ship_from": str((((item.get("seller") or {}).get("location") or {})
-                              .get("prefecture")) or "")[:16],
+            # 【可能带市区町村】实测有卖家填「東京都 板橋区」，归一到都道府県
+            "ship_from": pref_of((((item.get("seller") or {}).get("location") or {})
+                                  .get("prefecture"))),
         }
 
     def _parse(self, blk: str) -> dict:

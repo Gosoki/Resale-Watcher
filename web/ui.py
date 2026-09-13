@@ -37,11 +37,12 @@ DARK_CSS = (
     ".q-badge.bg-amber{background:oklch(82.8% 0.189 84.429)!important}"      # amber-400
     ".q-badge.bg-grey{background:oklch(70.7% 0.022 261.325)!important}"      # gray-400
     ".q-badge.bg-teal{background:oklch(77.7% 0.152 181.912)!important}"      # teal-400
+    ".q-badge.bg-red{background:oklch(70.4% 0.191 22.216)!important}"        # red-400
     # 【这半条和上面是同一个决定】Quasar 的 .q-badge{color:#fff} 是写死的白字，
     # 而上面这批背景亮度在 70%~83% —— amber 上白字只有 1.7:1、green 2.2:1，全线看不清。
     # 亮底一律改配深色前景。
     ".q-badge.bg-green,.q-badge.bg-orange,.q-badge.bg-amber,.q-badge.bg-grey,"
-    ".q-badge.bg-teal{color:#18181b!important}"
+    ".q-badge.bg-teal,.q-badge.bg-red{color:#18181b!important}"
     "}"
     "</style>"
 )
@@ -219,7 +220,7 @@ def blacklist_seller(rule_id: int, seller_id: str) -> None:
 # ------------------------------------------------------------------ 命中页
 
 @ui.refreshable
-def hits_view() -> None:
+def hits_view(host=None) -> None:
     rules = store.get_rules()
     if not rules:
         ui.label("还没有规则，去「规则」页新建一条。").classes("text-gray-400 p-4")
@@ -258,6 +259,12 @@ def hits_view() -> None:
                 .classes("w-full mb-3").props("header-class=text-base"):
             # 【放在「没有商品」判断之前】一件都没命中的时候，恰恰是你最想调这个价的时候。
             with ui.row().classes("items-center gap-2 mb-2 flex-wrap"):
+                # 【host 必须一路传进来】对话框要建在页面级容器里，不能建在
+                # hits_view 自己的刷新容器内 —— refresh() 的第一步是 container.clear()，
+                # 会把还开着的对话框连同你敲了一半的内容一起删掉，而且不给任何提示。
+                ui.button("设置规则", on_click=lambda _, r=rule: rule_dialog(r, host)) \
+                    .props("flat dense no-caps size=sm color=primary") \
+                    .tooltip("改关键词、词表、价格区间、数据源 —— 和「规则」页是同一个框")
                 ui.label("手动捡漏价 ¥").classes("text-xs text-gray-400")
                 # 【必须用默认参数绑死 rid/comp】这两个是循环变量，直接引用的话
                 # 等你点保存时它们早就指向最后一条规则了 —— 每个按钮都会改同一条。
@@ -296,16 +303,28 @@ def hits_view() -> None:
                                 "w-24 h-24 object-cover rounded shrink-0")
                         # leading-snug：正文是 3~4 行小字堆起来的，默认行高留白偏多，
                         # 累积下来整张卡片会显得松垮
-                        with ui.column().classes("gap-0 grow min-w-0 leading-snug"):
+                        # self-stretch：撑满卡片高度，下面那行小字的 mt-auto 才顶得到底
+                        with ui.column().classes(
+                                "gap-0 grow min-w-0 leading-snug self-stretch"):
                             # 【徽标在标题上方】它们是"要不要点进去"的信号，得一眼看见。
                             # 放在标题后面的话，遇到长标题（全库最长 130 字，超 70 字的有
                             # 一百多件）就会被推到第二三行的行尾，等于没有。
                             # 没有任何徽标时整行不渲染，不留空档。
+                            dropped = r["price"] < r["first_price"]
                             if (r["is_deal"] or fresh or r["desc_warn"]
-                                    or r["ship_from"] == TOKYO):
+                                    or r["ship_from"] == TOKYO or dropped):
                                 with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
                                     if r["is_deal"]:
                                         ui.badge("捡漏", color="green")
+                                    if dropped:
+                                        # 【降价属于徽标不属于小字】它和捡漏/新上架是同一类
+                                        # 信息：决定你要不要点进去。摆在最下面那行灰字里，
+                                        # 和品相、发货地混在一起，等于把它藏了。
+                                        # 首见价放进 tooltip —— 徽标要短，一眼能扫过去。
+                                        ui.badge(f"已降 {yen(r['first_price'] - r['price'])}",
+                                                 color="red").tooltip(
+                                            f"我们首次发现它时是 {yen(r['first_price'])}，"
+                                            f"现在 {yen(r['price'])}")
                                     if r["ship_from"] == TOKYO:
                                         ui.badge(TOKYO, color="teal").tooltip(
                                             "发货地在东京都内。【只有拉过详情的商品才知道发货地】"
@@ -339,12 +358,17 @@ def hits_view() -> None:
                             note, color = auction_note(r)
                             if note:
                                 ui.label(note).classes(f"text-xs {color}")
-                            with ui.row().classes("gap-3 text-xs text-gray-400 items-center"):
-                                ui.label(COND.get(r["condition_id"], "品相未标"))
-                                # 非东京的也显示出来 —— 不然「这件为什么没有东京标」
-                                # 你分不清是「不在东京」还是「还没拉详情」
-                                if r["ship_from"]:
-                                    ui.label(f"发货 {r['ship_from']}")
+                            # 【mt-auto 把这一行顶到卡片底部】宽屏两列时，同一行的两张
+                            # 卡片高度取决于高的那张；不顶到底部的话，矮的那张这一行会
+                            # 悬在半空，两列的这排小字对不齐，扫起来很累。
+                            # 配合正文列的 self-stretch（让它撑满卡片高度）才生效。
+                            with ui.row().classes(
+                                    "gap-3 text-xs text-gray-400 items-center mt-auto pt-1"):
+                                # 【这一行永远只有这四项，固定顺序】
+                                #   拉黑卖家 → 品相 → 发货地 → 上架时间
+                                # 别再往这里塞东西：它贴在卡片底部、两列之间要对齐，
+                                # 多一项少一项都会让两边错位。会变的信息一律做成徽标
+                                # 放到标题上方（降价就是这么挪上去的）。
                                 # 【必须用默认参数绑死 rid/sid】这两个是循环变量，
                                 # 直接在 lambda 里引用 rule/r 的话，等你点下去时它们
                                 # 早就指向循环的最后一件商品了 —— 每个按钮都会拉黑同一个人。
@@ -360,10 +384,16 @@ def hits_view() -> None:
                                         f"卖家 {r['seller_id']}\n"
                                         "拉黑后这条规则下他的全部商品立刻判为不合适。"
                                         "想反悔就去规则页把 ID 从 exclude_sellers 里删掉")
-                                if r["price"] < r["first_price"]:
-                                    ui.label(f"已降 {yen(r['first_price'] - r['price'])}"
-                                             f"（首见 {yen(r['first_price'])}）").classes("text-red-400")
-                                ui.label(f"上架 {r['listed_at']:%m-%d %H:%M}" if r["listed_at"] else "")
+                                ui.label(COND.get(r["condition_id"], "品相未标"))
+                                # 非东京的也显示出来 —— 不然「这件为什么没有东京标」
+                                # 你分不清是「不在东京」还是「还没拉详情」
+                                if r["ship_from"]:
+                                    ui.label(f"发货 {r['ship_from']}")
+                                if r["listed_at"]:
+                                    # 【没有上架时间就整个不渲染】ヤフオク 不给这个字段，
+                                    # 渲染成空 label 会在两列之间留一个对不齐的空档
+                                    ui.label(f"上架 {r['listed_at']:%m-%d %H:%M}")
+
                         # shrink-0：价格列宽度固定，不参与压缩
                         # whitespace-nowrap：¥1,188,800 这种数字本身也绝不折行
                         with ui.column().classes("gap-0 items-end shrink-0 whitespace-nowrap"):
@@ -1008,7 +1038,7 @@ def create() -> None:
                                  "两边共用同一套限速，不会因此发得更快")
                     ui.button("刷新", on_click=hits_view.refresh).props("flat dense no-caps") \
                         .tooltip("只重画页面，不发请求")
-                hits_view()
+                hits_view(dialog_host)
             with ui.tab_panel(t_sold):
                 with ui.row().classes("items-center gap-2"):
                     ui.button("刷新", on_click=sold_view.refresh).props("flat dense no-caps")

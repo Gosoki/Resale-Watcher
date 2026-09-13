@@ -66,6 +66,21 @@ DARK_CSS = (
     # 【淡化的危险按钮】拉黑这类操作每行都有一个，全红会把整页压成一片红。
     # 平时压到 40% 不透明度，鼠标移上去才满 —— 要用时找得到，不用时不碍眼。
     ".btn-muted{opacity:.55;transition:opacity .15s}"
+    # 【图片角上的星】收藏手势大家都认得，比底部一个文字按钮自然得多。
+    # 商品图什么底色都有（白盒、亮桌面、深机箱），所以星必须自带描边阴影，
+    # 否则压在浅色图上直接消失。
+    # 【颜色必须连 .q-btn__content 一起写、还要 !important】Quasar 的按钮没指定
+    # color 时默认用主色，只给外层 .star-btn 上色会被它盖掉 —— 星会渲染成蓝的。
+    # 和 BTN_QUIET 当初那个坑同源：flat 按钮的颜色默认不是继承来的。
+    ".star-btn{min-width:0!important;min-height:0!important;padding:1px 4px!important;"
+    "font-size:18px;line-height:1;opacity:.8;"
+    "text-shadow:0 0 3px rgba(0,0,0,.95),0 1px 4px rgba(0,0,0,.9);transition:all .15s}"
+    ".star-btn,.star-btn .q-btn__content{color:#fff!important}"
+    ".star-btn:hover{opacity:1;transform:scale(1.2)}"
+    # 已追踪用琥珀实心星：和「捡漏」的绿、「已降」的红都不撞，而且实心/空心
+    # 本身就能一眼看出状态，不必靠颜色分辨。
+    ".star-on{opacity:1}"
+    ".star-on,.star-on .q-btn__content{color:oklch(82.8% 0.189 84.429)!important}"
     ".btn-muted:hover{opacity:1}"
     # 東京都 原先用 teal，和「捡漏」的绿是相邻色相，扫一眼分不开，而这俩语义
     # 完全不同（一个说地点、一个说机会）。换到紫档，和绿/橙/红/琥珀/灰都拉开。
@@ -244,6 +259,33 @@ def toggle_track(source: str, item_id: str, rule_id: int, on: bool) -> None:
     track_view.refresh()
 
 
+def thumb_with_star(r: dict, rule_id: int) -> None:
+    """缩略图 + 右上角的追踪星。
+
+    【为什么星压在图上】收藏是大家都认得的手势，放图角上一眼就懂，也不占正文和
+    价格列的位置。之前那个底部的文字按钮要先读字才知道能点。
+
+    【占位框不能省】某个源哪天返回空缩略图，没有占位的话这一行的正文会直接顶到
+    最左边，和上下几行错开 —— 而且星也没地方挂。
+    """
+    tracked = r["tracked_at"] is not None
+    with ui.element("div").classes("relative shrink-0 w-24 h-24"):
+        if r["thumb_url"]:
+            ui.image(r["thumb_url"]).classes("w-24 h-24 object-cover rounded")
+        else:
+            ui.element("div").classes("w-24 h-24 rounded bg-white/5")
+        # 【必须用默认参数绑死】它们是循环变量，直接引用的话等你点下去时
+        # 早就指向最后一件商品了 —— 每颗星都会追踪同一件。
+        ui.button("★" if tracked else "☆",
+                  on_click=lambda _, so=r["source"], ii=r["item_id"], ri=rule_id,
+                  t=tracked: toggle_track(so, ii, ri, not t)) \
+            .props("flat dense round") \
+            .classes("absolute top-0 right-0 star-btn" + (" star-on" if tracked else "")) \
+            .tooltip("取消追踪" if tracked else
+                     "加入追踪：这件会被单独拉详情刷新，价格、出价数、是否卖掉都比"
+                     "整轮扫描快得多。代价是每次刷新一个请求")
+
+
 def blacklist_seller(rule_id: int, seller_id: str) -> None:
     """把这个卖家加进该规则的黑名单，并【立刻】重判一次。
 
@@ -382,12 +424,10 @@ def hits_view(host=None) -> None:
                     #   flex 子项默认 min-width:auto，不写 min-w-0 的话正文列会被内容
                     #   撑到超过容器宽度，把右边挤没
                     with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
-                        if r["thumb_url"]:
-                            # 96px：正文列在「徽标+标题两行+拍卖提示+品相行」时约 90px 高，
-                            # 图跟着长到差不多，两边才齐。64px 时右边明显空一块，
-                            # 看起来就像行距被撑开了。
-                            ui.image(r["thumb_url"]).classes(
-                                "w-24 h-24 object-cover rounded shrink-0")
+                        # 96px：正文列在「徽标+标题两行+拍卖提示+品相行」时约 90px 高，
+                        # 图跟着长到差不多，两边才齐。64px 时右边明显空一块，
+                        # 看起来就像行距被撑开了。
+                        thumb_with_star(r, rule["id"])
                         # leading-snug：正文是 3~4 行小字堆起来的，默认行高留白偏多，
                         # 累积下来整张卡片会显得松垮
                         # self-stretch：撑满卡片高度，下面那行小字的 mt-auto 才顶得到底
@@ -483,19 +523,8 @@ def hits_view(host=None) -> None:
                                 ui.label(f"市价的 {r['deal_pct']}%").classes(
                                     "text-xs " + ("text-green-400" if r["deal_pct"] < 100
                                                   else "text-gray-400"))
-                            # 操作按钮并排放在价格列底部：位置固定、不挡左边的阅读动线。
-                            # 追踪是常用的正向操作，排在前面；拉黑少用且是负向的，排后面。
+                            # 追踪已经挪到图片角上的星了，这里只剩拉黑。
                             with ui.row().classes("items-center gap-1 mt-auto"):
-                                tracked = r["tracked_at"] is not None
-                                ui.button(
-                                    "追踪中" if tracked else "追踪",
-                                    on_click=lambda _, so=r["source"], ii=r["item_id"],
-                                    ri=rule["id"], t=tracked: toggle_track(so, ii, ri, not t),
-                                ).props((BTN_GHOST if tracked else BTN_QUIET) + " size=sm") \
-                                 .classes("" if tracked else "btn-muted").tooltip(
-                                    "取消追踪" if tracked else
-                                    "加入追踪：这件会被单独拉详情刷新，价格、出价数、"
-                                    "是否卖掉都比整轮扫描快得多。代价是每次刷新一个请求")
                                 # 【必须用默认参数绑死 rid/sid】它们是循环变量，直接引用的话
                                 # 等你点下去时早就指向最后一件商品了 —— 每个按钮拉黑同一个人。
                                 # 卖家ID为空时不给按钮：ヤフオク 有一部分商品不给卖家ID，
@@ -582,8 +611,8 @@ def _track_row(r: dict, rule: dict, st: dict) -> None:
     """布局和命中页同一套，理由见那边的注释。"""
     gone = r["status"] in ("sold_out", "gone")
     with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
-        if r["thumb_url"]:
-            ui.image(r["thumb_url"]).classes("w-24 h-24 object-cover rounded shrink-0")
+        # 和命中页同一颗星：这里它一定是实心的，点一下就是取消追踪
+        thumb_with_star(r, r["rule_id"])
         with ui.column().classes("gap-0 grow min-w-0 leading-snug self-stretch"):
             with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
                 if r["status"] == "sold_out":
@@ -617,10 +646,8 @@ def _track_row(r: dict, rule: dict, st: dict) -> None:
             if r["deal_pct"]:
                 ui.label(f"市价的 {r['deal_pct']}%").classes(
                     "text-xs " + ("text-green-400" if r["deal_pct"] < 100 else "text-gray-400"))
-            ui.button("取消追踪",
-                      on_click=lambda _, so=r["source"], ii=r["item_id"], ri=r["rule_id"]:
-                      toggle_track(so, ii, ri, False)) \
-                .props(BTN_QUIET + " size=sm").classes("btn-muted mt-auto")
+            # 取消追踪已经在图片角的星上，这里不再重复一个按钮 ——
+            # 同一个动作出现两次，人会以为它们不是一回事。
 
 
 # ------------------------------------------------------------------ 成交页

@@ -83,7 +83,9 @@ TOKYO = "東京都"
 # 统一到角色之后，加新按钮时照抄一个常量即可，不用再逐个拍板。
 BTN_PRIMARY = "unelevated dense no-caps color=primary"        # 主操作：一键抓取、保存
 BTN_GHOST = "flat dense no-caps color=primary"                # 次操作：设置、编辑、跑一轮
-BTN_QUIET = "flat dense no-caps"                              # 轻操作：刷新、取消
+# 【必须显式给灰色】flat 不指定 color 时 Quasar 默认用主色 —— 那 BTN_QUIET 和
+# BTN_GHOST 渲染出来一模一样，三档层级塌成两档，"轻操作"这一档等于没做。
+BTN_QUIET = "flat dense no-caps color=grey-5"                 # 轻操作：刷新、取消、设置规则
 BTN_DANGER = "flat dense no-caps color=negative"              # 危险：拉黑、删除
 BTN_DANGER_SOLID = "unelevated dense no-caps color=negative"  # 危险且要确认：删除对话框
 INPUT = "dense outlined"                                      # 所有输入框
@@ -325,18 +327,24 @@ def hits_view(host=None) -> None:
                 inp = ui.number(value=rule["deal_price"] or None, format="%d",
                                 placeholder="不填＝按市价百分比") \
                     .props(INPUT + ' prefix="捡漏价 ¥" input-class=text-right') \
-                    .classes("w-64").tooltip(
+                    .classes("w-72").tooltip(
                         "低于这个价就算捡漏。填了就完全盖过「成交中位数 × 百分比」那套，"
                         "而且不依赖成交样本 —— 样本不够、或挂单价整体高于成交价时，"
                         "百分比那条线永远碰不到，只能用它。留空或 0 = 回到按百分比判")
-                ui.button("保存", on_click=lambda _, rid=rule["id"], c=inp:
-                          save_deal_price(rid, c.value)) \
-                    .props(BTN_PRIMARY + " size=sm")
+                # 【保存键放进输入框内部】原先它是外面一个 size=sm 的按钮，只有输入框
+                # 一半高（24px vs 40px），并排放着高度差一眼就看出来。塞进 append 插槽
+                # 之后高度由 q-input 自己保证，不用去凑两个控件的尺寸。
+                with inp.add_slot("append"):
+                    ui.button("保存", on_click=lambda _, rid=rule["id"], c=inp:
+                              save_deal_price(rid, c.value)) \
+                        .props("flat dense no-caps color=primary").classes("px-2")
                 # 【host 必须一路传进来】对话框要建在页面级容器里，不能建在
                 # hits_view 自己的刷新容器内 —— refresh() 的第一步是 container.clear()，
                 # 会把还开着的对话框连同你敲了一半的内容一起删掉，而且不给任何提示。
+                # 【降到灰色】它和框里那个「保存」挨着，两个都用主色的话权重一样，
+                # 而一个是提交这条价、一个是打开整条规则的设置框，职责差很远。
                 ui.button("设置规则", on_click=lambda _, r=rule: rule_dialog(r, host)) \
-                    .props(BTN_GHOST + " size=sm") \
+                    .props(BTN_QUIET + " size=sm") \
                     .tooltip("改关键词、词表、价格区间、数据源 —— 和「规则」页是同一个框")
             if not rows:
                 ui.label("当前没有符合条件的在售商品。").classes("text-gray-400 text-sm")

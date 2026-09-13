@@ -84,6 +84,10 @@ INPUT = "dense outlined"                                      # 所有输入框
 # 徽标分两类：信号（实心，抢眼）和标签（描边，只说明"它是什么"）
 BADGE_LABEL = "badge-label"
 
+# 卡片和折叠块的外边距只有这一个值。原先是 my-1 / my-2 / mb-3 三种混着，
+# 纵向节奏在页面之间对不上 —— 从设置页切到规则页能看出行距在跳。
+CARD = "w-full my-2"
+
 COND = {1: "新品未使用", 2: "未使用に近い", 3: "傷汚れなし",
         4: "やや傷汚れ", 5: "傷や汚れあり", 6: "状態が悪い"}
 
@@ -302,7 +306,7 @@ def hits_view(host=None) -> None:
         # value=True＝默认展开。折叠状态只活在当前页面里，刷新后回到展开 ——
         # 这正是想要的：命中列表是每次打开都要从头扫一遍的东西。
         with ui.expansion(head, caption=" · ".join(summary), value=True) \
-                .classes("w-full mb-3").props("header-class=text-base"):
+                .classes(CARD).props("header-class=text-base"):
             # 【放在「没有商品」判断之前】一件都没命中的时候，恰恰是你最想调这个价的时候。
             with ui.row().classes("items-center gap-2 mb-2 flex-wrap"):
                 # 【host 必须一路传进来】对话框要建在页面级容器里，不能建在
@@ -540,7 +544,7 @@ def sold_view() -> None:
             f"　🔗 跟到成交 {len(tracked)} 件" if tracked else "")
 
         with ui.expansion(head, caption="　·　".join(cap), value=True) \
-                .classes("w-full mb-3").props("header-class=text-base"):
+                .classes(CARD).props("header-class=text-base"):
             if not samples and not tracked:
                 ui.label("还没有成交数据。成交轮每 "
                          f"{rule['sold_scan_hours']} 小时跑一次，跑过之后这里才有东西。"
@@ -563,7 +567,9 @@ def _sold_row(r: dict, med: int | None) -> None:
     with ui.row().classes("items-start w-full gap-3 border-t py-2 flex-nowrap"):
         if r["thumb_url"]:
             ui.image(r["thumb_url"]).classes("w-24 h-24 object-cover rounded shrink-0")
-        with ui.column().classes("gap-0 grow min-w-0 leading-snug"):
+        # self-stretch + 下面那行的 mt-auto：和命中页同一套贴底做法。
+        # 漏了的话宽屏两列时矮的那张卡片小字悬在半空，两列对不齐。
+        with ui.column().classes("gap-0 grow min-w-0 leading-snug self-stretch"):
             with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
                 ui.badge("已成交", color="grey")
                 if r["ship_from"] == TOKYO:
@@ -575,7 +581,8 @@ def _sold_row(r: dict, med: int | None) -> None:
                         "它在售时低于捡漏线 —— 也就是这个价位确实有人接")
             ui.link(r["name"], item_url(r["source"], r["item_id"]),
                     new_tab=True).classes("font-medium break-words")
-            with ui.row().classes("gap-3 text-xs text-gray-400 items-center"):
+            with ui.row().classes(
+                    "gap-3 text-xs text-gray-400 items-center mt-auto pt-1"):
                 ui.label(f"{r['sold_at']:%m-%d %H:%M} 成交" if r["sold_at"] else "成交时间未知")
                 if r["ship_from"]:
                     ui.label(f"发货 {r['ship_from']}")
@@ -862,7 +869,7 @@ def rules_view(host=None) -> None:
         stats = store.one(
             "SELECT COUNT(*) total, SUM(matched = 1 AND status = 'on_sale') hit "
             "FROM item WHERE rule_id = %s", (rule["id"],))
-        with ui.card().classes("w-full my-2"):
+        with ui.card().classes(CARD):
             with ui.row().classes("items-center w-full gap-3"):
                 ui.label(rule["name"]).classes("text-base font-bold")
                 ui.badge("启用" if rule["enabled"] else "停用",
@@ -962,7 +969,7 @@ async def run_now(rule: dict) -> None:
 def settings_view() -> None:
     fields: dict = {}
     for it in store.all_settings():
-        with ui.card().classes("w-full my-1 py-2"):
+        with ui.card().classes(CARD + " py-2"):
             # 【字符串项必须用 ui.input】拿 ui.number 装 URL 会直接显示成空白，
             # 而且保存时 value 是 None —— 看起来像"填了没保存上"。
             if it["type"] == "str":

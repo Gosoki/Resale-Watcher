@@ -81,6 +81,11 @@ DARK_CSS = (
     # 本身就能一眼看出状态，不必靠颜色分辨。
     ".star-on{opacity:1}"
     ".star-on,.star-on .q-btn__content{color:oklch(82.8% 0.189 84.429)!important}"
+    # 标记旗用青色：和追踪的琥珀、捡漏的绿、已降的红都拉得开。
+    # 【必须写在 .star-btn 之后】那条规则也带 !important 且特异性相同，
+    # 同分时靠出现顺序决胜 —— 写在前面的话旗子会被刷成白的。
+    ".mark-on{opacity:1}"
+    ".mark-on,.mark-on .q-btn__content{color:oklch(78.9% 0.154 211.53)!important}"
     ".btn-muted:hover{opacity:1}"
     # 東京都 原先用 teal，和「捡漏」的绿是相邻色相，扫一眼分不开，而这俩语义
     # 完全不同（一个说地点、一个说机会）。换到紫档，和绿/橙/红/琥珀/灰都拉开。
@@ -266,16 +271,41 @@ def toggle_track(source: str, item_id: str, rule_id: int, on: bool) -> None:
     track_view.refresh()
 
 
-def thumb_with_star(r: dict, rule_id: int) -> None:
-    """缩略图 + 右上角的追踪星。
+def toggle_mark(row: dict, rule_name: str, on: bool) -> None:
+    """标记/取消标记。和追踪的区别：这个【一个请求都不发】，随便标。"""
+    store.set_marked(row, rule_name, on)
+    n = len(store.marked_ids())
+    notify(f"已标记（共 {n} 件），在「标记」页看" if on else f"已取消标记（还剩 {n} 件）")
+    hits_view.refresh()
+    track_view.refresh()
+    sold_view.refresh()
+    marks_view.refresh()
 
-    【为什么星压在图上】收藏是大家都认得的手势，放图角上一眼就懂，也不占正文和
-    价格列的位置。之前那个底部的文字按钮要先读字才知道能点。
+
+def save_mark_note(source: str, item_id: str, value) -> None:
+    store.set_mark_note(source, item_id, (value or "").strip())
+    notify("备注已存")
+    marks_view.refresh()
+
+
+def thumb_corners(r: dict, rule_id: int, marks: set, rule_name: str,
+                  star: bool = True) -> None:
+    """缩略图 + 两个角标：右上角的追踪星，右下角的标记旗。
+
+    【两个角标是两回事，别合并】
+      ★ 追踪：会真的花请求去单独刷新它，所以有件数上限、要克制。
+      ⚑ 标记：一个书签，不发任何请求，随便标。
+    放在同一张图的不同角上，是因为它们针对的是同一件商品、又都属于"我对它的态度"；
+    但颜色和图形必须分开（琥珀星 / 青旗），否则点错了代价完全不同。
+
+    star=False 给成交页用：那里的商品已经卖掉了，追踪它没有意义（不会再刷新），
+    但把成交价记下来很有意义。
 
     【占位框不能省】某个源哪天返回空缩略图，没有占位的话这一行的正文会直接顶到
-    最左边，和上下几行错开 —— 而且星也没地方挂。
+    最左边，和上下几行错开 —— 而且角标也没地方挂。
     """
-    tracked = r["tracked_at"] is not None
+    tracked = r.get("tracked_at") is not None
+    marked = (r["source"], r["item_id"]) in marks
     with ui.element("div").classes("relative shrink-0 w-24 h-24"):
         if r["thumb_url"]:
             # 【ratio=1 不能省】q-img 的高度是按图片真实宽高比撑出来的，
@@ -288,14 +318,25 @@ def thumb_with_star(r: dict, rule_id: int) -> None:
             ui.element("div").classes("w-24 h-24 rounded bg-white/5")
         # 【必须用默认参数绑死】它们是循环变量，直接引用的话等你点下去时
         # 早就指向最后一件商品了 —— 每颗星都会追踪同一件。
-        ui.button("★" if tracked else "☆",
-                  on_click=lambda _, so=r["source"], ii=r["item_id"], ri=rule_id,
-                  t=tracked: toggle_track(so, ii, ri, not t)) \
+        if star:
+            ui.button("★" if tracked else "☆",
+                      on_click=lambda _, so=r["source"], ii=r["item_id"], ri=rule_id,
+                      t=tracked: toggle_track(so, ii, ri, not t)) \
+                .props("flat dense round") \
+                .classes("absolute top-0 right-0 star-btn"
+                         + (" star-on" if tracked else "")) \
+                .tooltip("取消追踪" if tracked else
+                         "加入追踪：这件会被单独拉详情刷新，价格、出价数、是否卖掉都比"
+                         "整轮扫描快得多。代价是每次刷新一个请求")
+        # 【同样要用默认参数绑死】理由和上面那颗星一模一样：row 是循环变量
+        ui.button("⚑" if marked else "⚐",
+                  on_click=lambda _, row=dict(r), rn=rule_name, m=marked:
+                  toggle_mark(row, rn, not m)) \
             .props("flat dense round") \
-            .classes("absolute top-0 right-0 star-btn" + (" star-on" if tracked else "")) \
-            .tooltip("取消追踪" if tracked else
-                     "加入追踪：这件会被单独拉详情刷新，价格、出价数、是否卖掉都比"
-                     "整轮扫描快得多。代价是每次刷新一个请求")
+            .classes("absolute bottom-0 right-0 star-btn" + (" mark-on" if marked else "")) \
+            .tooltip("取消标记" if marked else
+                     "标记：只是记一笔，不发任何请求。标的是【此刻的快照】——"
+                     "标题、价格、图都存下来，以后商品下架了这一页照样看得到")
 
 
 def blacklist_seller(rule_id: int, seller_id: str) -> None:
@@ -350,6 +391,8 @@ def toolbar(desc: str):
 
 @ui.refreshable
 def hits_view(host=None) -> None:
+    # 【整份取出来，不要每行查一次】一屏几十行，每行一个 SELECT 翻页会肉眼卡顿
+    marks = store.marked_ids()
     rules = store.get_rules()
     if not rules:
         ui.label("还没有规则，去「规则」页新建一条。").classes("text-gray-400 p-4")
@@ -443,7 +486,7 @@ def hits_view(host=None) -> None:
                         # 96px：正文列在「徽标+标题两行+拍卖提示+品相行」时约 90px 高，
                         # 图跟着长到差不多，两边才齐。64px 时右边明显空一块，
                         # 看起来就像行距被撑开了。
-                        thumb_with_star(r, rule["id"])
+                        thumb_corners(r, rule["id"], marks, rule["name"])
                         # leading-snug：正文是 3~4 行小字堆起来的，默认行高留白偏多，
                         # 累积下来整张卡片会显得松垮
                         # self-stretch：撑满卡片高度，下面那行小字的 mt-auto 才顶得到底
@@ -603,6 +646,7 @@ def save_deal_price(rule_id: int, value) -> None:
 def track_view() -> None:
     """追踪中的商品。这一页的数据比别处都新 —— 它们是被单独拉详情刷新的。"""
     rows = store.tracked_items()
+    marks = store.marked_ids()
     st = store.get_settings()
     if not rows:
         ui.label("还没有追踪任何商品。在「命中」页每件商品右下角点「追踪」加进来。"
@@ -624,14 +668,14 @@ def track_view() -> None:
 
     with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
         for r in rows:
-            _track_row(r, rules.get(r["rule_id"]) or {}, st)
+            _track_row(r, rules.get(r["rule_id"]) or {}, st, marks)
 
 
-def _track_row(r: dict, rule: dict, st: dict) -> None:
+def _track_row(r: dict, rule: dict, st: dict, marks: set) -> None:
     """布局和命中页同一套，理由见那边的注释。"""
     with ui.row().classes("items-start w-full gap-3 border-t py-2 sm:flex-nowrap"):
         # 和命中页同一颗星：这里它一定是实心的，点一下就是取消追踪
-        thumb_with_star(r, r["rule_id"])
+        thumb_corners(r, r["rule_id"], marks, rule.get("name", ""))
         with ui.column().classes("gap-0 grow min-w-0 leading-snug self-stretch"):
             with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
                 # 【终态的留在这一页】卖掉/下架的不会被摘掉追踪，所以这三种
@@ -680,6 +724,79 @@ def _track_row(r: dict, rule: dict, st: dict) -> None:
             # 同一个动作出现两次，人会以为它们不是一回事。
 
 
+# ------------------------------------------------------------------ 标记页
+
+@ui.refreshable
+def marks_view() -> None:
+    """标记过的商品。纯书签：不发请求、不参与任何判定、不影响任何规则。
+
+    【这一页同时显示两份数据，缺一个都不成立】
+      快照 —— 按下标记那一刻的标题、价格、图。存在 marked_item 表里，之后不再变。
+      现况 —— 那件商品现在怎么样了（现查 item 表）。商品被删、规则被删之后就没有了。
+    只有快照，这一页就是一堆旧照片，看不出"后来降了没、卖了没"；
+    只有现况，商品一下架整条记录就变成空白，而那正是你最想回头查的时候。
+    """
+    rows = store.marked_items()
+    if not rows:
+        ui.label("还没有标记任何商品。在「命中」「追踪」「成交」页，"
+                 "点商品图【右下角】那面小旗 ⚐ 就标上了 —— 不发任何请求，随便标。"
+                 ).classes("text-gray-400 text-sm")
+        return
+    ui.label(f"共 {len(rows)} 件 · 按标记时间倒序 · 纯记录：不发请求、不参与捡漏判定"
+             ).classes("text-xs text-gray-400 mb-3")
+    with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
+        for m in rows:
+            _mark_row(m)
+
+
+def _mark_row(m: dict) -> None:
+    """布局和命中页同一套，理由见那边的注释。"""
+    live = m["live"]
+    with ui.row().classes("items-start w-full gap-3 border-t py-2 sm:flex-nowrap"):
+        # 这一页上的旗一定是实心的，点一下就是取消标记。
+        # rule_id 传 0：star=False 时它用不到（追踪才需要规则维度）。
+        thumb_corners(m, 0, {(m["source"], m["item_id"])}, m["rule_name"], star=False)
+        with ui.column().classes("gap-0 grow min-w-0 leading-snug self-stretch"):
+            with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
+                if live is None:
+                    ui.badge("已不在库", color="grey").tooltip(
+                        "抓取记录没了（多半是那条规则被删了，或者商品早就下架不再被抓到）。"
+                        "标记本身不受影响 —— 下面显示的就是你标记那一刻的快照")
+                elif live["status"] == "sold_out":
+                    ui.badge("已卖掉", color="grey")
+                elif live["status"] == "gone":
+                    ui.badge("已下架", color="grey")
+                if m["rule_name"]:
+                    ui.label(m["rule_name"]).classes("text-xs text-gray-400")
+            ui.link(m["name"], item_url(m["source"], m["item_id"]),
+                    new_tab=True).classes("font-medium break-words")
+            # 【备注是这一页的重点】"以后好查"靠的就是它：过两个月回来看，
+            # 光有标题和价格想不起来当初为什么标它。
+            # 保存键放进 append 插槽，理由同命中页的捡漏价输入框。
+            inp = ui.input(value=m["note"], placeholder="记一句：为什么标它") \
+                .props(INPUT).classes("w-full max-w-md mt-1")
+            with inp.add_slot("append"):
+                # 【必须用默认参数绑死】m 和 inp 都是循环变量
+                ui.button("存", on_click=lambda _, so=m["source"], ii=m["item_id"],
+                          c=inp: save_mark_note(so, ii, c.value)) \
+                    .props("flat dense no-caps color=primary").classes("px-2")
+            with ui.row().classes(
+                    "gap-3 text-xs text-gray-400 items-center mt-auto pt-1"):
+                ui.label(f"{m['marked_at']:%Y-%m-%d %H:%M} 标记")
+        with ui.column().classes(
+                "gap-0 items-end shrink-0 whitespace-nowrap self-stretch"):
+            ui.badge(source_name(m["source"])).classes(BADGE_LABEL + " mb-1")
+            ui.label(yen(m["price"])).classes("text-lg font-bold")
+            ui.label("标记时").classes("text-xs text-gray-500")
+            # 现价只在【和当初不一样】时才显示 —— 一样的时候多写一行纯噪音
+            if live and live["price"] != m["price"]:
+                diff = live["price"] - m["price"]
+                ui.label(f"现 {yen(live['price'])}").classes(
+                    "text-sm mt-1 " + ("text-green-400" if diff < 0 else "text-gray-400"))
+                ui.label(("↓ " if diff < 0 else "↑ ") + yen(abs(diff))).classes(
+                    "text-xs " + ("text-green-400" if diff < 0 else "text-gray-500"))
+
+
 # ------------------------------------------------------------------ 成交页
 
 @ui.refreshable
@@ -702,6 +819,7 @@ def sold_view() -> None:
         ui.label("还没有规则，去「规则」页新建一条。").classes("text-gray-400 p-4")
         return
 
+    marks = store.marked_ids()
     for rule in rules:
         rid = rule["id"]
         st = store.get_state(rid)
@@ -745,21 +863,15 @@ def sold_view() -> None:
                 with ui.element("div").classes(
                         "grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
                     for r in tracked:
-                        _sold_row(r, med)
+                        _sold_row(r, med, marks, rule["name"])
 
 
-
-
-def _sold_row(r: dict, med: int | None) -> None:
+def _sold_row(r: dict, med: int | None, marks: set, rule_name: str) -> None:
     """一件跟到成交的商品。布局和命中页同一套，理由见那边的注释。"""
     with ui.row().classes("items-start w-full gap-3 border-t py-2 sm:flex-nowrap"):
-        if r["thumb_url"]:
-            ui.image(r["thumb_url"]).props("fit=cover ratio=1") \
-                .classes("w-24 h-24 rounded shrink-0")
-        else:
-            # 【占位框不能省】理由同 thumb_with_star：没有它，缺缩略图的那一行
-            # 正文会顶到最左边，和上下几行错开
-            ui.element("div").classes("w-24 h-24 rounded bg-white/5 shrink-0")
+        # star=False：已经卖掉的东西追踪它没意义（不会再刷新），
+        # 但把"这个货色什么价成交的"记一笔很有意义 —— 所以只留标记旗。
+        thumb_corners(r, r["rule_id"], marks, rule_name, star=False)
         # self-stretch + 下面那行的 mt-auto：和命中页同一套贴底做法。
         # 漏了的话宽屏两列时矮的那张卡片小字悬在半空，两列对不齐。
         with ui.column().classes("gap-0 grow min-w-0 leading-snug self-stretch"):
@@ -1366,6 +1478,7 @@ def create() -> None:
         with ui.tabs().classes("w-full") as tabs:
             t_hit = ui.tab("命中")
             t_track = ui.tab("追踪")
+            t_mark = ui.tab("标记")
             t_sold = ui.tab("成交")
             t_all = ui.tab("全部")
             t_rule = ui.tab("规则")
@@ -1388,6 +1501,12 @@ def create() -> None:
                     ui.button("刷新", on_click=track_view.refresh).props(BTN_QUIET) \
                         .tooltip("只重画页面，不发请求")
                 track_view()
+            with ui.tab_panel(t_mark):
+                with toolbar("自己标下来的东西，纯记录。不发请求、不参与判定，"
+                             "存的是你标记那一刻的快照，商品下架了也还在"):
+                    ui.button("刷新", on_click=marks_view.refresh).props(BTN_QUIET) \
+                        .tooltip("只重画页面，不发请求")
+                marks_view()
             with ui.tab_panel(t_sold):
                 with toolbar("市场实际用什么价清掉了什么货 —— 定价前先看分布，"
                              "别只看中位数那一个数字"):

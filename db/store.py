@@ -327,6 +327,69 @@ def delete_rule(rule_id: int) -> None:
     execute("DELETE FROM sold_sample WHERE rule_id NOT IN (SELECT id FROM watch_rule)")
 
 
+
+# ---------------------------------------------------------------- 标记（书签）
+
+def set_marked(row: dict, rule_name: str, on: bool) -> None:
+    """标记 / 取消标记。
+
+    【标记的是快照，不是引用】存下此刻的标题、价格、缩略图。商品下架、
+    平台删帖、详情页 404 之后，这一页仍然看得到你当初标的是什么、多少钱。
+    只存 ID 的话，过几周回来只剩一排死链接。
+
+    【重复标记不覆盖】ON DUPLICATE 里故意什么都不改：快照和时间都保持第一次
+    按下的那一刻。否则你在列表里不小心点两下，"我什么时候标的"就变成了现在。
+    """
+    if not on:
+        execute("DELETE FROM marked_item WHERE source = %s AND item_id = %s",
+                (row["source"], row["item_id"]))
+        return
+    execute("INSERT INTO marked_item (source, item_id, name, price, thumb_url, "
+            "rule_name, marked_at) VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE item_id = item_id",
+            (row["source"], row["item_id"], row["name"], row["price"],
+             row.get("thumb_url") or "", rule_name[:64], config.now()))
+
+
+def set_mark_note(source: str, item_id: str, note: str) -> None:
+    execute("UPDATE marked_item SET note = %s WHERE source = %s AND item_id = %s",
+            (note[:255], source, item_id))
+
+
+def marked_ids() -> set[tuple[str, str]]:
+    """已标记的 (source, item_id) 集合。
+
+    列表页一次查出来整份，而不是每行查一次 —— 命中页一屏几十行，
+    每行一个 SELECT 会让翻页肉眼可见地卡。
+    """
+    return {(r["source"], r["item_id"])
+            for r in query("SELECT source, item_id FROM marked_item")}
+
+
+def marked_items() -> list[dict]:
+    """标记列表，最近标的在前。每条带一个 live 字段＝它现在怎么样了（没有就是 None）。
+
+    【为什么要带现况】快照回答"我当初标的是什么"，现况回答"它后来怎么了"——
+    降价了没、卖掉了没。两个都在才用得上：只有快照的话这一页就是一堆旧照片。
+
+    【同一个商品可能有多行 item】被两条规则抓到就是两行。取最近一次看到的那行：
+    不同规则的轮次错开，早一轮的那行价格可能是旧的。
+    """
+    rows = query("SELECT * FROM marked_item ORDER BY marked_at DESC")
+    if not rows:
+        return []
+    ids = list({m["item_id"] for m in rows})
+    live: dict[tuple[str, str], dict] = {}
+    # 按 last_seen_at 升序扫，后写的覆盖先写的 —— 留下的就是最新那行
+    for r in query(f"SELECT source, item_id, price, status, sold_at FROM item "
+                   f"WHERE item_id IN ({','.join(['%s'] * len(ids))}) "
+                   f"ORDER BY last_seen_at ASC", ids):
+        live[(r["source"], r["item_id"])] = r
+    for m in rows:
+        m["live"] = live.get((m["source"], m["item_id"]))
+    return rows
+
+
 # ---------------------------------------------------------------- 规则状态
 
 def get_state(rule_id: int) -> dict:

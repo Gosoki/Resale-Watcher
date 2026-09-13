@@ -169,6 +169,34 @@ CREATE TABLE IF NOT EXISTS sold_sample (
 
 
 -- ============================================================
+-- 5.5 标记（书签）
+-- ============================================================
+-- 【为什么不做成 item 表上的一列】delete_rule 会 DELETE FROM item WHERE rule_id=…，
+-- 也就是删掉一条规则会连它抓过的所有商品行一起清空。标记要是挂在那上面，
+-- 你哪天重建规则，攒了几个月的标记就跟着没了 —— 而"记下来以后好查"恰恰是它
+-- 唯一的用途，活不过一次改规则就等于没有。
+--
+-- 【为什么存快照而不是只存 ID】商品会下架、会被平台删、详情页会 404。
+-- 只存 ID 的话，以后打开这一页看到的是一排死链接，标题价格全没了。
+-- 这几个字段是"你按下标记那一刻看到的东西"，之后不再变。
+--
+-- 【主键是 source+item_id，不带 rule_id】同一个商品被两条规则抓到是两行 item，
+-- 但对你来说它就是一件东西，标记一次就够。
+CREATE TABLE IF NOT EXISTS marked_item (
+  source     VARCHAR(16)  NOT NULL             COMMENT '哪个源',
+  item_id    VARCHAR(32)  NOT NULL             COMMENT '商品在源站的 ID，拼出链接用',
+  name       VARCHAR(255) NOT NULL             COMMENT '标记那一刻的标题（快照，之后不跟着源站变）',
+  price      INT          NOT NULL             COMMENT '标记那一刻的价格（快照）。以后回看"我当时看到的是多少钱"',
+  thumb_url  VARCHAR(255) NOT NULL DEFAULT ''  COMMENT '标记那一刻的缩略图地址（快照）',
+  rule_name  VARCHAR(64)  NOT NULL DEFAULT ''  COMMENT '标记时它归在哪条规则下。【存名字不存 rule_id】规则删了这行还得看得懂，存 id 就只剩一个查不到的数字',
+  note       VARCHAR(255) NOT NULL DEFAULT ''  COMMENT '你自己写的一句备注，可留空',
+  marked_at  DATETIME     NOT NULL             COMMENT '按下标记的时间。列表按它倒序',
+  PRIMARY KEY (source, item_id),
+  KEY idx_marked (marked_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='手动标记的商品（书签）。独立于 item，删规则、商品下架都不影响';
+
+
+-- ============================================================
 -- 6. 每日请求量（风控保险丝）
 -- ============================================================
 CREATE TABLE IF NOT EXISTS daily_stat (

@@ -7,6 +7,7 @@
 """
 import base64
 import json
+import logging
 import time
 import uuid
 
@@ -15,6 +16,22 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 from sources.base import UA, Source, pref_of
+
+log = logging.getLogger(__name__)
+
+
+def _bids(v) -> int | None:
+    """出价数 → int。【两个接口都把它写成字符串】搜索给 "9"，详情给 9 或 "9"。
+
+    拿不到就返回 None，不能返回 0 —— None 的意思是「这不是拍卖」，
+    0 的意思是「是拍卖但还没人出价」，面板上是两种完全不同的显示。
+    """
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 SEARCH_URL = "https://api.mercari.jp/v2/entities:search"
 DETAIL_URL = "https://api.mercari.jp/items/get"
@@ -95,6 +112,12 @@ class Mercari(Source):
             "withSuggestedItems": False, "withOfferPricePromotion": False,
             "withProductSuggest": False, "withParentProducts": False,
             "withProductArticles": False, "withSearchConditionId": False,
+            # 【不加这个开关，拍卖商品的 auction 字段全是 null】メルカリ 2025-01-29
+            # 上线了オークション機能，但搜索接口默认【不返回】拍卖信息 ——
+            # 每件商品都带一个 auction 字段，不开这个开关时它恒为 null，
+            # 看起来就像"メルカリ 没有拍卖"。实测同一页 RTX 4090 的 119 件里，
+            # 不开＝0 件拍卖，开了＝2 件。而它【不额外花请求】，就是 body 里多一个字段。
+            "withAuction": True,
         }
         data = self._call("POST", SEARCH_URL, json_body=body).json()
         meta = data.get("meta") or {}
@@ -113,8 +136,11 @@ class Mercari(Source):
         # 上层会保持原状，和详情页解析失败走同一条路。
         if not item_id.startswith("m"):
             return {"description": None, "price": 0, "name": "", "status": "", "ship_from": "", "bid_count": None}
+        # include_auction=true 同理：不带的话返回里根本没有 auction_info 这一节。
+        # 这个参数是从 メルカリ 网页版自己发的请求里抠出来的（抓了一次网络日志）。
         resp = self._call("GET", DETAIL_URL,
-                          params={"id": item_id, "country_code": "", "view": "1"})
+                          params={"id": item_id, "country_code": "", "view": "1",
+                                  "include_auction": "true"})
         if resp.status_code == 404:
             return None
         d = (resp.json() or {}).get("data")
@@ -128,10 +154,19 @@ class Mercari(Source):
             "status": d.get("status") or "",
             # 形如 {"id": 13, "name": "東京都"}
             "ship_from": pref_of((d.get("shipping_from_area") or {}).get("name")),
-            "bid_count": None,          # メルカリ 是定价销售，没有拍卖那套
+            # 拍卖商品才有 auction_info；普通商品这一节不存在，bid_count 就是 None。
+            # 【详情用 total_bids，搜索用 totalBid】同一份数据两个接口两套命名，
+            # 抄错一个就是静默拿到 None —— 面板上表现为"拍卖标签时有时无"。
+            "bid_count": _bids((d.get("auction_info") or {}).get("total_bids")),
         }
 
     def _parse(self, raw: dict) -> dict:
+        # 拍卖商品才有内容，普通商品是 null。实测形状（2026-09-14 真实抓到的）：
+        #   {"id":"", "bidDeadline":"2026-09-14T11:33:00Z", "totalBid":"9",
+        #    "highestBid":"425200", "initialPrice":"410000"}
+        # 【数字是字符串】totalBid / highestBid / initialPrice 都是带引号的，
+        # 直接当 int 用会在别处炸；而 bidDeadline 是 UTC 的 Z 格式，不是 JST。
+        auc = raw.get("auction") or {}
         return {
             "source": self.key,
             "item_id": raw.get("id") or "",
@@ -148,6 +183,13 @@ class Mercari(Source):
             "thumb_url": (raw.get("thumbnails") or [""])[0][:255],
             "listed_at": self.ts(raw.get("created")),
             "updated_at_src": self.ts(raw.get("updated")),
-            # Mercari 是定价销售，没有拍卖那套
-            "end_time": None, "bid_count": None, "buy_now_price": None,
+            # 【メルカリ 也有拍卖】原先这里写死着「メルカリ 是定价销售，没有拍卖那套」，
+            # 那句话在 2025-01-29 メルカリ 上线オークション機能之后就不成立了。
+            # 拿不到数据的真正原因是【搜索接口默认不返回】，要靠上面那个
+            # withAuction 开关 —— 不是"没有拍卖"。
+            # highestBid 就是当前价，和 price 一致，所以不用另外覆盖 price。
+            # 【メルカリ 的拍卖没有一口价】只能竞价，所以 buy_now_price 恒为 None。
+            "end_time": self.iso(auc.get("bidDeadline")),
+            "bid_count": _bids(auc.get("totalBid")),
+            "buy_now_price": None,
         }

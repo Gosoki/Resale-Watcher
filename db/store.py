@@ -609,6 +609,14 @@ def update_tracked(source: str, item_id: str, rule_id: int, d: dict, old_price: 
         add_price_log(source, item_id, price, now)
 
 
+# 推送正文要用到的列。【两条待推查询必须取一模一样的列】各写一份的话，
+# 加一列只加在一边，另一边推出去的消息就悄悄少一块 —— 不报错、不进日志。
+#   thumb_url 缺 → 每条都走兜底，图永远出不来（Slack 对空 image_url 回 400）
+#   end_time  缺 → 拍卖推送里没有截止时间，而那正是拍卖最要紧的一个数
+NOTIFY_COLS = ("source, item_id, rule_id, name, price, is_deal, deal_pct, bid_count, "
+               "end_time, thumb_url")
+
+
 def pending_notify(rule_id: int, only_deal: bool) -> list[dict]:
     """还没推送过的在售命中商品。
 
@@ -616,13 +624,7 @@ def pending_notify(rule_id: int, only_deal: bool) -> list[dict]:
     （它当时确实合适），推一条"快看这个好货"过去而人点进去是已售出，
     比不推还差。
     """
-    # 【thumb_url 不能漏】推送模板里的 {thumb} 就靠它。少了这一列，
-    # 渲染出来的 image_url 是空串，而 Slack 对空 image_url 回的是
-    # 400 invalid_blocks —— 整条消息发不出去，那件捡漏就丢了。
-    # 【end_time 不能漏】拍卖的推送要写「剩 3 小时（09-14 20:33 截止）」。
-    # 少了这一列，正文里就只剩出价数 —— 而拍卖里最要紧的那个数就是到点没了。
-    sql = ("SELECT source, item_id, rule_id, name, price, is_deal, deal_pct, bid_count, "
-           "end_time, thumb_url FROM item WHERE rule_id = %s AND matched = 1 "
+    sql = (f"SELECT {NOTIFY_COLS} FROM item WHERE rule_id = %s AND matched = 1 "
            "AND status = 'on_sale' AND notified_at IS NULL")
     if only_deal:
         sql += " AND is_deal = 1"
@@ -630,15 +632,58 @@ def pending_notify(rule_id: int, only_deal: bool) -> list[dict]:
     return query(sql + " ORDER BY COALESCE(deal_pct, 999), price", (rule_id,))
 
 
-def mark_notified(rows: list[dict]) -> None:
-    """标成已推。推送成功与否都要标 —— 见 core/notify.py 里「失败也标已推」的说明。"""
+def pending_final(rule_id: int, minutes: int) -> list[dict]:
+    """快到点的拍卖里，价格还在捡漏线内、而且还没提醒过的那些。
+
+    【为什么要第二条】第一条是它刚变成捡漏那一刻发的 —— 那时可能还剩两天。
+    两天足够你把它忘干净，而拍卖到点就没了，没有第二次机会。
+
+    【只挑拍卖】bid_count IS NOT NULL 就是"这是拍卖"。普通商品没有到点一说，
+    晚一天去看它还在那儿。
+
+    【is_deal = 1 是硬条件，不看 notify_on】被别人抬出捡漏线的就不该再提醒 ——
+    那时它只是一件"你原本看得上的贵东西"，催你去看等于催你冲动出价。
+
+    【notified_at 必须早于进入这个窗口的那一刻】少了最后这一句，一件在最后
+    半小时里才第一次变成捡漏的商品会被推两遍：先是第一条（它刚够格），
+    几分钟后又来一条"快结束"—— 你看到的是同一件东西，只隔了五分钟。
+    """
+    now = config.now()
+    return query(
+        f"SELECT {NOTIFY_COLS} FROM item "
+        "WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' AND is_deal = 1 "
+        "AND bid_count IS NOT NULL AND end_time IS NOT NULL "
+        "AND end_time > %s AND end_time <= %s "
+        "AND final_notified_at IS NULL "
+        "AND notified_at IS NOT NULL "
+        "AND notified_at < DATE_SUB(end_time, INTERVAL %s MINUTE) "
+        "ORDER BY end_time",
+        (rule_id, now, now + timedelta(minutes=minutes), minutes))
+
+
+def _mark_pushed(rows: list[dict], col: str) -> None:
+    """把这批商品的某个推送时间戳戳到现在。
+
+    推送成功与否都要标 —— 见 core/notify.py 里「失败也标已推」的说明。
+    col 是本文件写死的列名，不来自外部输入。
+    """
     if not rows:
         return
     keys = [(r["source"], r["item_id"], r["rule_id"]) for r in rows]
     holes = ",".join(["(%s,%s,%s)"] * len(keys))
-    execute(f"UPDATE item SET notified_at = %s "
+    execute(f"UPDATE item SET {col} = %s "
             f"WHERE (source, item_id, rule_id) IN ({holes})",
             (config.now(), *[v for k in keys for v in k]))
+
+
+def mark_notified(rows: list[dict]) -> None:
+    """标成「第一条已推」。"""
+    _mark_pushed(rows, "notified_at")
+
+
+def mark_final_notified(rows: list[dict]) -> None:
+    """标成「快结束提醒已推」。这一条每件商品同样只发一次。"""
+    _mark_pushed(rows, "final_notified_at")
 
 
 def on_sale_items(rule_id: int, source: str) -> list[dict]:

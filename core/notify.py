@@ -55,9 +55,13 @@ def deadline(end) -> str:
     return f" · {config.time_left(end)}（{end:%m-%d %H:%M} 截止）"
 
 
-def compose(rule: dict, row: dict, median: int | None) -> str:
-    """一条提醒的正文。手机通知栏只看得见前两行，所以最要紧的信息必须在最前面。"""
-    head = "🟢 捡漏" if row["is_deal"] else "命中"
+def compose(rule: dict, row: dict, median: int | None, final: bool = False) -> str:
+    """一条提醒的正文。手机通知栏只看得见前两行，所以最要紧的信息必须在最前面。
+
+    final=True 是「快结束提醒」，也就是这件商品的第二条。头一个词必须换掉：
+    两条正文其余部分几乎一模一样，不换的话你会以为是同一条重复推送、顺手划掉。
+    """
+    head = "⏰ 捡漏快结束" if final else ("🟢 捡漏" if row["is_deal"] else "命中")
     lines = [f"{head} | {rule['name']}", row["name"][:60], f"¥{row['price']:,}"]
     if row.get("deal_pct"):
         tail = f"（市价的 {row['deal_pct']}%"
@@ -118,7 +122,14 @@ def post(url: str, template: str, text: str, thumb: str = "") -> None:
 
 
 def push_new(rule: dict) -> int:
-    """把这条规则里还没推过的命中商品推出去，返回实际推送条数。
+    """把这条规则里该推的商品推出去，返回实际推送条数。
+
+    推两种：新命中（每件一次），以及【拍卖快结束提醒】—— 一件捡漏拍卖进入
+    最后 notify_final_min 分钟、价格还在捡漏线内时的第二条，同样每件一次。
+
+    【提醒必须在 mark_deals 之后跑】它挑的是 is_deal = 1，而 is_deal 是那边
+    用最新价格重算出来的。反过来的话，提醒看到的是上一轮的捡漏判定 ——
+    一件已经被别人抬出捡漏线的拍卖，会催着你去出价。
 
     【积压不补推】一次要推的超过 notify_max_per_round 就一条都不发，
     只把它们标成已推。这一条规则同时挡住三种炸弹：
@@ -134,8 +145,8 @@ def push_new(rule: dict) -> int:
         return 0
 
     rows = store.pending_notify(rule["id"], only_deal=(s.get("notify_on") != "matched"))
-    if not rows:
-        return 0
+    mins = s.get("notify_final_min") or 0
+    final = store.pending_final(rule["id"], mins) if mins else []
 
     cap = s.get("notify_max_per_round") or 5
     if len(rows) > cap:
@@ -143,22 +154,39 @@ def push_new(rule: dict) -> int:
         log.warning("规则「%s」有 %d 件待推，超过上限 %d —— 本轮【不补推】，全部标为已推。"
                     "（多半是刚开启推送、刚重启、或刚放宽了规则）后面新出现的会正常推。",
                     rule["name"], len(rows), cap)
+        rows = []
+    # 【快结束提醒单独判上限，不和上面合在一起算】合着算的话，一次放宽规则
+    # 带来的几十件新命中会把同一轮里那条「还剩 20 分钟」一起吞掉 ——
+    # 而那正是这个提醒存在的全部理由。它自己井喷不起来：能进这张表的只有
+    # 「此刻正处在最后 N 分钟里的捡漏拍卖」，天然就是个位数。
+    if len(final) > cap:
+        store.mark_final_notified(final)
+        log.warning("规则「%s」有 %d 件拍卖同时进入最后 %d 分钟，超过上限 %d —— 全部跳过。"
+                    "（多半是刚把这个提醒打开）", rule["name"], len(final), mins, cap)
+        final = []
+    if not rows and not final:
         return 0
 
     median = store.get_state(rule["id"])["median_price"]
     template = s.get("notify_body") or ""
     sent = 0
-    for i, row in enumerate(rows):
+    # 【两批合成一个队列再发】GAP 是按"上一条发出去多久"算的，分两个循环的话
+    # 第二批的头一条不会等，两条会挤在同一秒里出去 —— 正好撞上 Slack 的 1 条/秒。
+    queue = [(r, False) for r in rows] + [(r, True) for r in final]
+    for i, (row, is_final) in enumerate(queue):
         if i:                               # 第一条不用等
             time.sleep(GAP)
         try:
-            post(url, template, compose(rule, row, median), row.get("thumb_url") or "")
+            post(url, template, compose(rule, row, median, final=is_final),
+                 row.get("thumb_url") or "")
             sent += 1
         except Exception as e:              # noqa: BLE001 - 推送坏了不该影响抓取
             # 【失败也标已推，不重试】一条迟到一小时的提醒没有意义，
             # 而对着挂掉的地址每轮重试会一直拖慢抓取，还把日志刷满。
             log.warning("推送失败（本条不再重试）：%s", e)
     store.mark_notified(rows)
+    store.mark_final_notified(final)
     if sent:
-        log.info("规则「%s」推送 %d 条", rule["name"], sent)
+        log.info("规则「%s」推送 %d 条%s", rule["name"], sent,
+                 f"（含快结束提醒 {len(final)} 条）" if final else "")
     return sent

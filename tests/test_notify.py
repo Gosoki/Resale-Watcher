@@ -19,7 +19,8 @@ RULE = {"id": 1, "name": "RTX 5090 单卡"}
 
 def item(**kw):
     base = {"source": "mercari", "item_id": "m1", "rule_id": 1, "name": "RTX 5090",
-            "price": 700000, "is_deal": 1, "deal_pct": 85, "bid_count": None}
+            "price": 700000, "is_deal": 1, "deal_pct": 85, "bid_count": None,
+            "thumb_url": "https://cdn/thumb.jpg"}
     return {**base, **kw}
 
 
@@ -63,7 +64,7 @@ def run(monkeypatch_target, settings, rows, sender=None):
     monkeypatch_target["store"], monkeypatch_target["post"] = notify.store, notify.post
     saved_time = notify.time
     notify.store = fake
-    notify.post = sender or (lambda url, tpl, text: sent.append((url, tpl, text)))
+    notify.post = sender or (lambda url, tpl, text, thumb="": sent.append((url, tpl, text)))
     notify.time = _NoSleep
     try:
         n = notify.push_new(RULE)
@@ -147,7 +148,7 @@ def test_恰好等于上限时正常推():
 
 def test_发送失败也标为已推_不无限重试():
     """一条迟到一小时的提醒没有意义，而对着挂掉的地址每轮重试会一直拖慢抓取。"""
-    def boom(url, tpl, text):
+    def boom(url, tpl, text, thumb=""):
         raise RuntimeError("connection refused")
 
     sent, fake, n = run({}, {"notify_url": "u", "notify_on": "deal",
@@ -159,7 +160,7 @@ def test_发送失败也标为已推_不无限重试():
 def test_单条发送失败不影响后面几条():
     calls = []
 
-    def flaky(url, tpl, text):
+    def flaky(url, tpl, text, thumb=""):
         calls.append(text)
         if len(calls) == 1:
             raise RuntimeError("第一条挂了")
@@ -194,6 +195,10 @@ def test_推送必须接在常驻轮询的路径上():
 # ---------------------------------------------------------------- Slack
 
 SLACK_TPL = '{"text": "{text}"}'
+# 真正在用的那个（带图）
+SLACK_IMG_TPL = ('{"text": "{text}", "blocks": [{"type": "section", "text": '
+                 '{"type": "mrkdwn", "text": "{text}"}, "accessory": {"type": "image", '
+                 '"image_url": "{thumb}", "alt_text": "商品图"}}]}')
 
 
 def test_slack模板产出合法JSON():
@@ -242,3 +247,70 @@ def test_只推一条时不白等():
     sent, _, n = run({}, {"notify_url": "u", "notify_on": "deal",
                           "notify_max_per_round": 5}, [item()])
     assert n == 1 and SLEPT == []
+
+
+# ---------------------------------------------------------------- 缩略图
+
+def test_带图模板把缩略图地址填进去():
+    import json
+
+    body = notify.render(SLACK_IMG_TPL, "标题", "https://cdn/x.jpg")
+    d = json.loads(body)
+    assert d["blocks"][0]["accessory"]["image_url"] == "https://cdn/x.jpg"
+    assert d["text"] == "标题", "顶层 text 不能丢 —— 它是手机通知栏显示的内容"
+
+
+def test_没有缩略图时整个换成纯文本模板():
+    """【Slack 对空 image_url 回 400 invalid_blocks】只把 {thumb} 填成空串的话，
+    发出去的是 "image_url": ""，整条消息失败 —— 而本模块失败不重试，那件捡漏就丢了。
+    实测过：空串确实是 400，正常地址是 200。"""
+    import json
+
+    body = notify.render(SLACK_IMG_TPL, "标题", "")
+    d = json.loads(body)
+    assert "blocks" not in d, "没图时必须退回纯文本，不能发一个空 image_url 出去"
+    assert d["text"] == "标题"
+
+
+def test_缩略图地址也要转义():
+    """地址里可能带引号或反斜杠（源站的 URL 什么都有），不转义会把 JSON 撑破。"""
+    import json
+
+    json.loads(notify.render(SLACK_IMG_TPL, "t", 'https://cdn/a"b\\c.jpg'))
+
+
+def test_不带thumb的模板照旧工作():
+    """ntfy/Bark/Discord 那些模板里没有 {thumb}，不能因为加了这个功能就退回兜底。"""
+    import json
+
+    body = notify.render(SLACK_TPL, "标题", "")
+    assert json.loads(body)["text"] == "标题"
+
+
+def test_推送时把商品的缩略图传下去():
+    """pending_notify 取了 thumb_url，push_new 必须真的把它交给 post ——
+    漏传的话每条都会走兜底，图永远出不来，而且不报错。"""
+    got = []
+    rows = [item(thumb_url="https://cdn/y.jpg")]
+    run({}, {"notify_url": "u", "notify_on": "deal", "notify_max_per_round": 5}, rows,
+        sender=lambda url, tpl, text, thumb="": got.append(thumb))
+    assert got == ["https://cdn/y.jpg"]
+
+
+def test_取待推列表的SQL必须带上thumb_url():
+    """【上面那些用例是假 store，盯不住真 SQL】pending_notify 少 SELECT 一列，
+    push_new 拿到的 row 里就没有 thumb_url，每条都悄悄走兜底、图永远出不来，
+    而且不报错、不进日志。同类的坑栽过一次：revalidate 漏了 seller_id，
+    导致拉黑在同一轮里被自己撤销。
+
+    【必须先剥掉注释】注释里正好写着 thumb_url 这个词，不剥的话这条守卫恒真 ——
+    也栽过一次，当时是自己写的注释让断言永远通过。
+    """
+    import inspect
+
+    from db import store
+
+    src = inspect.getsource(store.pending_notify)
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    sql = code[code.index("SELECT"):code.index("ORDER BY")]
+    assert "thumb_url" in sql, "pending_notify 没取 thumb_url，推送里的图会永远缺席"

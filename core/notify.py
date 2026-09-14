@@ -57,20 +57,40 @@ def compose(rule: dict, row: dict, median: int | None) -> str:
     return "\n".join(lines)
 
 
-def render(template: str, text: str) -> str:
-    """把正文填进 JSON 模板。
+# 模板里带 {thumb}、而这件商品又没有缩略图时，退回这个形状。
+# 【为什么必须有兜底】Slack 对 image_url 为空串回的是 400 invalid_blocks，
+# 整条消息直接发不出去 —— 而本模块失败不重试，那件捡漏就永久丢了。
+# 实测库里 637 件商品三个源都给了缩略图、一件不缺，所以这条路平时走不到；
+# 它防的是哪天某个源改了返回、或者新加一个源不给图。
+# 形状用最小的 {"text": …}：Slack 和 Discord 都认。用别家的话自己确认一下。
+NO_THUMB_FALLBACK = '{"text": "{text}"}'
+
+
+def esc(v: str) -> str:
+    """转义成能塞进 JSON 字符串字面量的样子。
 
     【必须转义】标题里带一个双引号或反斜杠就能把 JSON 撑破 —— 而日文商品名里
     引号并不罕见（「新品」"未開封" 之类）。直接字符串替换的话，推送会静默
     失败在对方的 400 上，日志里只看得到一个没头没尾的状态码。
     """
-    return template.replace("{text}", json.dumps(text, ensure_ascii=False)[1:-1])
+    return json.dumps(v, ensure_ascii=False)[1:-1]
 
 
-def post(url: str, template: str, text: str) -> None:
+def render(template: str, text: str, thumb: str = "") -> str:
+    """把正文和缩略图地址填进 JSON 模板。
+
+    【模板要 {thumb} 而商品没有图时，整个换成兜底模板】只把 {thumb} 填成空串
+    是不行的：那样发出去的是 "image_url": ""，Slack 回 400，整条消息丢掉。
+    """
+    if "{thumb}" in template and not thumb:
+        template = NO_THUMB_FALLBACK
+    return template.replace("{text}", esc(text)).replace("{thumb}", esc(thumb))
+
+
+def post(url: str, template: str, text: str, thumb: str = "") -> None:
     """发一条。失败只记日志，绝不向上抛 —— 推送坏了不该影响抓取。"""
     if template.strip():
-        r = httpx.post(url, content=render(template, text).encode(),
+        r = httpx.post(url, content=render(template, text, thumb).encode(),
                        headers={"content-type": "application/json", "user-agent": UA},
                        timeout=TIMEOUT)
     else:
@@ -116,7 +136,7 @@ def push_new(rule: dict) -> int:
         if i:                               # 第一条不用等
             time.sleep(GAP)
         try:
-            post(url, template, compose(rule, row, median))
+            post(url, template, compose(rule, row, median), row.get("thumb_url") or "")
             sent += 1
         except Exception as e:              # noqa: BLE001 - 推送坏了不该影响抓取
             # 【失败也标已推，不重试】一条迟到一小时的提醒没有意义，

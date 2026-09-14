@@ -616,8 +616,11 @@ def pending_notify(rule_id: int, only_deal: bool) -> list[dict]:
     （它当时确实合适），推一条"快看这个好货"过去而人点进去是已售出，
     比不推还差。
     """
-    sql = ("SELECT source, item_id, rule_id, name, price, is_deal, deal_pct, bid_count "
-           "FROM item WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' "
+    # 【thumb_url 不能漏】推送模板里的 {thumb} 就靠它。少了这一列，
+    # 渲染出来的 image_url 是空串，而 Slack 对空 image_url 回的是
+    # 400 invalid_blocks —— 整条消息发不出去，那件捡漏就丢了。
+    sql = ("SELECT source, item_id, rule_id, name, price, is_deal, deal_pct, bid_count, "
+           "thumb_url FROM item WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' "
            "AND notified_at IS NULL")
     if only_deal:
         sql += " AND is_deal = 1"

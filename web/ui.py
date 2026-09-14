@@ -1381,7 +1381,11 @@ async def test_notify() -> None:
             "¥850,000（市价的 106%，中位 ¥798,000）\n"
             "https://jp.mercari.com/item/m54103659696")
     try:
-        await run.io_bound(push.post, url, s.get("notify_body") or "", text)
+        # 【必须带一张真图】模板里有 {thumb} 时，不给图会走兜底的纯文本分支，
+        # 那就测不出"带图的那条到底长什么样"—— 而那正是你点这个按钮想看的。
+        thumb = (store.query("SELECT thumb_url FROM item WHERE thumb_url <> '' "
+                             "ORDER BY last_seen_at DESC LIMIT 1") or [{}])[0].get("thumb_url", "")
+        await run.io_bound(push.post, url, s.get("notify_body") or "", text, thumb)
     except Exception as e:      # noqa: BLE001 - 这里就是要把失败摆到脸上
         notify(f"发送失败：{e}", type="negative")
         return

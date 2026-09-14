@@ -159,12 +159,24 @@ SETTINGS_SPEC: dict[str, tuple[type, object, str]] = {
         str, "",
         "请求体模板（JSON）。留空＝把提醒正文当纯文本直接发（ntfy / Bark 这么用）。\n"
         "要发 JSON 就在这里写，用 {text} 占位提醒正文，会自动转义：\n"
-        '  Slack     {"text": "{text}"}\n'
+        '  Slack     见下面「带图」那段\n'
         '  Discord   {"content": "{text}"}\n'
         '  企业微信  {"msgtype":"text","text":{"content":"{text}"}}\n'
         '  Telegram  {"chat_id":"你的chat_id","text":"{text}"}\n'
         "【Slack 就是上面那一行，照抄即可】商品链接放在正文最后一行，"
-        "Slack 会自动展开成带图的预览卡片，不用额外配。\n"
+        "Slack 会抓那个页面的 og:image 展开成带图的预览卡片。\n"
+        "【带图的 Slack 模板，照抄这一整行】\n"
+        '  {"text": "{text}", "blocks": [{"type": "section", "text": {"type": "mrkdwn",'
+        ' "text": "{text}"}, "accessory": {"type": "image", "image_url": "{thumb}",'
+        ' "alt_text": "商品图"}}]}\n'
+        "【{thumb} 是商品缩略图地址】我们不存图片，只存地址，图由 Slack 直接去源站 CDN 取。"
+        "实测三个源的图都能被裸请求取到（不需要 Referer、不挡 Slackbot）。\n"
+        "【顶层那个 text 不能省】它是手机通知栏和消息列表里显示的内容；"
+        "只写 blocks 的话推送预览是一句「This content can't be displayed」。\n"
+        "【靠链接自动展开是不行的】实测过：正文里放商品链接、甚至显式写上 "
+        "unfurl_links/unfurl_media，Slack 都没有展开成带图卡片。要图就得自己塞。\n"
+        "【没有缩略图的商品会自动退回纯文本】Slack 对空 image_url 回 400 invalid_blocks，"
+        "整条消息会发不出去。见 core/notify.py 的 NO_THUMB_FALLBACK。\n"
         "标题里的引号和换行会自动转义，实测库里 637 条商品标题没有一条含 < 或 >"
         "（日文商品名用的是【】《》这类全角括号），所以不需要为 Slack 的 mrkdwn 另做转义。",
     ),

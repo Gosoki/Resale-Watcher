@@ -65,15 +65,25 @@ DARK_CSS = (
     ".q-btn{letter-spacing:0}"
     # 【淡化的危险按钮】拉黑这类操作每行都有一个，全红会把整页压成一片红。
     # 平时压到 40% 不透明度，鼠标移上去才满 —— 要用时找得到，不用时不碍眼。
-    ".btn-muted{opacity:.55;transition:opacity .15s}"
+    # 【原先注释写 40% 而代码是 .55，两边一直对不上】按钮统一尺寸之后
+    # 「拉黑卖家」从 size=sm 长回默认大小，右边整整一列红字明显抢眼了，
+    # 正好把它调回注释里本来就说好的 40%。层级靠颜色和透明度，不靠大小。
+    ".btn-muted{opacity:.4;transition:opacity .15s}"
     # 【图片角上的星】收藏手势大家都认得，比底部一个文字按钮自然得多。
     # 商品图什么底色都有（白盒、亮桌面、深机箱），所以星必须自带描边阴影，
     # 否则压在浅色图上直接消失。
     # 【颜色必须连 .q-btn__content 一起写、还要 !important】Quasar 的按钮没指定
     # color 时默认用主色，只给外层 .star-btn 上色会被它盖掉 —— 星会渲染成蓝的。
     # 和 BTN_QUIET 当初那个坑同源：flat 按钮的颜色默认不是继承来的。
-    ".star-btn{min-width:0!important;min-height:0!important;padding:1px 4px!important;"
-    "font-size:18px;line-height:1;opacity:.8;"
+    # 【必须是正方形，否则圆角画出来是椭圆】Quasar 的 .q-btn--round 是这么写的：
+    #   border-radius:50%; padding:0; min-width:2.4em; min-height:2.4em
+    # 那三条一起把盒子锁成正方形，50% 圆角才是正圆。我们原先把三条全用
+    # !important 覆盖掉了（min-* 归零 + padding 给成 1px 4px 的不对称值），
+    # 盒子变成长方形 —— 而且两个角标椭的方向还相反：★ 字面宽，被压成横椭圆；
+    # ⚑ 字面窄，被拉成竖椭圆。平时 flat 透明看不出来，鼠标一上去 hover 底色
+    # 填满整个盒子就露馅了。所以尺寸要给死 width=height，padding 归零。
+    ".star-btn{min-width:0!important;min-height:0!important;padding:0!important;"
+    "width:26px;height:26px;font-size:18px;line-height:1;opacity:.8;"
     "text-shadow:0 0 3px rgba(0,0,0,.95),0 1px 4px rgba(0,0,0,.9);transition:all .15s}"
     ".star-btn,.star-btn .q-btn__content{color:#fff!important}"
     ".star-btn:hover{opacity:1;transform:scale(1.2)}"
@@ -84,12 +94,31 @@ DARK_CSS = (
     # 标记旗用青色：和追踪的琥珀、捡漏的绿、已降的红都拉得开。
     # 【必须写在 .star-btn 之后】那条规则也带 !important 且特异性相同，
     # 同分时靠出现顺序决胜 —— 写在前面的话旗子会被刷成白的。
+    # 【旗要单独调两次：先补大小，再补笔画】★ 和 ⚑ 是两个不相干的字符，
+    # 同一字号下旗的字面小一圈、笔画还更细 —— 大小和粗细是两回事，
+    # 只放大字号会得到一个"又大又细"的旗，摆在星旁边照样不像一套。
+    #   font-size:22px        补字面大小（18px 的星 ≈ 22px 的旗）
+    #   -webkit-text-stroke   补笔画粗细，.5px 时和 ☆ 的描边几乎等重
+    # 两个数都是把星和旗挨着放、在 5 倍图上逐档比出来的，不是估的。
+    # 【text-stroke 挂了也不会坏】不支持的浏览器只是旗细一点，不影响功能。
+    ".mark-btn{font-size:22px;-webkit-text-stroke:.5px currentColor}"
     ".mark-on{opacity:1}"
     ".mark-on,.mark-on .q-btn__content{color:oklch(78.9% 0.154 211.53)!important}"
     ".btn-muted:hover{opacity:1}"
     # 東京都 原先用 teal，和「捡漏」的绿是相邻色相，扫一眼分不开，而这俩语义
     # 完全不同（一个说地点、一个说机会）。换到紫档，和绿/橙/红/琥珀/灰都拉开。
     ".q-badge.bg-purple{background:oklch(71.4% 0.203 305.504)!important}"    # purple-400
+    # 【没有这一条，设置页那根 sticky 保存条是死代码】Quasar 的标签面板套了两层
+    # 滚动容器：.q-tab-panels.q-panel-parent 是 overflow:hidden，里面每个
+    # .q-panel 还带 class="scroll"（overflow:auto）。position:sticky 的偏移参照
+    # 「最近的滚动祖先」而不是视口，于是那根条子参照的是一个【永远不滚】的盒子
+    #（面板没设高度、高度跟内容一起长，scrollHeight == clientHeight），
+    # 偏移量恒为 0，sticky 退化成 relative。在真实页面上实测过：滚 600px 后
+    # 条子 top=-414，也就是跟着内容一起滚走，和没写 sticky 完全一样；
+    # 放开这两层之后同样的实测是 top=45、挡路祖先=[]。
+    # 【必须配合 animated=False】切标签页时 Quasar 会把两个面板绝对定位叠在一起，
+    # overflow:hidden 正是用来裁掉它的；不关动画就会看到两页互相穿帮。
+    ".q-tab-panels.q-panel-parent,.q-tab-panels .q-panel.scroll{overflow:visible}"
     "}"
     "</style>"
 )
@@ -101,6 +130,9 @@ TOKYO = "東京都"
 # 【按钮只有这几种角色，别再发明第四种】改之前这里有 8 种 props 写法，
 # 有的带 dense 有的不带（高度差一截）、有的浮起有的扁平，同一行里就能看出参差。
 # 统一到角色之后，加新按钮时照抄一个常量即可，不用再逐个拍板。
+# 【尺寸只有一个，别再加 size=】层级靠颜色和填充区分，不靠大小。
+# 之前「设置规则」「拉黑卖家」带着 size=sm，而紧挨着它们的「保存」是默认尺寸 ——
+# 两个按钮并排差一档，一眼就看出来没收拾过。tests/test_ui_consistency.py 拦着这条。
 BTN_PRIMARY = "unelevated dense no-caps color=primary"        # 主操作：一键抓取、保存
 BTN_GHOST = "flat dense no-caps color=primary"                # 次操作：设置、编辑、跑一轮
 # 【必须显式给灰色】flat 不指定 color 时 Quasar 默认用主色 —— 那 BTN_QUIET 和
@@ -108,6 +140,9 @@ BTN_GHOST = "flat dense no-caps color=primary"                # 次操作：设�
 BTN_QUIET = "flat dense no-caps color=grey-5"                 # 轻操作：刷新、取消、设置规则
 BTN_DANGER = "flat dense no-caps color=negative"              # 危险：拉黑、删除
 BTN_DANGER_SOLID = "unelevated dense no-caps color=negative"  # 危险且要确认：删除对话框
+# 压在缩略图角上的图标按钮（追踪星、标记旗）。它不属于上面那几档 —— 没有文字、
+# 没有底色、尺寸由 .star-btn 的 font-size 决定，所以单列一个常量而不是硬写。
+BTN_CORNER = "flat dense round"                               # 图片角标：★ 追踪、⚑ 标记
 INPUT = "dense outlined"                                      # 所有输入框
 
 # 徽标分两类：信号（实心，抢眼）和标签（描边，只说明"它是什么"）
@@ -322,7 +357,7 @@ def thumb_corners(r: dict, rule_id: int, marks: set, rule_name: str,
             ui.button("★" if tracked else "☆",
                       on_click=lambda _, so=r["source"], ii=r["item_id"], ri=rule_id,
                       t=tracked: toggle_track(so, ii, ri, not t)) \
-                .props("flat dense round") \
+                .props(BTN_CORNER) \
                 .classes("absolute top-0 right-0 star-btn"
                          + (" star-on" if tracked else "")) \
                 .tooltip("取消追踪" if tracked else
@@ -332,11 +367,36 @@ def thumb_corners(r: dict, rule_id: int, marks: set, rule_name: str,
         ui.button("⚑" if marked else "⚐",
                   on_click=lambda _, row=dict(r), rn=rule_name, m=marked:
                   toggle_mark(row, rn, not m)) \
-            .props("flat dense round") \
-            .classes("absolute bottom-0 right-0 star-btn" + (" mark-on" if marked else "")) \
+            .props(BTN_CORNER) \
+            .classes("absolute bottom-0 right-0 star-btn mark-btn"
+                     + (" mark-on" if marked else "")) \
             .tooltip("取消标记" if marked else
                      "标记：只是记一笔，不发任何请求。标的是【此刻的快照】——"
                      "标题、价格、图都存下来，以后商品下架了这一页照样看得到")
+
+
+def stale_hours(r: dict) -> float:
+    """这件商品有多久没在搜索结果里出现过了（小时）。
+
+    【为什么用 last_seen_at 而不是别的】它的语义就是「最后一次拿到这件商品的新数据」，
+    整轮扫描和单独拉详情都会刷新它。健康情况下每轮都会重新看到在售商品
+    （quick_min，7〜30 分钟），所以这个数一旦涨到几小时，一定是出事了 ——
+    多半是那个源在限流（实测 メルカリ 会回 403），对账拉不到详情，
+    判不出它到底卖掉了还是还挂着，于是它就带着几小时前的旧价格一直挂在命中页上。
+    """
+    return (config.now() - r["last_seen_at"]).total_seconds() / 3600
+
+
+def split_stale(rows: list[dict], hide_h: float) -> tuple[list[dict], list[dict]]:
+    """按「多久没见到」把命中列表切成（还能信的，已经撤下的）。
+
+    【拆成独立函数是为了能离线测】这条界线上两种写反的方向后果都很难发现：
+    切多了会静悄悄少几件（你以为这个价位真的没货），切少了等于没做
+    （旧价格照常冒充在售）。而这两种都不会报错、不会进日志。
+    """
+    keep = [r for r in rows if stale_hours(r) <= hide_h]
+    dark = [r for r in rows if stale_hours(r) > hide_h]
+    return keep, dark
 
 
 def blacklist_seller(rule_id: int, seller_id: str) -> None:
@@ -398,7 +458,9 @@ def hits_view(host=None) -> None:
         ui.label("还没有规则，去「规则」页新建一条。").classes("text-gray-400 p-4")
         return
 
-    fresh_hours = store.get_settings()["fresh_hours"]
+    cfg = store.get_settings()
+    fresh_hours = cfg["fresh_hours"]
+    warn_h, hide_h = cfg["stale_warn_hours"], cfg["stale_hide_hours"]
     for rule in rules:
         st = store.get_state(rule["id"])
         med = st["median_price"]
@@ -409,6 +471,13 @@ def hits_view(host=None) -> None:
         rows = store.query(
             "SELECT * FROM item WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' "
             "ORDER BY COALESCE(deal_pct, 999), price", (rule["id"],))
+        # 【太久没见到的从这一页撤下】命中页回答的是「现在有什么能买」。
+        # 一条一天没更新过的记录回答不了这个问题：它显示的价格是一天前的，
+        # 而商品可能早就卖掉了 —— 源在限流时对账拉不到详情，判不出来，
+        # 它就会一直挂在这里冒充在售。宁可撤下让它哪天重新入库，
+        # 也不要拿旧数据糊弄人。撤下不是删除：全部页照常看得到，
+        # 只要它重新出现在搜索结果里，last_seen_at 一刷新就自动回来。
+        rows, gone_dark = split_stale(rows, hide_h)
 
         # 折叠摘要：折起来之后这一行就是你能看到的全部，所以预算/市价/捡漏线都要在里面
         summary = [f"预算 {yen(rule['price_min'])}〜{yen(rule['price_max'])}"]
@@ -422,6 +491,9 @@ def hits_view(host=None) -> None:
             summary.append(f"手动捡漏价 {yen(rule['deal_price'])}")
         elif med and rule["deal_ratio"]:
             summary.append(f"低于 {yen(med * rule['deal_ratio'] // 100)} 算捡漏")
+        if gone_dark:
+            # 【必须报数】偷偷少几件比显示旧数据更糟：你会以为这个价位真的没货了
+            summary.append(f"另有 {len(gone_dark)} 件超过 {hide_h}h 没见到，已撤下")
         deals = sum(1 for r in rows if r["is_deal"])
         head = f"{rule['name']}　{len(rows)} 件" + (f"　🟢 {deals} 件捡漏" if deals else "")
 
@@ -450,14 +522,14 @@ def hits_view(host=None) -> None:
                 with inp.add_slot("append"):
                     ui.button("保存", on_click=lambda _, rid=rule["id"], c=inp:
                               save_deal_price(rid, c.value)) \
-                        .props("flat dense no-caps color=primary").classes("px-2")
+                        .props(BTN_GHOST).classes("px-2")
                 # 【host 必须一路传进来】对话框要建在页面级容器里，不能建在
                 # hits_view 自己的刷新容器内 —— refresh() 的第一步是 container.clear()，
                 # 会把还开着的对话框连同你敲了一半的内容一起删掉，而且不给任何提示。
                 # 【降到灰色】它和框里那个「保存」挨着，两个都用主色的话权重一样，
                 # 而一个是提交这条价、一个是打开整条规则的设置框，职责差很远。
                 ui.button("设置规则", on_click=lambda _, r=rule: rule_dialog(r, host)) \
-                    .props(BTN_QUIET + " size=sm") \
+                    .props(BTN_QUIET) \
                     .tooltip("改关键词、词表、价格区间、数据源 —— 和「规则」页是同一个框")
             if not rows:
                 ui.label("当前没有符合条件的在售商品。").classes("text-gray-400 text-sm")
@@ -471,6 +543,14 @@ def hits_view(host=None) -> None:
             with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
                 for r in rows:
                     fresh = freshness(r, fresh_hours, cold_start)
+                    # 【正文列必须是 flex-1，不能是 grow】grow 只给 flex-grow:1，
+                    # flex-basis 还是 auto —— 而 flex 折行用的是「内容不折行时的完整
+                    # 宽度」(max-content)，min-w-0 只压下限、管不到折行这一步。
+                    # 日文标题动辄七八十字，max-content 接近 1000px，于是手机上正文列
+                    # 自己就撑爆一行：缩略图被单独留在第一行、右边一大片空白，标题掉到
+                    # 第二行、价格再掉第三行，一件商品从两行变三行、行高涨到 250px 上下。
+                    # flex-1 是 flex:1 1 0%，basis 归零后它在折行计算里占 0，
+                    # 图和正文才留得住在同一行，只把价格挤下去 —— 那才是本来想要的。
                     # 【这一行的三个 class 是一组，缺一个价格就会被长标题挤下去】
                     #   sm:flex-nowrap  ≥640px 时三列（图/正文/价格）绝不换行 ——
                     #                没有它，标题一长整个价格列会被挤到下一行去。
@@ -491,15 +571,32 @@ def hits_view(host=None) -> None:
                         # 累积下来整张卡片会显得松垮
                         # self-stretch：撑满卡片高度，下面那行小字的 mt-auto 才顶得到底
                         with ui.column().classes(
-                                "gap-0 grow min-w-0 leading-snug self-stretch"):
+                                "gap-0 flex-1 min-w-0 leading-snug self-stretch"):
                             # 【徽标在标题上方】它们是"要不要点进去"的信号，得一眼看见。
                             # 放在标题后面的话，遇到长标题（全库最长 130 字，超 70 字的有
                             # 一百多件）就会被推到第二三行的行尾，等于没有。
                             # 没有任何徽标时整行不渲染，不留空档。
                             dropped = r["price"] < r["first_price"]
+                            stale = stale_hours(r)
                             if (r["is_deal"] or fresh or r["desc_warn"]
-                                    or r["ship_from"] == TOKYO or dropped):
+                                    or r["ship_from"] == TOKYO or dropped
+                                    or stale > warn_h):
                                 with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
+                                    # 【失联排在最前面】它一旦成立，下面那些
+                                    # 「捡漏」「已降」全都是基于旧价算的，
+                                    # 先看到它才知道后面几个徽标都不能全信。
+                                    if stale > warn_h:
+                                        # 【用灰不用橙】橙色是「新上架」，两个并排时
+                                        # 分不开，而它们语义正好相反：一个说"快看"，
+                                        # 一个说"别信"。失联和「描述未读到」是同一类
+                                        # ——数据质量提示，不是机会信号，归灰档。
+                                        ui.badge(f"失联 {stale:.0f}h", color="grey").tooltip(
+                                            f"已经 {stale:.0f} 小时没在搜索结果里见到它了"
+                                            f"（正常每 {rule['quick_min']} 分钟就该见到一次）。"
+                                            "多半是这个源在限流，对账拉不到详情，"
+                                            "判不出它是卖掉了还是还挂着 —— "
+                                            f"下面的价格是 {stale:.0f} 小时前的，别当真。"
+                                            f"超过 {hide_h}h 会直接从这一页撤下")
                                     if r["is_deal"]:
                                         ui.badge("捡漏", color="green")
                                     if dropped:
@@ -593,7 +690,7 @@ def hits_view(host=None) -> None:
                                         "拉黑卖家",
                                         on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
                                             blacklist_seller(rid, sid),
-                                    ).props(BTN_DANGER + " size=sm").classes("btn-muted") \
+                                    ).props(BTN_DANGER).classes("btn-muted") \
                                      .tooltip(
                                         f"卖家 {r['seller_id']}\n"
                                         "拉黑后这条规则下他的全部商品立刻判为不合适。"
@@ -676,7 +773,7 @@ def _track_row(r: dict, rule: dict, st: dict, marks: set) -> None:
     with ui.row().classes("items-start w-full gap-3 border-t py-2 sm:flex-nowrap"):
         # 和命中页同一颗星：这里它一定是实心的，点一下就是取消追踪
         thumb_corners(r, r["rule_id"], marks, rule.get("name", ""))
-        with ui.column().classes("gap-0 grow min-w-0 leading-snug self-stretch"):
+        with ui.column().classes("gap-0 flex-1 min-w-0 leading-snug self-stretch"):
             with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
                 # 【终态的留在这一页】卖掉/下架的不会被摘掉追踪，所以这三种
                 # 状态都会出现。已卖掉排在最前面判，因为它一旦成立，
@@ -756,7 +853,7 @@ def _mark_row(m: dict) -> None:
         # 这一页上的旗一定是实心的，点一下就是取消标记。
         # rule_id 传 0：star=False 时它用不到（追踪才需要规则维度）。
         thumb_corners(m, 0, {(m["source"], m["item_id"])}, m["rule_name"], star=False)
-        with ui.column().classes("gap-0 grow min-w-0 leading-snug self-stretch"):
+        with ui.column().classes("gap-0 flex-1 min-w-0 leading-snug self-stretch"):
             with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
                 if live is None:
                     ui.badge("已不在库", color="grey").tooltip(
@@ -777,9 +874,9 @@ def _mark_row(m: dict) -> None:
                 .props(INPUT).classes("w-full max-w-md mt-1")
             with inp.add_slot("append"):
                 # 【必须用默认参数绑死】m 和 inp 都是循环变量
-                ui.button("存", on_click=lambda _, so=m["source"], ii=m["item_id"],
+                ui.button("保存", on_click=lambda _, so=m["source"], ii=m["item_id"],
                           c=inp: save_mark_note(so, ii, c.value)) \
-                    .props("flat dense no-caps color=primary").classes("px-2")
+                    .props(BTN_GHOST).classes("px-2")
             with ui.row().classes(
                     "gap-3 text-xs text-gray-400 items-center mt-auto pt-1"):
                 ui.label(f"{m['marked_at']:%Y-%m-%d %H:%M} 标记")
@@ -874,7 +971,7 @@ def _sold_row(r: dict, med: int | None, marks: set, rule_name: str) -> None:
         thumb_corners(r, r["rule_id"], marks, rule_name, star=False)
         # self-stretch + 下面那行的 mt-auto：和命中页同一套贴底做法。
         # 漏了的话宽屏两列时矮的那张卡片小字悬在半空，两列对不齐。
-        with ui.column().classes("gap-0 grow min-w-0 leading-snug self-stretch"):
+        with ui.column().classes("gap-0 flex-1 min-w-0 leading-snug self-stretch"):
             with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
                 # 【这里不放「已成交」徽标】这一整页就是成交记录，每行再标一次
                 # 等于没说，而它还占着每行第一个徽标位 —— 真正有信息的
@@ -997,7 +1094,7 @@ def all_view(rule_id: int | None, reason: str) -> None:
     with tbl.add_slot("body-cell-act"):
         with tbl.cell("act"):
             ui.button().props(
-                BTN_DANGER + ' size=sm '
+                BTN_DANGER + ' '
                 ':label="props.row.act" :disable="!props.row.can_bl"'
             ).on(
                 "click",
@@ -1483,7 +1580,9 @@ def create() -> None:
             t_all = ui.tab("全部")
             t_rule = ui.tab("规则")
             t_set = ui.tab("设置")
-        with ui.tab_panels(tabs, value=t_hit).classes("w-full"):
+        # animated=False 的理由见 DARK_CSS 里那条 overflow:visible 的注释：
+        # 两者是一组，少一个要么 sticky 不生效、要么切页穿帮。
+        with ui.tab_panels(tabs, value=t_hit, animated=False).classes("w-full"):
             with ui.tab_panel(t_hit):
                 with toolbar("当前符合条件的在售商品，按「市价的百分之多少」从低到高排"):
                     ui.button("一键抓取", on_click=fetch_all).props(BTN_PRIMARY) \

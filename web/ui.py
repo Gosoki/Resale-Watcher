@@ -450,6 +450,51 @@ def toolbar(desc: str):
 
 # ------------------------------------------------------------------ 命中页
 
+def _deals_summary(rules: list[dict], cold: dict, marks: set,
+                   fresh_hours: int, warn_h: float, hide_h: float) -> None:
+    """跨规则的捡漏汇总 —— 命中页上唯一默认展开的块。
+
+    【为什么要单开一块，而不是靠各规则组里的绿徽标】捡漏是「现在该动手」的那几件，
+    平时一天 0〜4 件；而命中是「符合条件」的，四条规则加起来上百件。
+    混在一起的结果是：真正要抢的东西埋在几十屏里，你得逐组展开去找绿标。
+    分开之后这一页的默认视图就只剩「要不要买」这一个问题。
+
+    【口径必须和规则组完全一致】同一套 _hit_row、同一个 split_stale 撤下规则。
+    两边显示的件数对不上是最难查的那种 bug —— 你会以为是判定出错了。
+    """
+    by_id = {r["id"]: r for r in rules}
+    rows = store.query(
+        "SELECT * FROM item WHERE matched = 1 AND status = 'on_sale' AND is_deal = 1 "
+        "ORDER BY COALESCE(deal_pct, 999), price")
+    rows = [r for r in rows if r["rule_id"] in by_id]
+    rows, dark = split_stale(rows, hide_h)
+
+    head = f"🟢 捡漏　{len(rows)} 件" if rows else "🟢 捡漏　暂时没有"
+    cap = ["低于各自规则捡漏线的在售商品，按「市价的百分之多少」从低到高排"]
+    if dark:
+        cap.append(f"另有 {len(dark)} 件超过 {hide_h}h 没见到，已撤下")
+    with ui.expansion(head, caption=" · ".join(cap), value=True) \
+            .classes(CARD).props("header-class=text-base"):
+        if not rows:
+            # 【说清楚是"没有"还是"判不了"】捡漏线算不出来的规则（没手动价、
+            # 成交样本又不够）永远不会有捡漏，而页面上看起来和"暂时没好货"一模一样。
+            blind = [r["name"] for r in rules
+                     if not r["deal_price"]
+                     and not (store.get_state(r["id"])["median_price"] and r["deal_ratio"])]
+            msg = "当前没有低于捡漏线的商品。"
+            if blind:
+                msg += ("　⚠ 另外这几条规则【算不出捡漏线】，永远不会出现在这里："
+                        + "、".join(blind) + " —— 去下面的规则组里填个手动捡漏价")
+            ui.label(msg).classes("text-gray-400 text-sm")
+            return
+        with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
+            for r in rows:
+                rule = by_id[r["rule_id"]]
+                _hit_row(r, rule, marks, fresh_hours, cold[rule["id"]],
+                         warn_h, hide_h, show_rule=True)
+
+
+
 @ui.refreshable
 def hits_view(host=None) -> None:
     # 【整份取出来，不要每行查一次】一屏几十行，每行一个 SELECT 翻页会肉眼卡顿
@@ -462,13 +507,20 @@ def hits_view(host=None) -> None:
     cfg = store.get_settings()
     fresh_hours = cfg["fresh_hours"]
     warn_h, hide_h = cfg["stale_warn_hours"], cfg["stale_hide_hours"]
+    # 冷启动判断：这条规则库里【最早】的商品也是刚抓到的，说明监控本身才刚开始。
+    # 【一次算完存起来】汇总区和下面的规则组要用同一份，各算一遍就是每条规则两次查询。
+    cold = {}
+    for rule in rules:
+        earliest = store.one("SELECT MIN(first_seen_at) m FROM item WHERE rule_id = %s",
+                             (rule["id"],))["m"]
+        cold[rule["id"]] = bool(earliest) and (config.now() - earliest) < timedelta(hours=fresh_hours)
+
+    _deals_summary(rules, cold, marks, fresh_hours, warn_h, hide_h)
+
     for rule in rules:
         st = store.get_state(rule["id"])
         med = st["median_price"]
-        # 冷启动判断：这条规则库里【最早】的商品也是刚抓到的，说明监控本身才刚开始
-        earliest = store.one("SELECT MIN(first_seen_at) m FROM item WHERE rule_id = %s",
-                             (rule["id"],))["m"]
-        cold_start = bool(earliest) and (config.now() - earliest) < timedelta(hours=fresh_hours)
+        cold_start = cold[rule["id"]]
         rows = store.query(
             "SELECT * FROM item WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' "
             "ORDER BY COALESCE(deal_pct, 999), price", (rule["id"],))
@@ -498,9 +550,10 @@ def hits_view(host=None) -> None:
         deals = sum(1 for r in rows if r["is_deal"])
         head = f"{rule['name']}　{len(rows)} 件" + (f"　🟢 {deals} 件捡漏" if deals else "")
 
-        # value=True＝默认展开。折叠状态只活在当前页面里，刷新后回到展开 ——
-        # 这正是想要的：命中列表是每次打开都要从头扫一遍的东西。
-        with ui.expansion(head, caption=" · ".join(summary), value=True) \
+        # 【默认折叠】整页四条规则铺开有上百件，一进来就得滚半天才看得到重点。
+        # 真正要立刻动手的那几件已经在最上面的「捡漏」汇总里，
+        # 这些按规则分的组是「我想翻一翻某一类」时才展开的。
+        with ui.expansion(head, caption=" · ".join(summary), value=False) \
                 .classes(CARD).props("header-class=text-base"):
             # 【放在「没有商品」判断之前】一件都没命中的时候，恰恰是你最想调这个价的时候。
             # 原先这一行是五个元素平铺：按钮、标签、输入框、按钮、一长串说明 ——
@@ -543,159 +596,176 @@ def hits_view(host=None) -> None:
             # 再加 gap-y 会让两列之间的分隔线对不齐。
             with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
                 for r in rows:
-                    fresh = freshness(r, fresh_hours, cold_start)
-                    # 【正文列必须是 flex-1，不能是 grow】grow 只给 flex-grow:1，
-                    # flex-basis 还是 auto —— 而 flex 折行用的是「内容不折行时的完整
-                    # 宽度」(max-content)，min-w-0 只压下限、管不到折行这一步。
-                    # 日文标题动辄七八十字，max-content 接近 1000px，于是手机上正文列
-                    # 自己就撑爆一行：缩略图被单独留在第一行、右边一大片空白，标题掉到
-                    # 第二行、价格再掉第三行，一件商品从两行变三行、行高涨到 250px 上下。
-                    # flex-1 是 flex:1 1 0%，basis 归零后它在折行计算里占 0，
-                    # 图和正文才留得住在同一行，只把价格挤下去 —— 那才是本来想要的。
-                    # 【这一行的三个 class 是一组，缺一个价格就会被长标题挤下去】
-                    #   sm:flex-nowrap  ≥640px 时三列（图/正文/价格）绝不换行 ——
-                    #                没有它，标题一长整个价格列会被挤到下一行去。
-                    #   【但手机上必须换行】430px 宽时三列排不下，nowrap 的结果是
-                    #                价格列整个被推出视口：价格、市价百分比、拉黑
-                    #                全都看不见，而且没有横向滚动条提示你右边还有东西。
-                    #                宁可价格掉到第二行，也不能让它消失。
-                    #   items-start  标题换成两行时，价格保持在顶部对齐而不是浮到中间
-                    #   正文列的 min-w-0 + 价格列的 shrink-0 见下面，是同一件事的另一半：
-                    #   flex 子项默认 min-width:auto，不写 min-w-0 的话正文列会被内容
-                    #   撑到超过容器宽度，把右边挤没
-                    with ui.row().classes("items-start w-full gap-3 border-t py-2 sm:flex-nowrap"):
-                        # 96px：正文列在「徽标+标题两行+拍卖提示+品相行」时约 90px 高，
-                        # 图跟着长到差不多，两边才齐。64px 时右边明显空一块，
-                        # 看起来就像行距被撑开了。
-                        thumb_corners(r, rule["id"], marks, rule["name"])
-                        # leading-snug：正文是 3~4 行小字堆起来的，默认行高留白偏多，
-                        # 累积下来整张卡片会显得松垮
-                        # self-stretch：撑满卡片高度，下面那行小字的 mt-auto 才顶得到底
-                        with ui.column().classes(
-                                "gap-0 flex-1 min-w-0 leading-snug self-stretch"):
-                            # 【徽标在标题上方】它们是"要不要点进去"的信号，得一眼看见。
-                            # 放在标题后面的话，遇到长标题（全库最长 130 字，超 70 字的有
-                            # 一百多件）就会被推到第二三行的行尾，等于没有。
-                            # 没有任何徽标时整行不渲染，不留空档。
-                            dropped = r["price"] < r["first_price"]
-                            stale = stale_hours(r)
-                            if (r["is_deal"] or fresh or r["desc_warn"]
-                                    or r["ship_from"] == TOKYO or dropped
-                                    or stale > warn_h):
-                                with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
-                                    # 【失联排在最前面】它一旦成立，下面那些
-                                    # 「捡漏」「已降」全都是基于旧价算的，
-                                    # 先看到它才知道后面几个徽标都不能全信。
-                                    if stale > warn_h:
-                                        # 【用灰不用橙】橙色是「新上架」，两个并排时
-                                        # 分不开，而它们语义正好相反：一个说"快看"，
-                                        # 一个说"别信"。失联和「描述未读到」是同一类
-                                        # ——数据质量提示，不是机会信号，归灰档。
-                                        ui.badge(f"失联 {stale:.0f}h", color="grey").tooltip(
-                                            f"已经 {stale:.0f} 小时没在搜索结果里见到它了"
-                                            f"（正常每 {rule['quick_min']} 分钟就该见到一次）。"
-                                            "多半是这个源在限流，对账拉不到详情，"
-                                            "判不出它是卖掉了还是还挂着 —— "
-                                            f"下面的价格是 {stale:.0f} 小时前的，别当真。"
-                                            f"超过 {hide_h}h 会直接从这一页撤下")
-                                    if r["is_deal"]:
-                                        ui.badge("捡漏", color="green")
-                                    if dropped:
-                                        # 【降价属于徽标不属于小字】它和捡漏/新上架是同一类
-                                        # 信息：决定你要不要点进去。摆在最下面那行灰字里，
-                                        # 和品相、发货地混在一起，等于把它藏了。
-                                        # 首见价放进 tooltip —— 徽标要短，一眼能扫过去。
-                                        ui.badge(f"已降 {yen(r['first_price'] - r['price'])}",
-                                                 color="red").tooltip(
-                                            f"我们首次发现它时是 {yen(r['first_price'])}，"
-                                            f"现在 {yen(r['price'])}")
-                                    if r["ship_from"] == TOKYO:
-                                        ui.badge(TOKYO, color="purple").tooltip(
-                                            "发货地在东京都内。【只有拉过详情的商品才知道发货地】"
-                                            "三个源都只在详情里给这个字段，搜索结果里没有——"
-                                            "没这个标不等于不在东京，可能只是还没拉详情")
-                                    if fresh == "listed":
-                                        ui.badge("新上架", color="orange").tooltip(
-                                            f"平台显示它是最近 {fresh_hours} 小时内挂出来的")
-                                    elif fresh == "found":
-                                        ui.badge("新发现", color="blue-grey").tooltip(
-                                            f"最近 {fresh_hours} 小时内才进我们的库。商品本身可能"
-                                            "早就挂着了 —— 多半是它降价进了你的价格区间。"
-                                            "ヤフオク 不提供上架时间，它的商品只会有这个标")
-                                    if r["desc_warn"] == poller.DESC_UNREAD:
-                                        # 【这不是警示词，是降级信号】详情页打开了但描述没解析出来
-                                        # （多半是平台改版）。画成普通警示徽标、还配一句
-                                        # 「可能是卖家在否认」的解释，等于用假信息盖住了
-                                        # 「警示层对这件商品整个失效」这个事实。
-                                        ui.badge("描述未读到", color="grey").tooltip(
-                                            "详情页打开了，但描述没解析出来（平台页面结构可能变了）。"
-                                            "这件商品的描述警示【没有生效】，点进去自己看一眼")
-                                    elif r["desc_warn"]:
-                                        # 描述里命中了警示词。商品没被毙掉，只是提醒你点开看一眼
-                                        ui.badge(f"描述: {r['desc_warn']}", color="amber") \
-                                            .tooltip("描述里出现了这些词，但可能是卖家在否认（如"
-                                                     "「ジャンク品ではありません」）。点标题自己看一眼")
-                            # 标题【不截断】，长了就换行（break-words 让超长的连续
-                            # 字符串——比如日文长串型号——也能断开，不会撑破容器）
-                            ui.link(r["name"], item_url(r["source"], r["item_id"]),
-                                    new_tab=True).classes("font-medium break-words")
-                            note, color = auction_note(r)
-                            if note:
-                                ui.label(note).classes(f"text-xs {color}")
-                            # 【mt-auto 把这一行顶到卡片底部】宽屏两列时，同一行的两张
-                            # 卡片高度取决于高的那张；不顶到底部的话，矮的那张这一行会
-                            # 悬在半空，两列的这排小字对不齐，扫起来很累。
-                            # 配合正文列的 self-stretch（让它撑满卡片高度）才生效。
-                            with ui.row().classes(
-                                    "gap-3 text-xs text-gray-400 items-center mt-auto pt-1"):
-                                # 【这一行永远只有这三项，固定顺序】品相 → 发货地 → 上架时间
-                                # 别再往这里塞东西：它贴卡片底部、两列之间要横向对齐，
-                                # 多一项少一项都会让两边错位。会变的信息一律做成徽标放标题上方
-                                # （降价就是这么挪上去的），操作按钮放右边价格列（拉黑同理）。
-                                ui.label(COND.get(r["condition_id"], "品相未标"))
-                                # 非东京的也显示出来 —— 不然「这件为什么没有东京标」
-                                # 你分不清是「不在东京」还是「还没拉详情」
-                                if r["ship_from"]:
-                                    ui.label(f"发货 {r['ship_from']}")
-                                if r["listed_at"]:
-                                    # 【没有上架时间就整个不渲染】ヤフオク 不给这个字段，
-                                    # 渲染成空 label 会在两列之间留一个对不齐的空档
-                                    ui.label(f"上架 {r['listed_at']:%m-%d %H:%M}")
+                    _hit_row(r, rule, marks, fresh_hours, cold_start, warn_h, hide_h)
 
-                        # shrink-0：价格列宽度固定，不参与压缩
-                        # whitespace-nowrap：¥1,188,800 这种数字本身也绝不折行
-                        # self-stretch：和正文列一样撑满卡片高度，下面拉黑按钮的 mt-auto
-                        # 才能把它压到底 —— 否则它悬在半空，和左边那行小字不在同一条基线上。
-                        with ui.column().classes(
-                                "gap-0 items-end shrink-0 whitespace-nowrap self-stretch"):
-                            # 来源放在价格正上方：这两个信息是一起看的 ——
-                            # 同一个价格在哪个平台，直接决定你怎么去买
-                            ui.badge(source_name(r["source"])).classes(BADGE_LABEL + " mb-1")
-                            ui.label(yen(r["price"])).classes("text-lg font-bold")
-                            if r["deal_pct"]:
-                                # 【颜色按百分比本身，不按 is_deal】跟着 is_deal 走的话，
-                                # 手动捡漏价一开，「市价的 110%」会显示成绿色 —— 绿色读作
-                                # 「便宜」，而 110% 是贵了一成，界面在自相矛盾。
-                                # 是不是捡漏由上面那个绿徽标说，这里只说贵还是便宜。
-                                ui.label(f"市价的 {r['deal_pct']}%").classes(
-                                    "text-xs " + ("text-green-400" if r["deal_pct"] < 100
-                                                  else "text-gray-400"))
-                            # 追踪已经挪到图片角上的星了，这里只剩拉黑。
-                            with ui.row().classes("items-center gap-1 mt-auto"):
-                                # 【必须用默认参数绑死 rid/sid】它们是循环变量，直接引用的话
-                                # 等你点下去时早就指向最后一件商品了 —— 每个按钮拉黑同一个人。
-                                # 卖家ID为空时不给按钮：ヤフオク 有一部分商品不给卖家ID，
-                                # 没有可拉黑的对象，画个点不动的按钮只会让人以为坏了。
-                                if r["seller_id"]:
-                                    ui.button(
-                                        "拉黑卖家",
-                                        on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
-                                            blacklist_seller(rid, sid),
-                                    ).props(BTN_DANGER).classes("btn-muted") \
-                                     .tooltip(
-                                        f"卖家 {r['seller_id']}\n"
-                                        "拉黑后这条规则下他的全部商品立刻判为不合适。"
-                                        "想反悔就去规则页把 ID 从 exclude_sellers 里删掉")
+
+def _hit_row(r: dict, rule: dict, marks: set, fresh_hours: int,
+             cold_start: bool, warn_h: float, hide_h: float,
+             show_rule: bool = False) -> None:
+    """命中页的一行商品。
+
+    【抽成函数是为了「捡漏汇总」能用同一套】汇总区和规则组里显示的是同一批商品，
+    两边各写一遍的话迟早分叉：改了徽标顺序只改一处、加了新按钮只加一处，
+    而两处长得差不多，评审时很难发现。
+    """
+    fresh = freshness(r, fresh_hours, cold_start)
+    # 【正文列必须是 flex-1，不能是 grow】grow 只给 flex-grow:1，
+    # flex-basis 还是 auto —— 而 flex 折行用的是「内容不折行时的完整
+    # 宽度」(max-content)，min-w-0 只压下限、管不到折行这一步。
+    # 日文标题动辄七八十字，max-content 接近 1000px，于是手机上正文列
+    # 自己就撑爆一行：缩略图被单独留在第一行、右边一大片空白，标题掉到
+    # 第二行、价格再掉第三行，一件商品从两行变三行、行高涨到 250px 上下。
+    # flex-1 是 flex:1 1 0%，basis 归零后它在折行计算里占 0，
+    # 图和正文才留得住在同一行，只把价格挤下去 —— 那才是本来想要的。
+    # 【这一行的三个 class 是一组，缺一个价格就会被长标题挤下去】
+    #   sm:flex-nowrap  ≥640px 时三列（图/正文/价格）绝不换行 ——
+    #                没有它，标题一长整个价格列会被挤到下一行去。
+    #   【但手机上必须换行】430px 宽时三列排不下，nowrap 的结果是
+    #                价格列整个被推出视口：价格、市价百分比、拉黑
+    #                全都看不见，而且没有横向滚动条提示你右边还有东西。
+    #                宁可价格掉到第二行，也不能让它消失。
+    #   items-start  标题换成两行时，价格保持在顶部对齐而不是浮到中间
+    #   正文列的 min-w-0 + 价格列的 shrink-0 见下面，是同一件事的另一半：
+    #   flex 子项默认 min-width:auto，不写 min-w-0 的话正文列会被内容
+    #   撑到超过容器宽度，把右边挤没
+    with ui.row().classes("items-start w-full gap-3 border-t py-2 sm:flex-nowrap"):
+        # 96px：正文列在「徽标+标题两行+拍卖提示+品相行」时约 90px 高，
+        # 图跟着长到差不多，两边才齐。64px 时右边明显空一块，
+        # 看起来就像行距被撑开了。
+        thumb_corners(r, rule["id"], marks, rule["name"])
+        # leading-snug：正文是 3~4 行小字堆起来的，默认行高留白偏多，
+        # 累积下来整张卡片会显得松垮
+        # self-stretch：撑满卡片高度，下面那行小字的 mt-auto 才顶得到底
+        with ui.column().classes(
+                "gap-0 flex-1 min-w-0 leading-snug self-stretch"):
+            # 【徽标在标题上方】它们是"要不要点进去"的信号，得一眼看见。
+            # 放在标题后面的话，遇到长标题（全库最长 130 字，超 70 字的有
+            # 一百多件）就会被推到第二三行的行尾，等于没有。
+            # 没有任何徽标时整行不渲染，不留空档。
+            dropped = r["price"] < r["first_price"]
+            stale = stale_hours(r)
+            if (r["is_deal"] or fresh or r["desc_warn"]
+                    or r["ship_from"] == TOKYO or dropped
+                    or stale > warn_h):
+                with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
+                    # 【失联排在最前面】它一旦成立，下面那些
+                    # 「捡漏」「已降」全都是基于旧价算的，
+                    # 先看到它才知道后面几个徽标都不能全信。
+                    if stale > warn_h:
+                        # 【用灰不用橙】橙色是「新上架」，两个并排时
+                        # 分不开，而它们语义正好相反：一个说"快看"，
+                        # 一个说"别信"。失联和「描述未读到」是同一类
+                        # ——数据质量提示，不是机会信号，归灰档。
+                        ui.badge(f"失联 {stale:.0f}h", color="grey").tooltip(
+                            f"已经 {stale:.0f} 小时没在搜索结果里见到它了"
+                            f"（正常每 {rule['quick_min']} 分钟就该见到一次）。"
+                            "多半是这个源在限流，对账拉不到详情，"
+                            "判不出它是卖掉了还是还挂着 —— "
+                            f"下面的价格是 {stale:.0f} 小时前的，别当真。"
+                            f"超过 {hide_h}h 会直接从这一页撤下")
+                    if r["is_deal"]:
+                        ui.badge("捡漏", color="green")
+                    if show_rule:
+                        # 【汇总区必须标规则名】它把四条规则的商品混在一起排，
+                        # 不标的话「¥50万算捡漏吗」这个问题没法回答 ——
+                        # 4090 单卡的线是 40 万，5090 整机的线是 110 万。
+                        ui.label(rule.get("name", "?")).classes("text-xs text-gray-400")
+                    if dropped:
+                        # 【降价属于徽标不属于小字】它和捡漏/新上架是同一类
+                        # 信息：决定你要不要点进去。摆在最下面那行灰字里，
+                        # 和品相、发货地混在一起，等于把它藏了。
+                        # 首见价放进 tooltip —— 徽标要短，一眼能扫过去。
+                        ui.badge(f"已降 {yen(r['first_price'] - r['price'])}",
+                                 color="red").tooltip(
+                            f"我们首次发现它时是 {yen(r['first_price'])}，"
+                            f"现在 {yen(r['price'])}")
+                    if r["ship_from"] == TOKYO:
+                        ui.badge(TOKYO, color="purple").tooltip(
+                            "发货地在东京都内。【只有拉过详情的商品才知道发货地】"
+                            "三个源都只在详情里给这个字段，搜索结果里没有——"
+                            "没这个标不等于不在东京，可能只是还没拉详情")
+                    if fresh == "listed":
+                        ui.badge("新上架", color="orange").tooltip(
+                            f"平台显示它是最近 {fresh_hours} 小时内挂出来的")
+                    elif fresh == "found":
+                        ui.badge("新发现", color="blue-grey").tooltip(
+                            f"最近 {fresh_hours} 小时内才进我们的库。商品本身可能"
+                            "早就挂着了 —— 多半是它降价进了你的价格区间。"
+                            "ヤフオク 不提供上架时间，它的商品只会有这个标")
+                    if r["desc_warn"] == poller.DESC_UNREAD:
+                        # 【这不是警示词，是降级信号】详情页打开了但描述没解析出来
+                        # （多半是平台改版）。画成普通警示徽标、还配一句
+                        # 「可能是卖家在否认」的解释，等于用假信息盖住了
+                        # 「警示层对这件商品整个失效」这个事实。
+                        ui.badge("描述未读到", color="grey").tooltip(
+                            "详情页打开了，但描述没解析出来（平台页面结构可能变了）。"
+                            "这件商品的描述警示【没有生效】，点进去自己看一眼")
+                    elif r["desc_warn"]:
+                        # 描述里命中了警示词。商品没被毙掉，只是提醒你点开看一眼
+                        ui.badge(f"描述: {r['desc_warn']}", color="amber") \
+                            .tooltip("描述里出现了这些词，但可能是卖家在否认（如"
+                                     "「ジャンク品ではありません」）。点标题自己看一眼")
+            # 标题【不截断】，长了就换行（break-words 让超长的连续
+            # 字符串——比如日文长串型号——也能断开，不会撑破容器）
+            ui.link(r["name"], item_url(r["source"], r["item_id"]),
+                    new_tab=True).classes("font-medium break-words")
+            note, color = auction_note(r)
+            if note:
+                ui.label(note).classes(f"text-xs {color}")
+            # 【mt-auto 把这一行顶到卡片底部】宽屏两列时，同一行的两张
+            # 卡片高度取决于高的那张；不顶到底部的话，矮的那张这一行会
+            # 悬在半空，两列的这排小字对不齐，扫起来很累。
+            # 配合正文列的 self-stretch（让它撑满卡片高度）才生效。
+            with ui.row().classes(
+                    "gap-3 text-xs text-gray-400 items-center mt-auto pt-1"):
+                # 【这一行永远只有这三项，固定顺序】品相 → 发货地 → 上架时间
+                # 别再往这里塞东西：它贴卡片底部、两列之间要横向对齐，
+                # 多一项少一项都会让两边错位。会变的信息一律做成徽标放标题上方
+                # （降价就是这么挪上去的），操作按钮放右边价格列（拉黑同理）。
+                ui.label(COND.get(r["condition_id"], "品相未标"))
+                # 非东京的也显示出来 —— 不然「这件为什么没有东京标」
+                # 你分不清是「不在东京」还是「还没拉详情」
+                if r["ship_from"]:
+                    ui.label(f"发货 {r['ship_from']}")
+                if r["listed_at"]:
+                    # 【没有上架时间就整个不渲染】ヤフオク 不给这个字段，
+                    # 渲染成空 label 会在两列之间留一个对不齐的空档
+                    ui.label(f"上架 {r['listed_at']:%m-%d %H:%M}")
+
+        # shrink-0：价格列宽度固定，不参与压缩
+        # whitespace-nowrap：¥1,188,800 这种数字本身也绝不折行
+        # self-stretch：和正文列一样撑满卡片高度，下面拉黑按钮的 mt-auto
+        # 才能把它压到底 —— 否则它悬在半空，和左边那行小字不在同一条基线上。
+        with ui.column().classes(
+                "gap-0 items-end shrink-0 whitespace-nowrap self-stretch"):
+            # 来源放在价格正上方：这两个信息是一起看的 ——
+            # 同一个价格在哪个平台，直接决定你怎么去买
+            ui.badge(source_name(r["source"])).classes(BADGE_LABEL + " mb-1")
+            ui.label(yen(r["price"])).classes("text-lg font-bold")
+            if r["deal_pct"]:
+                # 【颜色按百分比本身，不按 is_deal】跟着 is_deal 走的话，
+                # 手动捡漏价一开，「市价的 110%」会显示成绿色 —— 绿色读作
+                # 「便宜」，而 110% 是贵了一成，界面在自相矛盾。
+                # 是不是捡漏由上面那个绿徽标说，这里只说贵还是便宜。
+                ui.label(f"市价的 {r['deal_pct']}%").classes(
+                    "text-xs " + ("text-green-400" if r["deal_pct"] < 100
+                                  else "text-gray-400"))
+            # 追踪已经挪到图片角上的星了，这里只剩拉黑。
+            with ui.row().classes("items-center gap-1 mt-auto"):
+                # 【必须用默认参数绑死 rid/sid】它们是循环变量，直接引用的话
+                # 等你点下去时早就指向最后一件商品了 —— 每个按钮拉黑同一个人。
+                # 卖家ID为空时不给按钮：ヤフオク 有一部分商品不给卖家ID，
+                # 没有可拉黑的对象，画个点不动的按钮只会让人以为坏了。
+                if r["seller_id"]:
+                    ui.button(
+                        "拉黑卖家",
+                        on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
+                            blacklist_seller(rid, sid),
+                    ).props(BTN_DANGER).classes("btn-muted") \
+                     .tooltip(
+                        f"卖家 {r['seller_id']}\n"
+                        "拉黑后这条规则下他的全部商品立刻判为不合适。"
+                        "想反悔就去规则页把 ID 从 exclude_sellers 里删掉")
 
 
 def _can_blacklist(row: dict, rule: dict) -> bool:

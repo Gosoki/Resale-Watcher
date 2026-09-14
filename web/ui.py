@@ -303,6 +303,24 @@ def toggle_mark(row: dict, rule_name: str, on: bool) -> None:
     marks_view.refresh()
 
 
+def toggle_hide(row: dict, rule_name: str, on: bool) -> None:
+    """从命中页剔除 / 恢复这一件。
+
+    【只是不显示，不是删除也不是拉黑】三件事经常被混为一谈，代价差很远：
+      剔除    只有命中页不再显示它。照常抓取、照常对账、照常推送
+      拉黑卖家 整条规则下这个卖家的所有商品立刻判为不合适
+      删规则   连商品带成交样本一起删掉
+    所以提示里必须把"它还在"说清楚，否则你会以为自己刚刚扔掉了什么。
+    """
+    store.set_hidden(row, rule_name, on)
+    if on:
+        notify(f"已剔除「{row['name'][:20]}」—— 只是命中页不再显示它，"
+               "商品照常抓取，全部页照常看得到。要拿回来：命中页最下面「已剔除」")
+    else:
+        notify("已恢复，它会重新出现在命中页")
+    hits_view.refresh()
+
+
 def save_mark_note(source: str, item_id: str, value) -> None:
     store.set_mark_note(source, item_id, (value or "").strip())
     notify("备注已存")
@@ -385,6 +403,40 @@ def split_stale(rows: list[dict], hide_h: float) -> tuple[list[dict], list[dict]
     return keep, dark
 
 
+def price_history(r: dict, prev) -> None:
+    """价格列里「上次 / 首见」那两行小字。prev 是 store.prev_prices 里的那个二元组。
+
+    【命中页和追踪页共用一个函数】两边的价格列本来就是同一套版式，各写一遍的话
+    改了去重规则只改一处，而两处长得一样，看不出来对不上。
+
+    【首见和上次相同时只写一行】只变过一次价的商品这两个数是同一个，
+    重复写出来反而让人以为中间还漏了一档没显示。
+    【一次都没变过价的什么都不写】首见就是现价，再写一行「首见 ¥X」等于
+    把同一个数说两遍，还占掉一行高度 —— 库里 646 行里有 550 行是这种。
+    """
+    seen = {r["price"]}
+    lines = []
+    if prev and prev[0] not in seen:
+        seen.add(prev[0])
+        lines.append(("上次", prev[0], prev[1], "变成现在这个价"))
+    if r.get("first_price") and r["first_price"] not in seen:
+        lines.append(("首见", r["first_price"], r.get("first_seen_at"), "第一次看到它"))
+    for label, price, at, what in lines:
+        el = ui.label(f"{label} {yen(price)}").classes("text-xs text-gray-500")
+        if at:
+            el.tooltip(f"{at:%m-%d %H:%M} {what}")
+
+
+def drop_hidden(rows: list[dict], hidden: set) -> list[dict]:
+    """把手动剔除的从命中列表里去掉。
+
+    【必须排在 split_stale 前面】反过来的话，被剔除的商品会先被算进
+    「另有 N 件超过 24h 没见到，已撤下」那句里 —— 那句话就开始说谎，
+    而它恰恰是用来让人相信"没有东西被偷偷藏起来"的。
+    """
+    return [r for r in rows if (r["source"], r["item_id"]) not in hidden]
+
+
 def blacklist_seller(rule_id: int, seller_id: str) -> None:
     """把这个卖家加进该规则的黑名单，并【立刻】重判一次。
 
@@ -435,8 +487,8 @@ def toolbar(desc: str):
 
 # ------------------------------------------------------------------ 命中页
 
-def _deals_summary(rules: list[dict], cold: dict, marks: set,
-                   fresh_hours: int, warn_h: float, hide_h: float) -> None:
+def _deals_summary(rules: list[dict], cold: dict, marks: set, hidden: set,
+                   prevs: dict, fresh_hours: int, warn_h: float, hide_h: float) -> None:
     """跨规则的捡漏汇总 —— 命中页上唯一默认展开的块。
 
     【为什么要单开一块，而不是靠各规则组里的绿徽标】捡漏是「现在该动手」的那几件，
@@ -452,12 +504,19 @@ def _deals_summary(rules: list[dict], cold: dict, marks: set,
         "SELECT * FROM item WHERE matched = 1 AND status = 'on_sale' AND is_deal = 1 "
         "ORDER BY COALESCE(deal_pct, 999), price")
     rows = [r for r in rows if r["rule_id"] in by_id]
+    # 【剔除要排在撤下前面】理由见 drop_hidden
+    kept = drop_hidden(rows, hidden)
+    n_hidden, rows = len(rows) - len(kept), kept
     rows, dark = split_stale(rows, hide_h)
 
     head = f"🟢 捡漏　{len(rows)} 件" if rows else "🟢 捡漏　暂时没有"
     cap = ["低于各自规则捡漏线的在售商品，按「市价的百分之多少」从低到高排"]
     if dark:
         cap.append(f"另有 {len(dark)} 件超过 {hide_h}h 没见到，已撤下")
+    if n_hidden:
+        # 【剔掉的也要报数】这一块回答的是「现在有什么值得抢」，
+        # 少几件而不说，你会以为今天真的就这么点货
+        cap.append(f"另有 {n_hidden} 件被你剔除")
     with ui.expansion(head, caption=" · ".join(cap), value=True) \
             .classes(CARD).props("header-class=text-base"):
         if not rows:
@@ -475,7 +534,7 @@ def _deals_summary(rules: list[dict], cold: dict, marks: set,
         with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
             for r in rows:
                 rule = by_id[r["rule_id"]]
-                _hit_row(r, rule, marks, fresh_hours, cold[rule["id"]],
+                _hit_row(r, rule, marks, prevs, fresh_hours, cold[rule["id"]],
                          warn_h, hide_h, show_rule=True)
 
 
@@ -484,6 +543,11 @@ def _deals_summary(rules: list[dict], cold: dict, marks: set,
 def hits_view(host=None) -> None:
     # 【整份取出来，不要每行查一次】一屏几十行，每行一个 SELECT 翻页会肉眼卡顿
     marks = store.marked_ids()
+    hidden = store.hidden_ids()
+    # 【一次查完整页要用的「上次价格」】每行单独查的话，一屏几十行就是几十个
+    # SELECT，翻页会肉眼卡顿 —— 和 marked_ids 是同一条理由。
+    prevs = store.prev_prices(store.query(
+        "SELECT source, item_id, price FROM item WHERE matched = 1 AND status = 'on_sale'"))
     rules = store.get_rules()
     if not rules:
         ui.label("还没有规则，去「规则」页新建一条。").classes("text-gray-400 p-4")
@@ -500,7 +564,7 @@ def hits_view(host=None) -> None:
                              (rule["id"],))["m"]
         cold[rule["id"]] = bool(earliest) and (config.now() - earliest) < timedelta(hours=fresh_hours)
 
-    _deals_summary(rules, cold, marks, fresh_hours, warn_h, hide_h)
+    _deals_summary(rules, cold, marks, hidden, prevs, fresh_hours, warn_h, hide_h)
 
     for rule in rules:
         st = store.get_state(rule["id"])
@@ -515,6 +579,9 @@ def hits_view(host=None) -> None:
         # 它就会一直挂在这里冒充在售。宁可撤下让它哪天重新入库，
         # 也不要拿旧数据糊弄人。撤下不是删除：全部页照常看得到，
         # 只要它重新出现在搜索结果里，last_seen_at 一刷新就自动回来。
+        # 【剔除要排在撤下前面】理由见 drop_hidden
+        kept = drop_hidden(rows, hidden)
+        n_hidden, rows = len(rows) - len(kept), kept
         rows, gone_dark = split_stale(rows, hide_h)
 
         # 折叠摘要：折起来之后这一行就是你能看到的全部，所以预算/市价/捡漏线都要在里面
@@ -532,6 +599,9 @@ def hits_view(host=None) -> None:
         if gone_dark:
             # 【必须报数】偷偷少几件比显示旧数据更糟：你会以为这个价位真的没货了
             summary.append(f"另有 {len(gone_dark)} 件超过 {hide_h}h 没见到，已撤下")
+        if n_hidden:
+            # 同上：剔除是你自己按的，但过几天你不会记得按过几件
+            summary.append(f"另有 {n_hidden} 件被你剔除")
         deals = sum(1 for r in rows if r["is_deal"])
         head = f"{rule['name']}　{len(rows)} 件" + (f"　🟢 {deals} 件捡漏" if deals else "")
 
@@ -581,10 +651,41 @@ def hits_view(host=None) -> None:
             # 再加 gap-y 会让两列之间的分隔线对不齐。
             with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
                 for r in rows:
-                    _hit_row(r, rule, marks, fresh_hours, cold_start, warn_h, hide_h)
+                    _hit_row(r, rule, marks, prevs, fresh_hours, cold_start, warn_h, hide_h)
+
+    _hidden_block()
 
 
-def _hit_row(r: dict, rule: dict, marks: set, fresh_hours: int,
+def _hidden_block() -> None:
+    """页尾的「已剔除」——剔除唯一的退路。
+
+    【没有这一块就不该做剔除这个功能】按错一下就再也找不回来，
+    而且页面上少了一件你根本不会发现。放在命中页最下面而不是单开一个页签：
+    它只影响这一页，看的人也只在这一页上发现"怎么少了一件"。
+    """
+    rows = store.hidden_items()
+    if not rows:
+        return
+    with ui.expansion(f"已剔除　{len(rows)} 件",
+                      caption="这些只是不在命中页显示，商品照常抓取、照常推送；"
+                              "点「恢复」就回来",
+                      value=False).classes(CARD).props("header-class=text-base"):
+        for m in rows:
+            with ui.row().classes("items-center w-full gap-3 border-t py-2 sm:flex-nowrap"):
+                ui.badge(source_name(m["source"])).classes(BADGE_LABEL)
+                ui.link(m["name"], item_url(m["source"], m["item_id"]),
+                        new_tab=True).classes("flex-1 min-w-0 break-words")
+                if m["rule_name"]:
+                    ui.label(m["rule_name"]).classes("text-xs text-gray-400 shrink-0")
+                ui.label(f"{m['hidden_at']:%m-%d %H:%M} 剔除") \
+                    .classes("text-xs text-gray-500 shrink-0")
+                # 【绑死 row】m 是循环变量，理由同命中页那些按钮
+                ui.button("恢复", on_click=lambda _, row=dict(m):
+                          toggle_hide(row, "", False)) \
+                    .props(BTN_GHOST).classes("shrink-0")
+
+
+def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, fresh_hours: int,
              cold_start: bool, warn_h: float, hide_h: float,
              show_rule: bool = False) -> None:
     """命中页的一行商品。
@@ -594,6 +695,7 @@ def _hit_row(r: dict, rule: dict, marks: set, fresh_hours: int,
     而两处长得差不多，评审时很难发现。
     """
     fresh = freshness(r, fresh_hours, cold_start)
+    prev = prevs.get((r["source"], r["item_id"]))
     # 【正文列必须是 flex-1，不能是 grow】grow 只给 flex-grow:1，
     # flex-basis 还是 auto —— 而 flex 折行用的是「内容不折行时的完整
     # 宽度」(max-content)，min-w-0 只压下限、管不到折行这一步。
@@ -660,10 +762,15 @@ def _hit_row(r: dict, rule: dict, marks: set, fresh_hours: int,
                         # 信息：决定你要不要点进去。摆在最下面那行灰字里，
                         # 和品相、发货地混在一起，等于把它藏了。
                         # 首见价放进 tooltip —— 徽标要短，一眼能扫过去。
+                        # 【三个价都写进来】"已降 ¥18,765"只说了跌了多少，
+                        # 没说是一次跌下来的还是一路阴跌 —— 而那两种的
+                        # 后续走势完全不同。中间这一档就是用来区分的。
+                        tip = f"首次发现时 {yen(r['first_price'])}"
+                        if prev and prev[0] not in (r["price"], r["first_price"]):
+                            tip += f"　→　上次 {yen(prev[0])}"
+                        tip += f"　→　现在 {yen(r['price'])}"
                         ui.badge(f"已降 {yen(r['first_price'] - r['price'])}",
-                                 color="red").tooltip(
-                            f"我们首次发现它时是 {yen(r['first_price'])}，"
-                            f"现在 {yen(r['price'])}")
+                                 color="red").tooltip(tip)
                     if r["ship_from"] == TOKYO:
                         ui.badge(TOKYO, color="purple").tooltip(
                             "发货地在东京都内。【只有拉过详情的商品才知道发货地】"
@@ -735,8 +842,23 @@ def _hit_row(r: dict, rule: dict, marks: set, fresh_hours: int,
                 ui.label(f"市价的 {r['deal_pct']}%").classes(
                     "text-xs " + ("text-green-400" if r["deal_pct"] < 100
                                   else "text-gray-400"))
-            # 追踪已经挪到图片角上的星了，这里只剩拉黑。
+            price_history(r, prev)
+            # 追踪已经挪到图片角上的星了，这里剩「剔除这一件」和「拉黑这个人」。
+            # 【两个挨着放是有意的】它们长得像、作用范围差一个数量级：
+            # 剔除只管眼前这一条，拉黑是这条规则下这个卖家的【全部】商品。
+            # 并排摆着、一个灰一个红，按之前先看清自己在按哪个。
             with ui.row().classes("items-center gap-1 mt-auto"):
+                # 【必须用默认参数绑死 row/rn】r 和 rule 是循环变量，直接引用的话
+                # 等你点下去时早就指向最后一件商品了 —— 每个按钮剔除同一件。
+                ui.button(
+                    "剔除",
+                    on_click=lambda _, row=dict(r), rn=rule["name"]:
+                        toggle_hide(row, rn, True),
+                ).props(BTN_QUIET).classes("btn-muted") \
+                 .tooltip("只是让它不在命中页显示。商品照常抓取、照常对账、"
+                          "照常推送，全部页和追踪页都还看得到。"
+                          "剔除的是这个链接本身，它在别的规则下也不再显示。"
+                          "要拿回来：命中页最下面那块「已剔除」")
                 # 【必须用默认参数绑死 rid/sid】它们是循环变量，直接引用的话
                 # 等你点下去时早就指向最后一件商品了 —— 每个按钮拉黑同一个人。
                 # 卖家ID为空时不给按钮：ヤフオク 有一部分商品不给卖家ID，
@@ -800,6 +922,9 @@ def track_view() -> None:
     """追踪中的商品。这一页的数据比别处都新 —— 它们是被单独拉详情刷新的。"""
     rows = store.tracked_items()
     marks = store.marked_ids()
+    # 【这一页最需要「上次价格」】追踪的意义就是盯它动没动。只给一个当前价，
+    # 你得记住上次打开时是多少 —— 而这正是你把它加进追踪的原因。
+    prevs = store.prev_prices(rows)
     st = store.get_settings()
     if not rows:
         ui.label("还没有追踪任何商品。在「命中」页每件商品右下角点「追踪」加进来。"
@@ -821,10 +946,10 @@ def track_view() -> None:
 
     with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
         for r in rows:
-            _track_row(r, rules.get(r["rule_id"]) or {}, st, marks)
+            _track_row(r, rules.get(r["rule_id"]) or {}, st, marks, prevs)
 
 
-def _track_row(r: dict, rule: dict, st: dict, marks: set) -> None:
+def _track_row(r: dict, rule: dict, st: dict, marks: set, prevs: dict) -> None:
     """布局和命中页同一套，理由见那边的注释。"""
     with ui.row().classes("items-start w-full gap-3 border-t py-2 sm:flex-nowrap"):
         # 和命中页同一颗星：这里它一定是实心的，点一下就是取消追踪
@@ -873,6 +998,7 @@ def _track_row(r: dict, rule: dict, st: dict, marks: set) -> None:
             if r["deal_pct"]:
                 ui.label(f"市价的 {r['deal_pct']}%").classes(
                     "text-xs " + ("text-green-400" if r["deal_pct"] < 100 else "text-gray-400"))
+            price_history(r, prevs.get((r["source"], r["item_id"])))
             # 取消追踪已经在图片角的星上，这里不再重复一个按钮 ——
             # 同一个动作出现两次，人会以为它们不是一回事。
 

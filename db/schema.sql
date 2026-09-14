@@ -198,6 +198,20 @@ CREATE TABLE IF NOT EXISTS marked_item (
 
 
 -- ============================================================
+-- 从命中页剔除的商品
+-- ============================================================
+CREATE TABLE IF NOT EXISTS hidden_item (
+  source     VARCHAR(16)  NOT NULL             COMMENT '哪个源',
+  item_id    VARCHAR(32)  NOT NULL             COMMENT '商品在源站的 ID，拼出链接用',
+  name       VARCHAR(255) NOT NULL             COMMENT '剔除那一刻的标题（快照）。恢复列表要告诉你剔掉的是什么，而那条 item 可能已经被删规则带走了，只存 ID 的话这一页就剩一排认不出的编号',
+  rule_name  VARCHAR(64)  NOT NULL DEFAULT ''  COMMENT '剔除时它归在哪条规则下。【存名字不存 rule_id】规则删了这行还得看得懂，存 id 就只剩一个查不到的数字',
+  hidden_at  DATETIME     NOT NULL             COMMENT '按下剔除的时间。恢复列表按它倒序',
+  PRIMARY KEY (source, item_id),
+  KEY idx_hidden (hidden_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='手动从命中页剔除的商品。【只影响命中页的显示】商品照常抓取、照常对账、照常推送，全部页/追踪页/成交页都还看得到';
+
+
+-- ============================================================
 -- 6. 每日请求量（风控保险丝）
 -- ============================================================
 CREATE TABLE IF NOT EXISTS daily_stat (

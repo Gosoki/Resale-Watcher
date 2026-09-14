@@ -356,6 +356,43 @@ def set_mark_note(source: str, item_id: str, note: str) -> None:
             (note[:255], source, item_id))
 
 
+# ---------------------------------------------------------------- 剔除（只影响命中页）
+
+def set_hidden(row: dict, rule_name: str, on: bool) -> None:
+    """从命中页剔除 / 恢复。
+
+    【只按 (source, item_id) 记，不带 rule_id】和标记同一个口径：同一个链接被
+    两条规则抓到就是两行 item，但它是同一件东西 —— 你说「不想再看到它」，
+    指的是这件东西，不是「它在某条规则下的那一行」。
+
+    【存一份标题快照】恢复列表要告诉你剔掉的是什么。只存 ID 的话，哪天那条规则
+    被删了（item 跟着一起删），这一页就只剩一排认不出的编号，而你已经不记得
+    当初为什么剔掉它了。
+
+    【重复剔除不覆盖时间】ON DUPLICATE 里什么都不改，理由同 set_marked。
+    """
+    if not on:
+        execute("DELETE FROM hidden_item WHERE source = %s AND item_id = %s",
+                (row["source"], row["item_id"]))
+        return
+    execute("INSERT INTO hidden_item (source, item_id, name, rule_name, hidden_at) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE item_id = item_id",
+            (row["source"], row["item_id"], row["name"][:255],
+             (rule_name or "")[:64], config.now()))
+
+
+def hidden_ids() -> set[tuple[str, str]]:
+    """已剔除的 (source, item_id) 集合。整份取出来，理由同 marked_ids。"""
+    return {(r["source"], r["item_id"])
+            for r in query("SELECT source, item_id FROM hidden_item")}
+
+
+def hidden_items() -> list[dict]:
+    """剔除列表，最近剔的在前。"""
+    return query("SELECT * FROM hidden_item ORDER BY hidden_at DESC")
+
+
 def marked_ids() -> set[tuple[str, str]]:
     """已标记的 (source, item_id) 集合。
 
@@ -722,6 +759,52 @@ def add_price_log(source: str, item_id: str, price: int, at) -> None:
         return
     execute("INSERT INTO price_log (source, item_id, price, noted_at) VALUES (%s, %s, %s, %s)",
             (source, item_id, price, at))
+
+
+def last_change(log: list[dict], current: int) -> tuple[int, object] | None:
+    """从一件商品的价格历史里取出「上一次的价格」和「什么时候变成现价的」。
+
+    log 是这件商品的全部 price_log，按时间升序；current 是它此刻的价格。
+    从没变过价就返回 None。时间取不到时返回 (上次价格, None)。
+
+    【必须跳过末尾连着的同价记录，不能直接拿倒数第二条】库里有 27 条同价记录
+    是 add_price_log 加上去重【之前】留下的（全在 2026-09-12 17:36〜18:53 那一段）：
+    price_log 不带 rule_id，那阵子同一个链接被两条规则命中就各记一条。
+    直接取倒数第二条的话，这 26 件商品的「上次价格」会和现价一模一样，
+    页面上就是「上次 ¥2,650 · 现在 ¥2,650」，看着像程序坏了。
+    拿 current 往回找第一个不同的价，这种历史脏数据和以后可能出现的
+    别的重复写入就都绕开了。
+    """
+    i = len(log)
+    while i > 0 and log[i - 1]["price"] == current:
+        i -= 1
+    if i == 0:                      # 历史里从头到尾只有现在这一个价
+        return None
+    # log[i] 是第一次记到现价的那条；i == len(log) 说明历史里根本没记过现价
+    return log[i - 1]["price"], (log[i]["noted_at"] if i < len(log) else None)
+
+
+def prev_prices(rows: list[dict]) -> dict[tuple[str, str], tuple]:
+    """一批商品各自的「上一次的价格」。键是 (source, item_id)，没变过价的不进字典。
+
+    【一次查完，不要每行查一次】命中页一屏几十行，理由同 marked_ids。
+    """
+    cur = {(r["source"], r["item_id"]): r["price"] for r in rows}
+    if not cur:
+        return {}
+    keys = sorted(cur)
+    holes = ",".join(["(%s,%s)"] * len(keys))
+    log: dict[tuple[str, str], list] = {}
+    for r in query(f"SELECT source, item_id, price, noted_at FROM price_log "
+                   f"WHERE (source, item_id) IN ({holes}) ORDER BY noted_at, id",
+                   tuple(v for k in keys for v in k)):
+        log.setdefault((r["source"], r["item_id"]), []).append(r)
+    out = {}
+    for k, v in log.items():
+        ch = last_change(v, cur[k])
+        if ch:
+            out[k] = ch
+    return out
 
 
 # ---------------------------------------------------------------- 成交样本 / 市价

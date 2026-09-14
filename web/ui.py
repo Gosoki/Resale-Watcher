@@ -15,6 +15,7 @@ from nicegui import run, ui
 
 import config
 import sources
+from core import notify as push          # 【必须改名】本文件里的 notify() 是弹提示的
 from core import poller
 from core.matcher import explain
 from core.normalize import ids
@@ -1359,6 +1360,34 @@ async def fetch_all() -> None:
     all_view.refresh()
 
 
+async def test_notify() -> None:
+    """照着现在存着的推送设置，真发一条出去。
+
+    【为什么非有这个按钮不可】推送失败是【静默】的：core.notify.post 出错只写一行
+    日志，面板上什么都不显示（这是有意的 —— 推送坏了不该拖垮抓取）。代价是地址
+    填错、模板写错、Slack webhook 被撤销，这些你全都看不出来，只会觉得"最近没捡漏"。
+    而真捡漏一天就 0〜4 件，等它来验证等于没验证。
+    这里把那个异常抓出来当场显示，是这条链路上唯一能立刻证伪的地方。
+    """
+    s = store.get_settings(force=True)          # 绕开 10 秒缓存，刚保存就能测
+    url = (s.get("notify_url") or "").strip()
+    if not url:
+        notify("推送地址是空的 —— 填上「推送地址」再点（留空＝整个推送关闭，一个请求都不发）",
+               type="warning")
+        return
+    # 用一件真商品的形状，这样你能看出到手的排版对不对，而不是只看到"test"
+    text = ("🟢 捡漏 | 这是一条测试推送\n"
+            "ASUS ROG ASTRAL GeForce RTX 5090 BTF\n"
+            "¥850,000（市价的 106%，中位 ¥798,000）\n"
+            "https://jp.mercari.com/item/m54103659696")
+    try:
+        await run.io_bound(push.post, url, s.get("notify_body") or "", text)
+    except Exception as e:      # noqa: BLE001 - 这里就是要把失败摆到脸上
+        notify(f"发送失败：{e}", type="negative")
+        return
+    notify("已发出。去 Slack/手机看一眼 —— 没收到就是地址或请求体模板不对", type="positive")
+
+
 async def pull_tracked() -> None:
     """追踪页的一键拉取：追踪中的每件立刻单独拉一次详情，不等 track_min 到点。
 
@@ -1515,6 +1544,9 @@ def settings_view() -> None:
     with ui.row().classes("sticky top-[45px] z-20 w-full items-center gap-3 py-2 mb-2 "
                           "backdrop-blur bg-black/80 rounded"):
         ui.button("保存全部", on_click=save).props(BTN_PRIMARY)
+        ui.button("测试推送", on_click=test_notify).props(BTN_GHOST) \
+            .tooltip("照现在【已保存】的推送设置真发一条出去。改完地址要先保存再测。"
+                     "推送失败平时是静默的（只写日志），这是唯一能当场看出通没通的地方")
         ui.label("对所有规则生效。改完保存，10 秒内自动生效，不用重启"
                  ).classes("text-xs text-gray-400")
 

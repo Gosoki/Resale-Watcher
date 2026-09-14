@@ -20,6 +20,7 @@
 """
 import json
 import logging
+import time
 
 import httpx
 
@@ -30,6 +31,13 @@ log = logging.getLogger(__name__)
 
 TIMEOUT = 5.0                 # 秒。推送卡住不能拖慢抓取，这是主功能
 UA = "Resale-Watcher"
+# 【两条推送之间必须隔一下】Slack 对每个 incoming webhook 限【1 条/秒】，
+# 超了回 429。而本函数【失败不重试】—— 两条规矩撞在一起就是：一轮推 5 条，
+# 后面几条直接 429，那几件捡漏你永远不会知道，日志里只有一行 warning。
+# 1.2 秒是给 1 条/秒 留的余量。代价是一轮最多多花 5 秒，
+# 而一轮扫描本来就要几分钟，这点时间看不出来。
+# 其它家（ntfy/Bark/Discord/Telegram）的限额都比这宽松，按最严的来就都安全。
+GAP = 1.2                     # 秒
 
 
 def compose(rule: dict, row: dict, median: int | None) -> str:
@@ -104,7 +112,9 @@ def push_new(rule: dict) -> int:
     median = store.get_state(rule["id"])["median_price"]
     template = s.get("notify_body") or ""
     sent = 0
-    for row in rows:
+    for i, row in enumerate(rows):
+        if i:                               # 第一条不用等
+            time.sleep(GAP)
         try:
             post(url, template, compose(rule, row, median))
             sent += 1

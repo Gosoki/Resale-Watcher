@@ -43,17 +43,33 @@ class FakeStore:
         return {"median_price": 820000}
 
 
+# 【每次 run() 都把真 sleep 换掉】push_new 两条之间要等 1.2 秒（Slack 限 1 条/秒）。
+# 不换的话光"推 5 条"那个用例就要跑 5 秒 —— 实测整套测试从 0.56s 涨到 9.02s，
+# 而慢测试的下场是被人加 skip。换成记录器，顺便拿它断言间隔够不够。
+SLEPT: list[float] = []
+
+
+class _NoSleep:
+    @staticmethod
+    def sleep(seconds):
+        SLEPT.append(seconds)
+
+
 def run(monkeypatch_target, settings, rows, sender=None):
     """装好假的 store 和假的 post，跑一次 push_new，返回 (发出去的内容, FakeStore)。"""
     sent = []
     fake = FakeStore(settings, rows)
+    SLEPT.clear()
     monkeypatch_target["store"], monkeypatch_target["post"] = notify.store, notify.post
+    saved_time = notify.time
     notify.store = fake
     notify.post = sender or (lambda url, tpl, text: sent.append((url, tpl, text)))
+    notify.time = _NoSleep
     try:
         n = notify.push_new(RULE)
     finally:
         notify.store, notify.post = monkeypatch_target["store"], monkeypatch_target["post"]
+        notify.time = saved_time
     return sent, fake, n
 
 
@@ -173,3 +189,56 @@ def test_推送必须接在常驻轮询的路径上():
     for fn, name in [(poller.run_once, "run_once"), (poller._run_round, "_run_round")]:
         assert "finalize(" in inspect.getsource(fn), \
             f"{name} 没有调 finalize —— 这条路径上的重判/捡漏/推送全都不会发生"
+
+
+# ---------------------------------------------------------------- Slack
+
+SLACK_TPL = '{"text": "{text}"}'
+
+
+def test_slack模板产出合法JSON():
+    """Slack 的 incoming webhook 只认 {"text": "..."}。
+    正文里有换行（我们的提醒本来就是 4 行）和日文引号，转义错一个 Slack 就回 400，
+    而 post() 的失败是静默的 —— 你只会觉得"最近没捡漏"。"""
+    import json
+
+    text = ('🟢 捡漏 | RTX 5090 单卡\n新品"未開封" \\ 特価\n'
+            '¥850,000（市价的 106%）\nhttps://jp.mercari.com/item/m1')
+    body = notify.render(SLACK_TPL, text)
+    assert json.loads(body)["text"] == text, "转义之后必须还原成一模一样的正文"
+
+
+def test_slack模板不会被标题里的引号撑破():
+    """这是 render() 存在的全部理由：日文商品名里「"未開封"」很常见。"""
+    import json
+
+    body = notify.render(SLACK_TPL, '【新品】"未開封" RTX5090')
+    json.loads(body)          # 解析不了就会抛，测试直接红
+
+
+def test_商品链接留在正文最后一行():
+    """Slack 靠它自动展开带图的预览卡片。挪到中间就不展开了。"""
+    row = item(name="RTX 5090")
+    text = notify.compose(RULE, row, 820000)
+    assert text.rstrip().splitlines()[-1].startswith("http"), \
+        "链接必须是最后一行，否则 Slack 不展开预览"
+
+
+def test_多条推送之间要留够间隔():
+    """【Slack 对每个 webhook 限 1 条/秒】超了回 429，而本模块【失败不重试】——
+    一轮推 5 条、不停顿连发的话，后面几条直接丢，日志里只有一行 warning，
+    而你丢掉的正是"该立刻去看"的那几件。这两条规矩撞在一起才是真问题，
+    单看任何一条都不像 bug。"""
+    rows = [item(item_id=f"m{i}") for i in range(4)]
+    sent, _, n = run({}, {"notify_url": "u", "notify_on": "deal",
+                          "notify_max_per_round": 5}, rows)
+    assert n == 4
+    assert len(SLEPT) == 3, f"4 条之间该等 3 次（第一条不用等），实际等了 {len(SLEPT)} 次"
+    assert all(x >= 1.0 for x in SLEPT), f"间隔不能低于 1 秒，实际 {SLEPT}"
+
+
+def test_只推一条时不白等():
+    """只有一条时多睡 1.2 秒纯属浪费 —— 稳态下一轮多半就 0〜1 条。"""
+    sent, _, n = run({}, {"notify_url": "u", "notify_on": "deal",
+                          "notify_max_per_round": 5}, [item()])
+    assert n == 1 and SLEPT == []

@@ -219,6 +219,6 @@ CREATE TABLE IF NOT EXISTS daily_stat (
 CREATE TABLE IF NOT EXISTS app_setting (
   k          VARCHAR(48)  NOT NULL PRIMARY KEY COMMENT '设置项名',
   v          TEXT         NOT NULL             COMMENT '值。统一按字符串存，读的时候按 config.SETTINGS_SPEC 声明的类型转',
-  note       VARCHAR(500) NOT NULL DEFAULT ''  COMMENT '这项是干什么的（建库时从 config.SETTINGS_SPEC 写入）',
+  note       TEXT         NOT NULL             COMMENT '这项是干什么的（建库时从 config.SETTINGS_SPEC 写入）。【必须是 TEXT 不能是 VARCHAR(500)】seed_settings 在启动路径上（main.py → init_schema → seed_settings），说明文字一超长就是 Data too long、整个服务起不来 —— 也就是"给某个设置项多写两行注释"能把进程搞崩。实际撞过一次：给 notify_url 补 Slack 的申请步骤时写到 693 字。',
   updated_at DATETIME     NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='全局设置（人工维护，改了即时生效）';

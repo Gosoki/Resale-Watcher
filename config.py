@@ -142,20 +142,31 @@ SETTINGS_SPEC: dict[str, tuple[type, object, str]] = {
         str, "",
         "推送地址。【留空＝不推送，一个请求都不发】。\n"
         "填什么都行，常见的几家（都是实际接口形状）：\n"
+        "  Slack     https://hooks.slack.com/services/T…/B…/…（模板见 notify_body）\n"
         "  ntfy      https://ntfy.sh/你的主题          （请求体模板留空）\n"
-        "  Bark      https://api.day.app/你的KEY       （请求体模板留空）\n"
+        "  Bark      https://api.day.app/你的KEY       （模板见 notify_body）\n"
         "  Discord   webhook 地址                      （模板见 notify_body）\n"
         "  企业微信  群机器人 webhook 地址             （模板见 notify_body）\n"
         "  Telegram  https://api.telegram.org/bot<TOKEN>/sendMessage\n"
+        "【Slack 怎么拿这个地址】api.slack.com/apps → Create New App → From scratch →\n"
+        "  选一个 workspace → 左侧 Incoming Webhooks → 打开开关 →\n"
+        "  Add New Webhook to Workspace → 选要推到哪个频道 → 复制那串 https://hooks.slack.com/…\n"
+        "【填完点设置页的「测试推送」】地址写错是【静默失败】的：发送出错只写日志，\n"
+        "  面板上什么都不显示，你会一直以为推送开着。\n"
         "【这个地址等于一把钥匙】谁拿到都能往你手机推东西，别写进截图或仓库。",
     ),
     "notify_body": (
         str, "",
         "请求体模板（JSON）。留空＝把提醒正文当纯文本直接发（ntfy / Bark 这么用）。\n"
         "要发 JSON 就在这里写，用 {text} 占位提醒正文，会自动转义：\n"
+        '  Slack     {"text": "{text}"}\n'
         '  Discord   {"content": "{text}"}\n'
         '  企业微信  {"msgtype":"text","text":{"content":"{text}"}}\n'
-        '  Telegram  {"chat_id":"你的chat_id","text":"{text}"}',
+        '  Telegram  {"chat_id":"你的chat_id","text":"{text}"}\n'
+        "【Slack 就是上面那一行，照抄即可】商品链接放在正文最后一行，"
+        "Slack 会自动展开成带图的预览卡片，不用额外配。\n"
+        "标题里的引号和换行会自动转义，实测库里 637 条商品标题没有一条含 < 或 >"
+        "（日文商品名用的是【】《》这类全角括号），所以不需要为 Slack 的 mrkdwn 另做转义。",
     ),
     "notify_on": (
         str, "deal",

@@ -276,8 +276,26 @@ def auction_note(r: dict) -> tuple[str, str]:
            ("text-red-400" if urgent else "text-gray-400")
 
 
+# 【哪几页的数据已经过时，切过去时再重建】不是当场全刷。
+# 原先每个动作都把相关的几页当场重建一遍，实测点一次「标记」要跑 1.24 秒的 SQL
+# （命中 697ms + 成交 344ms + 追踪 137ms + 标记 64ms），而你看得见的变化只是
+# 一面旗换了颜色 —— 那面旗现在由 corner_toggle 就地翻。
+# 别的页反正你没在看：等你真切过去，那一下的重建藏在切页动作里，看不出来。
+_DIRTY: set[str] = set()
+
+
+def stale_tabs(*names: str) -> None:
+    """把这几页标成"数据过时了"，切过去的时候再重建。"""
+    _DIRTY.update(names)
+
+
 def toggle_track(source: str, item_id: str, rule_id: int, on: bool) -> None:
-    """加入/取消追踪。追踪中的商品会被单独拉详情刷新，比整轮扫描快得多。"""
+    """加入/取消追踪。追踪中的商品会被单独拉详情刷新，比整轮扫描快得多。
+
+    【追踪页必须当场刷，别的页不用】在追踪页点掉一颗星，那一行就得当场消失 ——
+    不消失的话你会以为没点上。命中页那颗星已经就地翻过去了，
+    这一页别的东西和这次点击没有任何关系。
+    """
     store.set_tracked(source, item_id, rule_id, on)
     n = len(store.tracked_items())
     if on:
@@ -288,19 +306,21 @@ def toggle_track(source: str, item_id: str, rule_id: int, on: bool) -> None:
                f"每轮最多 {st['track_budget']} 件 —— 追得越多，每件实际间隔越长")
     else:
         notify(f"已取消追踪（还剩 {n} 件）")
-    hits_view.refresh()
     track_view.refresh()
 
 
 def toggle_mark(row: dict, rule_name: str, on: bool) -> None:
-    """标记/取消标记。和追踪的区别：这个【一个请求都不发】，随便标。"""
+    """标记/取消标记。和追踪的区别：这个【一个请求都不发】，随便标。
+
+    【只有标记页当场刷】在标记页点掉一面旗，那一行得当场消失。
+    追踪页和成交页上这件商品也画着旗，但你此刻没在看它们 —— 标成过时，
+    切过去时再重建。命中页那面旗已经就地翻过去了，不用重建。
+    """
     store.set_marked(row, rule_name, on)
     n = len(store.marked_ids())
     notify(f"已标记（共 {n} 件），在「标记」页看" if on else f"已取消标记（还剩 {n} 件）")
-    hits_view.refresh()
-    track_view.refresh()
-    sold_view.refresh()
     marks_view.refresh()
+    stale_tabs("追踪", "成交")
 
 
 def toggle_hide(row: dict, rule_name: str, on: bool) -> None:
@@ -327,9 +347,55 @@ def save_mark_note(source: str, item_id: str, value) -> None:
     marks_view.refresh()
 
 
+def corner_toggle(on: bool, icons: tuple[str, str], tips: tuple[str, str],
+                  base: str, on_cls: str, act, twins: dict | None, key) -> None:
+    """图片角上的一个开关（追踪星 / 标记旗）。点一下【就地】翻面，不重建整页。
+
+    【为什么非就地不可】原先每次点击都把相关的几页从头重建。实测点一次「标记」
+    要跑 1.24 秒的 SQL —— 命中页 697ms（19 条查询）+ 成交页 344ms + 追踪页 137ms
+    + 标记页 64ms，外加上千个页面元素重新下发。而你看得见的变化只是一面旗
+    换了个颜色。一屏几十行，等这一下的工夫你会以为没点上、再点一次，
+    第二次点的是已经翻过去的状态 —— 等于又翻回来，而且你不知道。
+
+    【先画后写】画在落库之前。这一步就是为了"马上生效"，而落库要走一个
+    数据库往返。真写失败的话图标会停在错的那一面，但下一次任何刷新都会纠正 ——
+    比让你对着一个没反应的按钮猜要好。
+
+    【twins：同一件商品在一页上会出现两次】捡漏汇总里一次、它所在的规则组里
+    再一次。点了其中一个，另一个必须跟着翻，否则同一屏上同一件东西一颗星
+    实心一颗空心，你会以为自己点漏了。同一个 key 共用一份状态和一组重画函数。
+    """
+    box = twins.setdefault(key, {"on": on}) if twins is not None else {"on": on}
+    box.setdefault("draw", [])
+
+    def flip() -> None:
+        box["on"] = not box["on"]
+        for d in box["draw"]:
+            d()
+        act(box["on"])
+
+    btn = ui.button(icons[box["on"]], on_click=lambda _: flip()).props(BTN_CORNER)
+    with btn:
+        tip = ui.tooltip(tips[box["on"]])
+
+    def draw() -> None:
+        btn.text = icons[box["on"]]
+        btn.classes(replace=base + (" " + on_cls if box["on"] else ""))
+        tip.text = tips[box["on"]]
+
+    box["draw"].append(draw)
+    draw()
+
+
 def thumb_corners(r: dict, rule_id: int, marks: set, rule_name: str,
-                  star: bool = True) -> None:
-    """缩略图 + 两个角标：右上角的追踪星，右下角的标记旗。
+                  star: bool = True, twins: dict | None = None) -> None:
+    """来源标签 + 缩略图 + 两个角标：右上角的追踪星，右下角的标记旗。
+
+    【来源标签压在图上方】它原先在右边价格列的顶上。价格列后来多了「上次 / 首见」
+    两行，左右两列高度对不上了 —— 图那一列矮一截，整行看着往上飘。
+    把标签挪到图上方正好补回那一行，不用把缩略图整个放大（放大会让一屏
+    装不下几件，而这一页的价值就是一眼扫完）。
+    标签本来就描述"这件东西在哪买"，和图、和标题是一组，本来就不该在价格那边。
 
     【两个角标是两回事，别合并】
       ★ 追踪：会真的花请求去单独刷新它，所以有件数上限、要克制。
@@ -337,46 +403,46 @@ def thumb_corners(r: dict, rule_id: int, marks: set, rule_name: str,
     放在同一张图的不同角上，是因为它们针对的是同一件商品、又都属于"我对它的态度"；
     但颜色和图形必须分开（琥珀星 / 青旗），否则点错了代价完全不同。
 
-    star=False 给成交页用：那里的商品已经卖掉了，追踪它没有意义（不会再刷新），
-    但把成交价记下来很有意义。
+    star=False 给成交页和标记页用：那里的商品已经卖掉了，追踪它没有意义
+    （不会再刷新），但把成交价记下来很有意义。
 
     【占位框不能省】某个源哪天返回空缩略图，没有占位的话这一行的正文会直接顶到
     最左边，和上下几行错开 —— 而且角标也没地方挂。
     """
     tracked = r.get("tracked_at") is not None
     marked = (r["source"], r["item_id"]) in marks
-    with ui.element("div").classes("relative shrink-0 w-24 h-24"):
-        if r["thumb_url"]:
-            # 【ratio=1 不能省】q-img 的高度是按图片真实宽高比撑出来的，
-            # Tailwind 的 h-24 管不住它（object-cover 是给原生 <img> 的，
-            # 这里外层是 Quasar 组件）。不写 ratio 的话一列里 96px 高和
-            # 44px 高的缩略图混着排，每行正文的起点都不在一条线上。
-            ui.image(r["thumb_url"]).props("fit=cover ratio=1") \
-                .classes("w-24 h-24 rounded")
-        else:
-            ui.element("div").classes("w-24 h-24 rounded bg-white/5")
-        # 【必须用默认参数绑死】它们是循环变量，直接引用的话等你点下去时
-        # 早就指向最后一件商品了 —— 每颗星都会追踪同一件。
-        if star:
-            ui.button("★" if tracked else "☆",
-                      on_click=lambda _, so=r["source"], ii=r["item_id"], ri=rule_id,
-                      t=tracked: toggle_track(so, ii, ri, not t)) \
-                .props(BTN_CORNER) \
-                .classes("absolute top-0 right-0 star-btn"
-                         + (" star-on" if tracked else "")) \
-                .tooltip("取消追踪" if tracked else
-                         "加入追踪：这件会被单独拉详情刷新，价格、出价数、是否卖掉都比"
-                         "整轮扫描快得多。代价是每次刷新一个请求")
-        # 【同样要用默认参数绑死】理由和上面那颗星一模一样：row 是循环变量
-        ui.button("⚑" if marked else "⚐",
-                  on_click=lambda _, row=dict(r), rn=rule_name, m=marked:
-                  toggle_mark(row, rn, not m)) \
-            .props(BTN_CORNER) \
-            .classes("absolute bottom-0 right-0 star-btn mark-btn"
-                     + (" mark-on" if marked else "")) \
-            .tooltip("取消标记" if marked else
-                     "标记：只是记一笔，不发任何请求。标的是【此刻的快照】——"
-                     "标题、价格、图都存下来，以后商品下架了这一页照样看得到")
+    key = (r["source"], r["item_id"])
+    # 【来源标签左对齐，和图的左边缘齐】居中的话它会在 96px 里浮着，
+    # 而这一行里别的东西（标题、徽标、小字）全是左对齐的 —— 就它一个居中，
+    # 一列扫下来左边缘是锯齿状的。
+    with ui.column().classes("gap-1 shrink-0 w-24 items-start"):
+        ui.badge(source_name(r["source"])).classes(BADGE_LABEL)
+        with ui.element("div").classes("relative w-24 h-24"):
+            if r["thumb_url"]:
+                # 【ratio=1 不能省】q-img 的高度是按图片真实宽高比撑出来的，
+                # Tailwind 的 h-24 管不住它（object-cover 是给原生 <img> 的，
+                # 这里外层是 Quasar 组件）。不写 ratio 的话一列里 96px 高和
+                # 44px 高的缩略图混着排，每行正文的起点都不在一条线上。
+                ui.image(r["thumb_url"]).props("fit=cover ratio=1") \
+                    .classes("w-24 h-24 rounded")
+            else:
+                ui.element("div").classes("w-24 h-24 rounded bg-white/5")
+            if star:
+                corner_toggle(
+                    tracked, ("☆", "★"),
+                    ("加入追踪：这件会被单独拉详情刷新，价格、出价数、是否卖掉都比"
+                     "整轮扫描快得多。代价是每次刷新一个请求", "取消追踪"),
+                    "absolute top-0 right-0 star-btn", "star-on",
+                    lambda on, so=r["source"], ii=r["item_id"], ri=rule_id:
+                        toggle_track(so, ii, ri, on),
+                    twins, ("star",) + key)
+            corner_toggle(
+                marked, ("⚐", "⚑"),
+                ("标记：只是记一笔，不发任何请求。标的是【此刻的快照】——"
+                 "标题、价格、图都存下来，以后商品下架了这一页照样看得到", "取消标记"),
+                "absolute bottom-0 right-0 star-btn mark-btn", "mark-on",
+                lambda on, row=dict(r), rn=rule_name: toggle_mark(row, rn, on),
+                twins, ("mark",) + key)
 
 
 def stale_hours(r: dict) -> float:
@@ -488,7 +554,8 @@ def toolbar(desc: str):
 # ------------------------------------------------------------------ 命中页
 
 def _deals_summary(rules: list[dict], cold: dict, marks: set, hidden: set,
-                   prevs: dict, fresh_hours: int, warn_h: float, hide_h: float) -> None:
+                   prevs: dict, twins: dict,
+                   fresh_hours: int, warn_h: float, hide_h: float) -> None:
     """跨规则的捡漏汇总 —— 命中页上唯一默认展开的块。
 
     【为什么要单开一块，而不是靠各规则组里的绿徽标】捡漏是「现在该动手」的那几件，
@@ -534,7 +601,7 @@ def _deals_summary(rules: list[dict], cold: dict, marks: set, hidden: set,
         with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
             for r in rows:
                 rule = by_id[r["rule_id"]]
-                _hit_row(r, rule, marks, prevs, fresh_hours, cold[rule["id"]],
+                _hit_row(r, rule, marks, prevs, twins, fresh_hours, cold[rule["id"]],
                          warn_h, hide_h, show_rule=True)
 
 
@@ -544,6 +611,10 @@ def hits_view(host=None) -> None:
     # 【整份取出来，不要每行查一次】一屏几十行，每行一个 SELECT 翻页会肉眼卡顿
     marks = store.marked_ids()
     hidden = store.hidden_ids()
+    # 同一件捡漏商品在这一页上会出现两次（汇总里一次、规则组里一次），
+    # 角标要一起翻。这份表跟着本次重建走，重建一次就是新的一份，不会留下
+    # 指向已删元素的重画函数。
+    twins: dict = {}
     # 【一次查完整页要用的「上次价格」】每行单独查的话，一屏几十行就是几十个
     # SELECT，翻页会肉眼卡顿 —— 和 marked_ids 是同一条理由。
     prevs = store.prev_prices(store.query(
@@ -564,7 +635,7 @@ def hits_view(host=None) -> None:
                              (rule["id"],))["m"]
         cold[rule["id"]] = bool(earliest) and (config.now() - earliest) < timedelta(hours=fresh_hours)
 
-    _deals_summary(rules, cold, marks, hidden, prevs, fresh_hours, warn_h, hide_h)
+    _deals_summary(rules, cold, marks, hidden, prevs, twins, fresh_hours, warn_h, hide_h)
 
     for rule in rules:
         st = store.get_state(rule["id"])
@@ -651,7 +722,8 @@ def hits_view(host=None) -> None:
             # 再加 gap-y 会让两列之间的分隔线对不齐。
             with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
                 for r in rows:
-                    _hit_row(r, rule, marks, prevs, fresh_hours, cold_start, warn_h, hide_h)
+                    _hit_row(r, rule, marks, prevs, twins, fresh_hours,
+                             cold_start, warn_h, hide_h)
 
     _hidden_block()
 
@@ -685,8 +757,8 @@ def _hidden_block() -> None:
                     .props(BTN_GHOST).classes("shrink-0")
 
 
-def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, fresh_hours: int,
-             cold_start: bool, warn_h: float, hide_h: float,
+def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, twins: dict,
+             fresh_hours: int, cold_start: bool, warn_h: float, hide_h: float,
              show_rule: bool = False) -> None:
     """命中页的一行商品。
 
@@ -719,7 +791,7 @@ def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, fresh_hours: int,
         # 96px：正文列在「徽标+标题两行+拍卖提示+品相行」时约 90px 高，
         # 图跟着长到差不多，两边才齐。64px 时右边明显空一块，
         # 看起来就像行距被撑开了。
-        thumb_corners(r, rule["id"], marks, rule["name"])
+        thumb_corners(r, rule["id"], marks, rule["name"], twins=twins)
         # leading-snug：正文是 3~4 行小字堆起来的，默认行高留白偏多，
         # 累积下来整张卡片会显得松垮
         # self-stretch：撑满卡片高度，下面那行小字的 mt-auto 才顶得到底
@@ -832,7 +904,6 @@ def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, fresh_hours: int,
                 "gap-0 items-end shrink-0 whitespace-nowrap self-stretch"):
             # 来源放在价格正上方：这两个信息是一起看的 ——
             # 同一个价格在哪个平台，直接决定你怎么去买
-            ui.badge(source_name(r["source"])).classes(BADGE_LABEL + " mb-1")
             ui.label(yen(r["price"])).classes("text-lg font-bold")
             if r["deal_pct"]:
                 # 【颜色按百分比本身，不按 is_deal】跟着 is_deal 走的话，
@@ -922,6 +993,7 @@ def track_view() -> None:
     """追踪中的商品。这一页的数据比别处都新 —— 它们是被单独拉详情刷新的。"""
     rows = store.tracked_items()
     marks = store.marked_ids()
+    twins: dict = {}
     # 【这一页最需要「上次价格」】追踪的意义就是盯它动没动。只给一个当前价，
     # 你得记住上次打开时是多少 —— 而这正是你把它加进追踪的原因。
     prevs = store.prev_prices(rows)
@@ -946,14 +1018,15 @@ def track_view() -> None:
 
     with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
         for r in rows:
-            _track_row(r, rules.get(r["rule_id"]) or {}, st, marks, prevs)
+            _track_row(r, rules.get(r["rule_id"]) or {}, st, marks, prevs, twins)
 
 
-def _track_row(r: dict, rule: dict, st: dict, marks: set, prevs: dict) -> None:
+def _track_row(r: dict, rule: dict, st: dict, marks: set, prevs: dict,
+               twins: dict) -> None:
     """布局和命中页同一套，理由见那边的注释。"""
     with ui.row().classes("items-start w-full gap-3 border-t py-2 sm:flex-nowrap"):
         # 和命中页同一颗星：这里它一定是实心的，点一下就是取消追踪
-        thumb_corners(r, r["rule_id"], marks, rule.get("name", ""))
+        thumb_corners(r, r["rule_id"], marks, rule.get("name", ""), twins=twins)
         with ui.column().classes("gap-0 flex-1 min-w-0 leading-snug self-stretch"):
             with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
                 # 【终态的留在这一页】卖掉/下架的不会被摘掉追踪，所以这三种
@@ -993,7 +1066,6 @@ def _track_row(r: dict, rule: dict, st: dict, marks: set, prevs: dict) -> None:
                     ui.label(f"发货 {r['ship_from']}")
         with ui.column().classes(
                 "gap-0 items-end shrink-0 whitespace-nowrap self-stretch"):
-            ui.badge(source_name(r["source"])).classes(BADGE_LABEL + " mb-1")
             ui.label(yen(r["price"])).classes("text-lg font-bold")
             if r["deal_pct"]:
                 ui.label(f"市价的 {r['deal_pct']}%").classes(
@@ -1064,7 +1136,6 @@ def _mark_row(m: dict) -> None:
                 ui.label(f"{m['marked_at']:%Y-%m-%d %H:%M} 标记")
         with ui.column().classes(
                 "gap-0 items-end shrink-0 whitespace-nowrap self-stretch"):
-            ui.badge(source_name(m["source"])).classes(BADGE_LABEL + " mb-1")
             ui.label(yen(m["price"])).classes("text-lg font-bold")
             ui.label("标记时").classes("text-xs text-gray-500")
             # 现价只在【和当初不一样】时才显示 —— 一样的时候多写一行纯噪音
@@ -1177,7 +1248,6 @@ def _sold_row(r: dict, med: int | None, marks: set, rule_name: str) -> None:
                     ui.label(f"从 {yen(r['first_price'])} 降了 "
                              f"{yen(r['first_price'] - r['price'])} 才卖掉").classes("text-red-400")
         with ui.column().classes("gap-0 items-end shrink-0 whitespace-nowrap"):
-            ui.badge(source_name(r["source"])).classes(BADGE_LABEL + " mb-1")
             ui.label(yen(r["price"])).classes("text-lg font-bold")
             if med:
                 ui.label(f"市价的 {r['price'] * 100 // med}%").classes("text-xs text-gray-400")
@@ -1789,7 +1859,20 @@ def create() -> None:
         # 对话框的家：建在所有 refreshable 容器之外，refresh() 清不到它
         dialog_host = ui.element()
 
-        with ui.tabs().classes("w-full") as tabs:
+        # 【切过去的时候才重建过时的那一页】配合 stale_tabs：点一面旗不再
+        # 当场重建四个视图（1.24 秒 SQL），只把别的页记成过时；
+        # 等你真切过去，那一下的重建藏在切页动作里，看不出来。
+        def on_tab(e) -> None:
+            # 【e.value 可能是 Tab 对象也可能是页签名】NiceGUI 两种都发得出来，
+            # 所以两种都认。别去读 Tab 的 .props ——那是个方法不是字典，
+            # 读出来是个 bound method，取 name 会直接抛，而抛在这里的后果是
+            # 切页无声地不刷新，你只会看到一页旧数据。
+            name = e.value if isinstance(e.value, str) else TAB_NAME.get(e.value, "")
+            if name in _DIRTY:
+                _DIRTY.discard(name)
+                REFRESH[name].refresh()
+
+        with ui.tabs(on_change=on_tab).classes("w-full") as tabs:
             t_hit = ui.tab("命中")
             t_track = ui.tab("追踪")
             t_mark = ui.tab("标记")
@@ -1797,6 +1880,9 @@ def create() -> None:
             t_all = ui.tab("全部")
             t_rule = ui.tab("规则")
             t_set = ui.tab("设置")
+        TAB_NAME = {t_hit: "命中", t_track: "追踪", t_mark: "标记", t_sold: "成交"}
+        REFRESH = {"命中": hits_view, "追踪": track_view,
+                   "标记": marks_view, "成交": sold_view}
         # animated=False 的理由见 DARK_CSS 里那条 overflow:visible 的注释：
         # 两者是一组，少一个要么 sticky 不生效、要么切页穿帮。
         with ui.tab_panels(tabs, value=t_hit, animated=False).classes("w-full"):

@@ -8,10 +8,12 @@
 下面这几条锁的就是这两件事，外加「推送坏了不能拖垮抓取」。
 """
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import config  # noqa: E402
 from core import notify  # noqa: E402
 
 RULE = {"id": 1, "name": "RTX 5090 单卡"}
@@ -105,6 +107,33 @@ def test_拍卖必须带竞价提示():
     """拍卖的「当前价」只在此刻成立。不写这句，推送就是在误导人。"""
     text = notify.compose(RULE, item(source="yahoo_auction", item_id="z1", bid_count=7), None)
     assert "已 7 次出价" in text and "还会涨" in text
+
+
+def test_拍卖要同时给剩余时间和绝对截止时间():
+    """【两个都得有】推送是躺在通知栏里的静止消息，面板是打开就重算的。
+    只写"剩 3 小时"的话，你半夜翻到这条时它可能早就结束了，而消息还写着剩 3 小时；
+    只写绝对时间又得自己心算 —— 而拍卖要的就是扫一眼的紧迫感。
+    """
+    end = config.now() + timedelta(hours=3, minutes=5)
+    text = notify.compose(
+        RULE, item(source="yahoo_auction", item_id="z1", bid_count=7, end_time=end), None)
+    assert "剩 3 小时" in text
+    assert f"{end:%m-%d %H:%M} 截止" in text
+
+
+def test_拍卖没给截止时间时不留半截括号():
+    """【源不给 end_time 是会发生的】ヤフオク 的搜索结果就不一定带。
+    直接往正文里拼的话会推出一句「（ 截止）」，看着像程序坏了。
+    """
+    text = notify.compose(
+        RULE, item(source="yahoo_auction", item_id="z1", bid_count=7, end_time=None), None)
+    assert "截止" not in text and "剩" not in text
+    assert "已 7 次出价" in text
+
+
+def test_非拍卖商品不写截止时间():
+    """普通商品没有"到点就没了"这回事，多一行只会稀释前两行。"""
+    assert "截止" not in notify.compose(RULE, item(), 820000)
 
 
 # ---------------------------------------------------------------- 开关与阈值
@@ -297,13 +326,14 @@ def test_推送时把商品的缩略图传下去():
     assert got == ["https://cdn/y.jpg"]
 
 
-def test_取待推列表的SQL必须带上thumb_url():
+def test_取待推列表的SQL必须带上正文要用的列():
     """【上面那些用例是假 store，盯不住真 SQL】pending_notify 少 SELECT 一列，
-    push_new 拿到的 row 里就没有 thumb_url，每条都悄悄走兜底、图永远出不来，
-    而且不报错、不进日志。同类的坑栽过一次：revalidate 漏了 seller_id，
-    导致拉黑在同一轮里被自己撤销。
+    push_new 拿到的 row 里就没有那个键，正文悄悄少一块 —— 不报错、不进日志：
+      thumb_url 缺 → 每条都走兜底，图永远出不来
+      end_time  缺 → 拍卖推送里没有截止时间，而那是拍卖最要紧的一个数
+    同类的坑栽过一次：revalidate 漏了 seller_id，导致拉黑在同一轮里被自己撤销。
 
-    【必须先剥掉注释】注释里正好写着 thumb_url 这个词，不剥的话这条守卫恒真 ——
+    【必须先剥掉注释】注释里正好写着这两个列名，不剥的话这条守卫恒真 ——
     也栽过一次，当时是自己写的注释让断言永远通过。
     """
     import inspect
@@ -314,3 +344,4 @@ def test_取待推列表的SQL必须带上thumb_url():
     code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
     sql = code[code.index("SELECT"):code.index("ORDER BY")]
     assert "thumb_url" in sql, "pending_notify 没取 thumb_url，推送里的图会永远缺席"
+    assert "end_time" in sql, "pending_notify 没取 end_time，拍卖推送里永远没有截止时间"

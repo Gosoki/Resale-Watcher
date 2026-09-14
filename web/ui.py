@@ -216,21 +216,6 @@ def yen(n) -> str:
     return f"¥{n:,}" if n is not None else "—"
 
 
-def time_left(end) -> str:
-    """距结束还有多久。拍卖里这是最要紧的一个数 —— 到点就没了。"""
-    if not end:
-        return ""
-    sec = (end - config.now()).total_seconds()
-    if sec <= 0:
-        return "已结束"
-    h = int(sec // 3600)
-    if h < 1:
-        return f"剩 {int(sec // 60)} 分"
-    if h < 24:
-        return f"剩 {h} 小时"
-    return f"剩 {h // 24} 天 {h % 24} 小时"
-
-
 def freshness(r: dict, hours: int, cold_start: bool) -> str:
     """返回 "listed"（新上架）/ "found"（新发现）/ ""（都不是）。
 
@@ -280,7 +265,7 @@ def auction_note(r: dict) -> tuple[str, str]:
         if bids > 0:
             return f"🔨 拍卖结束 · 共 {bids} 次出价，这是最终成交价", "text-gray-400"
         return "🔨 拍卖结束 · 无人出价", "text-gray-400"
-    left = time_left(r.get("end_time"))
+    left = config.time_left(r.get("end_time"))
     urgent = r.get("end_time") and (r["end_time"] - config.now()).total_seconds() < 3600
     if bids > 0:
         return f"🔨 竞价中 · 已 {bids} 次出价 · 当前价还会涨 · {left}", \

@@ -619,9 +619,11 @@ def pending_notify(rule_id: int, only_deal: bool) -> list[dict]:
     # 【thumb_url 不能漏】推送模板里的 {thumb} 就靠它。少了这一列，
     # 渲染出来的 image_url 是空串，而 Slack 对空 image_url 回的是
     # 400 invalid_blocks —— 整条消息发不出去，那件捡漏就丢了。
+    # 【end_time 不能漏】拍卖的推送要写「剩 3 小时（09-14 20:33 截止）」。
+    # 少了这一列，正文里就只剩出价数 —— 而拍卖里最要紧的那个数就是到点没了。
     sql = ("SELECT source, item_id, rule_id, name, price, is_deal, deal_pct, bid_count, "
-           "thumb_url FROM item WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' "
-           "AND notified_at IS NULL")
+           "end_time, thumb_url FROM item WHERE rule_id = %s AND matched = 1 "
+           "AND status = 'on_sale' AND notified_at IS NULL")
     if only_deal:
         sql += " AND is_deal = 1"
     # 和面板同一个排序：最划算的排最前，万一撞上限被整批跳过也是先看到好的

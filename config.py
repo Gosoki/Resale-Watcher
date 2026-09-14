@@ -20,6 +20,27 @@ def now() -> datetime:
     return datetime.now(JST).replace(tzinfo=None)
 
 
+def time_left(end) -> str:
+    """距结束还有多久。拍卖里这是最要紧的一个数 —— 到点就没了。
+
+    【为什么放在 config 而不是面板里】面板和推送两边都要写这个数，
+    而 core/ 不能 import web/（那会把 nicegui 拖进抓取进程）。
+    两边各写一份的话迟早分叉 —— 推送说「剩 180 分」、页面说「剩 3 小时」，
+    人会以为是两个不同的时间。config 是两边本来就都 import 的那一个。
+    """
+    if not end:
+        return ""
+    sec = (end - now()).total_seconds()
+    if sec <= 0:
+        return "已结束"
+    h = int(sec // 3600)
+    if h < 1:
+        return f"剩 {int(sec // 60)} 分"
+    if h < 24:
+        return f"剩 {h} 小时"
+    return f"剩 {h // 24} 天 {h % 24} 小时"
+
+
 def _int(key: str, default: int) -> int:
     try:
         v = int(os.getenv(key, "") or default)

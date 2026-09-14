@@ -24,6 +24,7 @@ import time
 
 import httpx
 
+import config
 import sources
 from db import store
 
@@ -40,6 +41,20 @@ UA = "Resale-Watcher"
 GAP = 1.2                     # 秒
 
 
+def deadline(end) -> str:
+    """拍卖的截止，写成 " · 剩 3 小时（09-14 20:33 截止）"。没有截止时间就是空串。
+
+    【剩余时间和绝对时间必须都写】推送是一条躺在通知栏里的静止消息，
+    而面板是打开就重算的。"剩 3 小时"只在发出去的那一秒成立 ——
+    你半夜翻到这条时它可能早就结束了，而消息本身还理直气壮地写着"剩 3 小时"。
+    绝对时间则永远读得对，但光有它又得自己心算还剩多久，
+    而"到点就没了"要的正是扫一眼就有的紧迫感。两个都给，各补对方的短板。
+    """
+    if not end:
+        return ""
+    return f" · {config.time_left(end)}（{end:%m-%d %H:%M} 截止）"
+
+
 def compose(rule: dict, row: dict, median: int | None) -> str:
     """一条提醒的正文。手机通知栏只看得见前两行，所以最要紧的信息必须在最前面。"""
     head = "🟢 捡漏" if row["is_deal"] else "命中"
@@ -51,7 +66,8 @@ def compose(rule: dict, row: dict, median: int | None) -> str:
     if row.get("bid_count") is not None:
         # 拍卖的"当前价"只在此刻成立。不写这句，推送就是在误导人 ——
         # 和面板上那条竞价提示是同一个理由。
-        lines.append(f"🔨 拍卖 · 已 {row['bid_count']} 次出价 · 还会涨")
+        lines.append(f"🔨 拍卖 · 已 {row['bid_count']} 次出价 · 还会涨"
+                     f"{deadline(row.get('end_time'))}")
     src = sources.get(row["source"])
     lines.append(src.item_url(row["item_id"]) if src else "")
     return "\n".join(lines)

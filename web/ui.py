@@ -70,6 +70,15 @@ DARK_CSS = (
     # 「拉黑卖家」从 size=sm 长回默认大小，右边整整一列红字明显抢眼了，
     # 正好把它调回注释里本来就说好的 40%。层级靠颜色和透明度，不靠大小。
     ".btn-muted{opacity:.4;transition:opacity .15s}"
+    # 【行内操作按钮跟左边那行小字同号】「剔除」「拉黑卖家」和左下角的
+    # 「来源 · 品相 · 发货 · 上架」是同一条基线上的两头，字号不一样的话
+    # 两边一眼看过去不像一层，右边那两个显得比实际重要。
+    # 【必须连 .q-btn__content 一起写】Quasar 的字号定在 .q-btn 上，
+    # 而按钮文字实际在内层的 .q-btn__content 里 —— 只写外层，内层会
+    # 从 Quasar 那边继承回 14px，等于没改。min-height 同理：不压下来的话
+    # 字变小了按钮框还是原来那么高，两边基线照样对不齐。
+    ".row-act,.row-act .q-btn__content{font-size:.75rem;line-height:1rem}"
+    ".row-act{min-height:20px;padding:0 6px}"
     # 【图片角上的星】收藏手势大家都认得，比底部一个文字按钮自然得多。
     # 商品图什么底色都有（白盒、亮桌面、深机箱），所以星必须自带描边阴影，
     # 否则压在浅色图上直接消失。
@@ -412,37 +421,32 @@ def thumb_corners(r: dict, rule_id: int, marks: set, rule_name: str,
     tracked = r.get("tracked_at") is not None
     marked = (r["source"], r["item_id"]) in marks
     key = (r["source"], r["item_id"])
-    # 【来源标签左对齐，和图的左边缘齐】居中的话它会在 96px 里浮着，
-    # 而这一行里别的东西（标题、徽标、小字）全是左对齐的 —— 就它一个居中，
-    # 一列扫下来左边缘是锯齿状的。
-    with ui.column().classes("gap-1 shrink-0 w-24 items-start"):
-        ui.badge(source_name(r["source"])).classes(BADGE_LABEL)
-        with ui.element("div").classes("relative w-24 h-24"):
-            if r["thumb_url"]:
-                # 【ratio=1 不能省】q-img 的高度是按图片真实宽高比撑出来的，
-                # Tailwind 的 h-24 管不住它（object-cover 是给原生 <img> 的，
-                # 这里外层是 Quasar 组件）。不写 ratio 的话一列里 96px 高和
-                # 44px 高的缩略图混着排，每行正文的起点都不在一条线上。
-                ui.image(r["thumb_url"]).props("fit=cover ratio=1") \
-                    .classes("w-24 h-24 rounded")
-            else:
-                ui.element("div").classes("w-24 h-24 rounded bg-white/5")
-            if star:
-                corner_toggle(
-                    tracked, ("☆", "★"),
-                    ("加入追踪：这件会被单独拉详情刷新，价格、出价数、是否卖掉都比"
-                     "整轮扫描快得多。代价是每次刷新一个请求", "取消追踪"),
-                    "absolute top-0 right-0 star-btn", "star-on",
-                    lambda on, so=r["source"], ii=r["item_id"], ri=rule_id:
-                        toggle_track(so, ii, ri, on),
-                    twins, ("star",) + key)
+    with ui.element("div").classes("relative shrink-0 w-24 h-24"):
+        if r["thumb_url"]:
+            # 【ratio=1 不能省】q-img 的高度是按图片真实宽高比撑出来的，
+            # Tailwind 的 h-24 管不住它（object-cover 是给原生 <img> 的，
+            # 这里外层是 Quasar 组件）。不写 ratio 的话一列里 96px 高和
+            # 44px 高的缩略图混着排，每行正文的起点都不在一条线上。
+            ui.image(r["thumb_url"]).props("fit=cover ratio=1") \
+                .classes("w-24 h-24 rounded")
+        else:
+            ui.element("div").classes("w-24 h-24 rounded bg-white/5")
+        if star:
             corner_toggle(
-                marked, ("⚐", "⚑"),
-                ("标记：只是记一笔，不发任何请求。标的是【此刻的快照】——"
-                 "标题、价格、图都存下来，以后商品下架了这一页照样看得到", "取消标记"),
-                "absolute bottom-0 right-0 star-btn mark-btn", "mark-on",
-                lambda on, row=dict(r), rn=rule_name: toggle_mark(row, rn, on),
-                twins, ("mark",) + key)
+                tracked, ("☆", "★"),
+                ("加入追踪：这件会被单独拉详情刷新，价格、出价数、是否卖掉都比"
+                 "整轮扫描快得多。代价是每次刷新一个请求", "取消追踪"),
+                "absolute top-0 right-0 star-btn", "star-on",
+                lambda on, so=r["source"], ii=r["item_id"], ri=rule_id:
+                    toggle_track(so, ii, ri, on),
+                twins, ("star",) + key)
+        corner_toggle(
+            marked, ("⚐", "⚑"),
+            ("标记：只是记一笔，不发任何请求。标的是【此刻的快照】——"
+             "标题、价格、图都存下来，以后商品下架了这一页照样看得到", "取消标记"),
+            "absolute bottom-0 right-0 star-btn mark-btn", "mark-on",
+            lambda on, row=dict(r), rn=rule_name: toggle_mark(row, rn, on),
+            twins, ("mark",) + key)
 
 
 def stale_hours(r: dict) -> float:
@@ -882,10 +886,14 @@ def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, twins: dict,
             # 配合正文列的 self-stretch（让它撑满卡片高度）才生效。
             with ui.row().classes(
                     "gap-3 text-xs text-gray-400 items-center mt-auto pt-1"):
-                # 【这一行永远只有这三项，固定顺序】品相 → 发货地 → 上架时间
-                # 别再往这里塞东西：它贴卡片底部、两列之间要横向对齐，
-                # 多一项少一项都会让两边错位。会变的信息一律做成徽标放标题上方
-                # （降价就是这么挪上去的），操作按钮放右边价格列（拉黑同理）。
+                # 【固定顺序】来源 → 品相 → 发货地 → 上架时间。
+                # 来源排第一，是因为它【每一行都有】—— 打头的那一项必须恒定存在，
+                # 否则两列卡片的这一行会从不同的位置起头，横着扫过去对不齐。
+                # 后面三项可有可无（ヤフオク 不给上架时间、没拉详情就没有发货地），
+                # 它们缺了只是这一行短一截，不影响起点。
+                # 【别再往这里塞会变的信息】它贴在卡片底部、两列之间要横向对齐。
+                # 会变的一律做成徽标放标题上方（降价就是这么挪上去的）。
+                ui.badge(source_name(r["source"])).classes(BADGE_LABEL)
                 ui.label(COND.get(r["condition_id"], "品相未标"))
                 # 非东京的也显示出来 —— 不然「这件为什么没有东京标」
                 # 你分不清是「不在东京」还是「还没拉详情」
@@ -925,7 +933,7 @@ def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, twins: dict,
                     "剔除",
                     on_click=lambda _, row=dict(r), rn=rule["name"]:
                         toggle_hide(row, rn, True),
-                ).props(BTN_QUIET).classes("btn-muted") \
+                ).props(BTN_QUIET).classes("btn-muted row-act") \
                  .tooltip("只是让它不在命中页显示。商品照常抓取、照常对账、"
                           "照常推送，全部页和追踪页都还看得到。"
                           "剔除的是这个链接本身，它在别的规则下也不再显示。"
@@ -939,7 +947,7 @@ def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, twins: dict,
                         "拉黑卖家",
                         on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
                             blacklist_seller(rid, sid),
-                    ).props(BTN_DANGER).classes("btn-muted") \
+                    ).props(BTN_DANGER).classes("btn-muted row-act") \
                      .tooltip(
                         f"卖家 {r['seller_id']}\n"
                         "拉黑后这条规则下他的全部商品立刻判为不合适。"

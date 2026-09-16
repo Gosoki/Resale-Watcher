@@ -15,9 +15,18 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
-from sources.base import UA, Source, pref_of
+from sources.base import RateLimited, UA, Source, pref_of
 
 log = logging.getLogger(__name__)
+
+
+def _deleted(resp) -> bool:
+    """403 的正文是不是「商品已删除」。只认这一个形状，别的 403 不当删除。"""
+    try:
+        errs = (resp.json() or {}).get("errors") or []
+    except ValueError:
+        return False
+    return any(e.get("code") == "InvisibleItemException" for e in errs)
 
 
 def _bids(v) -> int | None:
@@ -140,9 +149,20 @@ class Mercari(Source):
         # 这个参数是从 メルカリ 网页版自己发的请求里抠出来的（抓了一次网络日志）。
         resp = self._call("GET", DETAIL_URL,
                           params={"id": item_id, "country_code": "", "view": "1",
-                                  "include_auction": "true"})
+                                  "include_auction": "true"},
+                          soft=(403,))
         if resp.status_code == 404:
             return None
+        if resp.status_code == 403:
+            # 【メルカリ 用 403 报 404】已删除的商品回的是
+            #   403 {"errors":[{"code":"InvisibleItemException",
+            #        "message":"該当する商品は削除されています。"}],"meta":{"sub_error_code":"404"}}
+            # 实测 2026-09-17 拿库里一件卡了三天的商品验的。按 404 处理＝标 gone。
+            # 别的 403（没有这个 code 的）才是真限流，照旧抛出去让上层推迟一个周期；
+            # 不睡退避 —— 详情接口的限流从没见过，而睡 60 秒握着锁会挡住所有规则。
+            if _deleted(resp):
+                return None
+            raise RateLimited(f"{self.name} HTTP 403（详情）")
         d = (resp.json() or {}).get("data")
         if not d:
             return None

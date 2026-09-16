@@ -95,7 +95,18 @@ class Source(ABC):
         if total >= limit:
             raise DailyLimitReached(f"当天全源已发 {total} 次请求，到上限 {limit}")
 
-    def _call(self, method: str, url: str, *, params=None, json_body=None) -> httpx.Response:
+    def _call(self, method: str, url: str, *, params=None, json_body=None,
+              soft: tuple[int, ...] = ()) -> httpx.Response:
+        """发一个请求。soft 里的状态码当作【正常回答】原样返回：不计失败、不退避、不抛。
+
+        【为什么要有 soft】メルカリ 的详情接口对已删除的商品回的是
+        HTTP 403 + {"code":"InvisibleItemException","message":"該当する商品は削除されています"}
+        ——用 403 报一个 404。原先 403 一律按限流处理：睡 60 秒（还握着锁）、
+        计一次失败、抛 RateLimited 让整条规则这一轮作废。一件删掉的商品只要还
+        标着在售，就每轮都来一遍，永远不会被标成 gone；排在它后面的失踪商品也
+        永远轮不到核实。实测 2026-09-14 一整天 メルカリ 197 次「限流」全是这个。
+        哪些码算 soft 由调用方定 —— 只有它知道那个接口的 403 是什么意思。
+        """
         with self._lock:
             self._check_quota()
             self._pace()
@@ -115,7 +126,7 @@ class Source(ABC):
                 store.bump_daily(self.key, requests=1)
                 return resp
 
-            if resp.status_code == 404:
+            if resp.status_code == 404 or resp.status_code in soft:
                 # 商品被删了是【正常事件】，不是错误：既不该计进面板的"失败 N"
                 # （那会让这个数字失去诊断价值），也不该推高退避档位。
                 store.bump_daily(self.key, requests=1)

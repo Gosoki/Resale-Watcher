@@ -1853,10 +1853,16 @@ def create() -> None:
                         + f"　失败 {d['errors']}　{config.now():%H:%M:%S}")
             except Exception as e:          # noqa: BLE001 - 数据库抽风不该让状态栏整个消失
                 text = f"⚠ 读数据库失败：{str(e)[:60]}"
+            holder = poller.lease_holder()
             if dead:
                 gap = f"（心跳停在 {beat:%H:%M:%S}）" if beat else "（从未启动）"
                 status.text = f"⚠ 轮询已停止{gap}　" + text
                 status.classes(replace="text-sm text-red-400 font-bold")
+            elif holder and holder != poller.ME:
+                # 【待命要写出来】不写的话你看着本机的面板，以为它在抓 ——
+                # 其实抓的是 NAS 那份，本机只是在看同一个库。
+                status.text = f"待命：轮询由 {holder} 执行　" + text
+                status.classes(replace="text-sm text-amber-400")
             else:
                 status.text = text
                 status.classes(replace="text-sm")

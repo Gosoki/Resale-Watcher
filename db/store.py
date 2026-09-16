@@ -1,12 +1,29 @@
-"""数据库访问。全部手写 SQL，每次操作开一条短连接。
+"""数据库访问。全部手写 SQL，【每个线程一条长连接】。
 
-【为什么不做连接池/长连接】轮询线程和 NiceGUI 的事件循环会同时读写，
-PyMySQL 的连接不是线程安全的，共享一条必然在某天撞出 "Packet sequence number wrong"。
-局域网内建连接约几毫秒，而我们每轮只有几十次查询，省这点开销换来的并发 bug 不划算。
+【为什么不是每条 SQL 一条短连接】原先是那样，注释里写的理由是「局域网内建连接
+约几毫秒」—— 这个数是错的。2026-09-17 实测到 10.0.10.20：建连（TCP + TLS +
+caching_sha2 鉴权）31ms，而同一条连接上 SELECT 1 只要 3ms。也就是每条查询
+90% 的时间花在握手上，与 SQL 内容无关：命中页 19 条查询 803ms，复用连接后 98ms。
+面板上每一处"卡一下"——打开首页 3〜7 秒、点一面旗 1.2 秒、状态栏每 10 秒一顿——
+根子都在这里，之前为它打的补丁（_DIRTY 懒重建、marked_ids 一次取整份）
+只是绕着走。
+
+【为什么不共享一条】PyMySQL 的连接不是线程安全的，轮询线程和 NiceGUI 的事件
+循环共用一条会撞出 "Packet sequence number wrong"。所以是 threading.local：
+每个线程各持一条，谁也不碰谁的。常驻的就轮询、看门狗、事件循环三条，
+io_bound 的工作线程最多再几条，离 max_connections=151 很远。
+
+【连接会断，要认】MySQL 的 wait_timeout 是 8 小时，io_bound 的工作线程闲置
+一夜之后第一条查询必然撞上 "MySQL server has gone away"。所以：
+  - 闲置超过 IDLE_PING_SEC 再用之前先 ping 一下，死了就重连（只多一个往返，
+    而且只在闲置之后才有）；
+  - 执行中撞上连接类错误就把本线程这条丢掉，下一次用时重建。
+    【不自动重试】INSERT price_log / watch_rule 不是幂等的，盲目重试会多出一行。
 """
 import contextlib
 import re
 import statistics
+import threading
 import time
 from datetime import timedelta
 
@@ -22,17 +39,61 @@ log = logging.getLogger("store")
 SCHEMA_PATH = config.BASE_DIR / "db" / "schema.sql"
 
 
+IDLE_PING_SEC = 60                      # 闲置超过这么久，用之前先 ping
+_CONN_ERRORS = (pymysql.err.OperationalError, pymysql.err.InterfaceError)
+_local = threading.local()
+
+
+def _connect():
+    # config.DB 里带着 connect/read/write 三个超时 —— 理由见 config.py。
+    return pymysql.connect(**config.DB, charset="utf8mb4", cursorclass=DictCursor,
+                           autocommit=True)
+
+
+def _get():
+    """本线程的那条连接；没有就建，闲太久就先 ping，死了就重建。"""
+    c = getattr(_local, "c", None)
+    if c is not None and time.time() - _local.used > IDLE_PING_SEC:
+        try:
+            c.ping(reconnect=False)      # reconnect=True 在 PyMySQL 2.2 已弃用
+        except Exception:                # noqa: BLE001 - 任何异常都当它死了
+            _drop_conn()
+            c = None
+    if c is None:
+        c = _local.c = _connect()
+    _local.used = time.time()
+    return c
+
+
+def _drop_conn() -> None:
+    """丢掉本线程这条连接（出错后、或测试里要换 connect 时用）。"""
+    c = getattr(_local, "c", None)
+    _local.c = None
+    if c is not None:
+        try:
+            c.close()
+        except Exception:                # noqa: BLE001 - 本来就是坏的
+            pass
+
+
 @contextlib.contextmanager
 def conn(db: bool = True):
-    """db=False 时不指定库名，用于建库本身。"""
-    kw = dict(config.DB, charset="utf8mb4", cursorclass=DictCursor, autocommit=True)
+    """db=True：本线程的长连接（别 close）。db=False：一次性短连接，建库用 ——
+    它没选库，缓存下来的话后面所有查询都会 No database selected。"""
     if not db:
+        kw = dict(config.DB, charset="utf8mb4", cursorclass=DictCursor, autocommit=True)
         kw.pop("database")
-    c = pymysql.connect(**kw)
+        c = pymysql.connect(**kw)
+        try:
+            yield c
+        finally:
+            c.close()
+        return
     try:
-        yield c
-    finally:
-        c.close()
+        yield _get()
+    except _CONN_ERRORS:
+        _drop_conn()
+        raise
 
 
 # 【args 为空时必须不传】PyMySQL 只要 args 不是 None 就会拿 SQL 去做 % 格式化，
@@ -446,6 +507,58 @@ def update_state(rule_id: int, **fields) -> None:
             list(fields.values()) + [config.now(), rule_id])
 
 
+# ---------------------------------------------------------------- 轮询租约
+
+def claim_lease(holder: str, ttl_sec: int) -> str:
+    """争一次租约，返回争完之后的持有者（等于 holder 就是拿到了）。
+
+    【判断和写入必须在同一条 UPDATE 里】先 SELECT 看到"过期了"再 UPDATE，
+    两个实例会同时看到过期、同时写、都以为自己拿到了 —— 那正是这张表要防的事。
+    WHERE 里的条件就是判断，行数改了就是拿到了；然后再 SELECT 一次只是为了
+    把最终持有者读回来（UPDATE 的 rowcount 在值没变时是 0，不能拿它当结果）。
+
+    【taken_at 必须排在 holder 前面赋值】MySQL 的 SET 从左到右生效，
+    后面的表达式看到的是前面刚改过的值 —— holder 先改了，taken_at 里的
+    IF(holder = 我) 就恒真，换人的那一刻拿不到新的 taken_at。
+    """
+    now = config.now()
+    until = now + timedelta(seconds=ttl_sec)
+    execute("INSERT IGNORE INTO poller_lease (id, holder, taken_at, expires_at) "
+            "VALUES (1, %s, %s, %s)", (holder, now, until))
+    execute("UPDATE poller_lease "
+            "SET taken_at = IF(holder = %s, taken_at, %s), holder = %s, expires_at = %s "
+            "WHERE id = 1 AND (holder = %s OR expires_at < %s)",
+            (holder, now, holder, until, holder, now))
+    return one("SELECT holder FROM poller_lease WHERE id = 1")["holder"]
+
+
+def renew_lease(holder: str, ttl_sec: int) -> None:
+    """续期。只在自己还是持有者时才延长；不是了就什么都不做（别抢）。一条 SQL。"""
+    now = config.now()
+    execute("UPDATE poller_lease SET expires_at = %s WHERE id = 1 AND holder = %s",
+            (now + timedelta(seconds=ttl_sec), holder))
+
+
+def release_lease(holder: str) -> None:
+    """主动放掉租约（只放自己的）。
+
+    【为什么要主动放】不放的话 ./run.sh restart 之后新进程会看到旧进程的租约还没到期，
+    老老实实待命到 TTL 用完 —— 重启一次白等 10 分钟。进程正常退出时放掉，
+    新进程第一轮就能接上；被 kill -9 的话放不了，那就还是靠 TTL 到期。
+    """
+    # 【删行，不是把 expires_at 设成现在】claim 的条件是 expires_at < now，
+    # 同一秒内新进程来争会因为"等于而不是小于"拿不到，白等一轮。删掉行最干净：
+    # claim 开头的 INSERT IGNORE 会重建它，谁先到谁拿。
+    execute("DELETE FROM poller_lease WHERE id = 1 AND holder = %s", (holder,))
+
+
+def lease_holder() -> str | None:
+    row = one("SELECT holder, expires_at FROM poller_lease WHERE id = 1")
+    if not row or row["expires_at"] < config.now():
+        return None
+    return row["holder"]
+
+
 def get_source_state(rule_id: int, source: str) -> dict:
     """规则 × 数据源的轮询进度。Mercari 刚扫完不代表 Yahoo 也扫完了，所以按源分开记。"""
     st = one("SELECT * FROM rule_source_state WHERE rule_id = %s AND source = %s",
@@ -721,6 +834,16 @@ def mark_notified(rows: list[dict]) -> None:
 def mark_final_notified(rows: list[dict]) -> None:
     """标成「快结束提醒已推」。这一条每件商品同样只发一次。"""
     _mark_pushed(rows, "final_notified_at")
+
+
+def live_ids_among(rule_id: int, source: str, ids: list[str]) -> list[str]:
+    """这批 ID 里，库里还标着在售/交易中的有哪些。一条 SQL，给成交轮改状态用。"""
+    if not ids:
+        return []
+    holes = ",".join(["%s"] * len(ids))
+    return [r["item_id"] for r in query(
+        f"SELECT item_id FROM item WHERE rule_id = %s AND source = %s "
+        f"AND status IN {LIVE} AND item_id IN ({holes})", (rule_id, source, *ids))]
 
 
 def on_sale_items(rule_id: int, source: str) -> list[dict]:

@@ -57,9 +57,16 @@ def main() -> None:
     log.info("数据源：%s", "、".join(f"{v.name}({k})" for k, v in sources.all_sources().items()))
     stop = threading.Event()
     thread = threading.Thread(target=poller.loop, args=(stop,), name="poller", daemon=True)
+    # 看门狗：轮询线程卡死时唯一还能出声的东西。理由见 poller.watchdog。
+    dog = threading.Thread(target=poller.watchdog, args=(stop,), name="watchdog", daemon=True)
 
     app.on_startup(thread.start)
+    app.on_startup(dog.start)
     app.on_shutdown(stop.set)
+    # 【关机时主动放租约】轮询线程可能正卡在一轮扫描中间、来不及走到自己的 release()，
+    # 进程一退它就没了。这里在主线程再放一次，两处都放是双保险 —— 少一处就是
+    # ./run.sh restart 之后白等 10 分钟。
+    app.on_shutdown(poller.release)
 
     webui.create()
     log.info("面板 http://%s:%d", config.WEB_HOST, config.WEB_PORT)

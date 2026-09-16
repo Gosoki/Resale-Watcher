@@ -24,6 +24,36 @@ PAGE_SIZE = 100                       # 实测 results=100 有效，一次拿满
 CONDITION = {"new": 1, "used10": 2, "used20": 3, "used40": 4, "used60": 5, "used80": 6}
 
 _NEXT_DATA = re.compile(r'id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+# 【已售出的商品页没有 __NEXT_DATA__】Yahoo 给 SOLD 的商品套的是另一套模板，
+# 数据不再走 Next.js 的注水，但 SEO 用的 schema.org Product 块还在：
+#   {"@type":"Product","name":…,"offers":{"price":1280000,"availability":"https://schema.org/OutOfStock"}}
+# 实测 2026-09-17 拿 z677504374 验的。这是给搜索引擎的公开契约，比前端注水稳。
+# 没有这一层的后果：卖掉的 フリマ 商品详情永远「读不出状态」，对账每 20 分钟重试一次，
+# 6 件僵尸就吃掉这个源一半的每日请求，而它们在命中页上一直挂着"在售"。
+_LD_JSON = re.compile(r'<script type="application/ld\+json">(.*?)</script>', re.S)
+_AVAIL = {"InStock": "on_sale", "OutOfStock": "sold_out", "SoldOut": "sold_out"}
+
+
+def _from_ld_json(html: str) -> dict | None:
+    """从 schema.org 的 Product 块里读状态/价格/标题。没有就 None。"""
+    for blob in _LD_JSON.findall(html):
+        try:
+            d = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        if d.get("@type") != "Product":
+            continue
+        offers = d.get("offers") or {}
+        avail = str(offers.get("availability") or "").rsplit("/", 1)[-1]
+        return {
+            "description": d.get("description") or "",
+            "price": int(offers.get("price") or 0),
+            "name": d.get("name") or "",
+            "status": _AVAIL.get(avail, ""),
+            "ship_from": "",                # schema.org 里没有发货地；空串＝未知
+            "bid_count": None,
+        }
+    return None
 
 
 
@@ -55,6 +85,10 @@ class YahooFlea(Source):
         # warn_desc 这一层对整个源静默失效，而面板上还写着「✓ 描述已查，干净」。
         # 返回整个 dict 而不是 None：None 是"商品没了"的语义，会让上层把它标成下架。
         if not m:
+            # 没有 __NEXT_DATA__ 多半是已售出的页（见 _LD_JSON 的注释），先退到 schema.org
+            ld = _from_ld_json(resp.text)
+            if ld is not None:
+                return ld
             return {"description": None, "price": 0, "name": "", "status": "", "ship_from": "", "bid_count": None}
         try:
             blob = json.loads(m.group(1))

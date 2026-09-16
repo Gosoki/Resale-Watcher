@@ -16,7 +16,9 @@
 两边都是日本二手市场，合并样本量更大也更稳。
 """
 import logging
+import os
 import random
+import socket
 from datetime import timedelta
 
 import config
@@ -33,12 +35,66 @@ DESC_UNREAD = "(描述未读到)"
 # 轮询心跳。面板靠它判断「采集是不是还活着」——
 # 没有它的话，线程静默死掉后进程照常在跑、面板照常打开、旧数据照常显示，
 # 只有「上次扫描」那个时间戳冻在死亡那一刻，而界面上没有任何地方说这不正常。
-_beat: dict = {"at": None}
+_beat: dict = {"at": None, "running": False, "holder": None}
+# 本实例在租约表里的名字。主机名 + 进程号：同一台机器起两个进程也分得开。
+ME = f"{socket.gethostname()}:{os.getpid()}"
 
 
 def heartbeat():
-    """轮询主循环最近一次转动的时间。None＝还没开始转。"""
+    """轮询最近一次有动静的时间。None＝还没开始转。
+
+    【每扫完一个源就跳一下，不只在主循环顶部】一轮要遍历 4 条规则 × 3 个源，
+    每个源翻 5 页、拉 10 个详情，请求之间还要等 3〜8 秒 —— 一轮跑十几分钟
+    很正常。只在循环顶部跳的话，面板 3 分钟没见心跳就报「轮询已停止」，
+    而它明明在忙。
+    """
     return _beat["at"]
+
+
+def _tick() -> None:
+    _beat["at"] = config.now()
+
+
+def lease_holder():
+    """当前谁在抓。等于 ME 就是自己；None＝没用租约或还没争过。"""
+    return _beat["holder"]
+
+
+def _claim() -> bool:
+    """争一次租约。返回本实例现在能不能抓。租约关闭（ttl=0）时永远能。"""
+    ttl = store.get_settings().get("poller_lease_sec") or 0
+    if not ttl:
+        _beat["holder"] = None
+        return True
+    holder = store.claim_lease(ME, ttl)
+    if holder != _beat["holder"]:
+        if holder == ME:
+            log.info("拿到轮询租约（%s）", ME)
+        else:
+            log.info("轮询由 %s 执行，本实例待命", holder)
+    _beat["holder"] = holder
+    return holder == ME
+
+
+def release() -> None:
+    """退出时把租约放掉，让下一个进程立刻能接。失败也无所谓 —— 到期照样换手。"""
+    if _beat["holder"] == ME:
+        try:
+            store.release_lease(ME)
+            _beat["holder"] = None
+            log.info("已放掉轮询租约")
+        except Exception as e:              # noqa: BLE001
+            log.warning("放租约失败（到期会自动换手）：%s", e)
+
+
+def _renew() -> None:
+    """扫完一个源续一次期。失败只记日志：续不上大不了到期换人，不该打断这一轮。"""
+    ttl = store.get_settings().get("poller_lease_sec") or 0
+    if ttl and _beat["holder"] == ME:
+        try:
+            store.renew_lease(ME, ttl)
+        except Exception as e:              # noqa: BLE001
+            log.warning("租约续期失败：%s", e)
 
 
 def _due(last, interval_min: float) -> bool:
@@ -121,10 +177,13 @@ def reconcile_sold(src, rule: dict, seen: set[str]) -> None:
         if d["status"] == "sold_out":
             now = config.now()
             store.set_status(src.key, iid, rid, "sold_out", sold_at=now)
-            if it["matched"]:
+            # 【价格读不到就别进样本】0 进了 sold_sample 会把中位数往下拽，而中位数是
+            # 捡漏线的全部依据。状态和价格来自两条不同的解析路径（フリマ 的已售出页
+            # 只剩 schema.org 块），能读到"卖掉了"不代表能读到"多少钱卖的"。
+            if it["matched"] and d["price"] > 0:
                 # 我们一路跟到成交的商品：拉过详情、过了完整规则，是最可信的市价样本
                 store.add_sold_sample(rid, src.key, iid, d["price"], now, "tracked")
-            log.info("[%s] 售出 %s ¥%s", src.key, iid, f"{d['price']:,}")
+            log.info("[%s] 售出 %s ¥%s", src.key, iid, f"{d['price']:,}" if d["price"] else "?")
         elif d["status"] == "trading":
             store.set_status(src.key, iid, rid, "trading")
         elif d["status"] == "gone":
@@ -264,9 +323,11 @@ def scan_sold(src, rule: dict) -> dict:
     # 写进去也会被 prune_sold_samples 立刻删掉，白写一趟。
     cutoff = config.now() - timedelta(days=rule["median_window_days"])
 
+    seen_sold: dict[str, object] = {}       # item_id -> 平台给的成交时间
     for _ in range(rule["max_pages"]):
         page = src.search(rule["keyword"], sold=True, page_token=token)
         for snap in page["items"]:
+            seen_sold[snap["item_id"]] = snap["updated_at_src"]
             if not judge_snap(price_rule, snap)["matched"]:
                 continue
             # 【取不到成交时间就跳过，不要当成"刚刚成交"】原先 `or config.now()`
@@ -282,6 +343,22 @@ def scan_sold(src, rule: dict) -> dict:
         token = page["next"]
         if not token:
             break
+
+    # 【搜到的已售出商品，库里还标在售的，就地改成 sold_out】这些页本来就要翻，
+    # 一个请求都不多发。原先卖掉只能靠对账逐件拉详情确认（每轮 detail_budget 件），
+    # 而 メルカリ 的详情对已删除商品回 403、フリマ 的已售出页又没有 __NEXT_DATA__，
+    # 两个源的僵尸把预算吃光，真卖掉的永远轮不到 —— 库里 273 件 メルカリ「在售」
+    # 里成交的只标出来 1 件。成交搜索是平台自己说的"这件卖了"，比拉详情还可靠。
+    # 【不看有没有过规则】改的是"它还在不在卖"这个事实，和它值不值得买无关。
+    if seen_sold:
+        closed = 0
+        for iid in store.live_ids_among(rid, src.key, list(seen_sold)):
+            store.set_status(src.key, iid, rid, "sold_out",
+                             sold_at=seen_sold.get(iid) or config.now())
+            closed += 1
+        if closed:
+            log.info("[%s] 规则「%s」成交搜索里看到 %d 件库里还标在售的，已改为售出",
+                     src.key, rule["name"], closed)
 
     store.prune_sold_samples(rid)
     median, n = store.refresh_median(rid)
@@ -416,6 +493,50 @@ def run_once(rule: dict) -> dict:
     return agg
 
 
+def stalled_for(now, beat, stall_min: int) -> int | None:
+    """心跳停了多少分钟；没停（或功能关闭）返回 None。拆出来是为了能离线测。"""
+    if not stall_min or beat is None:
+        return None
+    mins = int((now - beat).total_seconds() // 60)
+    return mins if mins >= stall_min else None
+
+
+def watchdog(stop_event, alert=None, interval: float = 60.0) -> None:
+    """盯着心跳。停得太久就写 ERROR 日志、往推送地址发告警。
+
+    【为什么单独一个线程】它防的正是"轮询线程自己卡死"—— 卡死的线程救不了自己。
+    它只读一个内存里的时间戳、偶尔读一次设置，不碰源、不拿任何锁。
+
+    【每个停机段只告警一次】不然轮询一停，每分钟一条推送，你第一件事就是把推送关掉。
+    持续不恢复的话 6 小时再提醒一次。恢复了就把状态清掉，下次再停会重新告警。
+
+    alert 参数只是给测试注入用的；正常跑用 core.notify.post。
+    """
+    from core import notify
+
+    last_alert = None                       # 上一次告警的时间；None＝当前没在停机段里
+    while not stop_event.wait(interval):
+        try:
+            s = store.get_settings()
+            mins = stalled_for(config.now(), heartbeat(), s.get("poller_stall_min") or 0)
+            if mins is None:
+                last_alert = None
+                continue
+            if last_alert and (config.now() - last_alert) < timedelta(hours=6):
+                continue
+            beat = heartbeat()
+            text = (f"⚠ 轮询已停 {mins} 分钟（心跳停在 {beat:%m-%d %H:%M}）\n"
+                    "进程还活着、面板还开着，但没在抓。多半是数据库连接卡死。\n"
+                    "重启一下：./run.sh restart")
+            log.error(text.replace("\n", " "))
+            url = (s.get("notify_url") or "").strip()
+            if url:
+                (alert or notify.post)(url, s.get("notify_body") or "", text)
+            last_alert = config.now()
+        except Exception as e:              # noqa: BLE001 - 看门狗自己不能死
+            log.warning("看门狗这一轮失败：%s", e)
+
+
 def loop(stop_event) -> None:
     """常驻主循环。每 30 秒看一眼哪条规则的哪个源到点了，各自独立计时。
 
@@ -426,14 +547,30 @@ def loop(stop_event) -> None:
          正在限流的源，把配额烧光而一次都没成功。
       3. 每日配额耗尽要停【全部】规则，不是只跳出当前这层循环。
     """
+    # 【只许起一个】起两个的后果不是报错，是同一个源被打两遍 —— 而且日志里
+    # 两边的行长得一模一样，看不出来。
+    if _beat["running"]:
+        log.error("轮询已经在跑了，拒绝第二个实例")
+        return
+    _beat["running"] = True
     log.info("轮询启动，数据源：%s",
              "、".join(f"{s.name}({s.key})" for s in sources.all_sources().values()))
     while not stop_event.is_set():
-        _beat["at"] = config.now()
+        _tick()
         try:
             rules = store.get_rules(enabled_only=True)
         except Exception as e:                              # noqa: BLE001 - 库抽风不该让进程死掉
             log.error("读规则失败：%s", e)
+            stop_event.wait(60)
+            continue
+
+        # 【没拿到租约就什么都不抓】别的实例在抓；本实例只保持心跳、等着接手。
+        try:
+            if not _claim():
+                stop_event.wait(30)
+                continue
+        except Exception as e:                              # noqa: BLE001 - 争不到就当没拿到
+            log.warning("争租约失败（本轮不抓）：%s", e)
             stop_event.wait(60)
             continue
 
@@ -460,6 +597,7 @@ def loop(stop_event) -> None:
         except Exception:                   # noqa: BLE001 - 循环本身永不退出
             log.exception("轮询主循环出错，本轮跳过")
         stop_event.wait(600 if halted else 30)
+    release()
     log.info("轮询停止")
 
 
@@ -477,6 +615,8 @@ def _run_round(rules, stop_event) -> bool:
         for src in sources.for_rule(rule):
             if stop_event.is_set() or halted:
                 break
+            _tick()
+            _renew()
             st = store.get_source_state(rid, src.key)
 
             # —— 成交轮（可有可无，失败绝不能影响下面的在售扫描）——

@@ -66,6 +66,19 @@ CREATE TABLE IF NOT EXISTS rule_state (
 
 
 -- 每条规则在每个数据源上的轮询进度。
+-- 【谁在轮询】多份实例（本机 + NAS）共用一个库时，只许一份真的去抓，其余待命。
+-- 2026-09-17 从 performance_schema.hosts 反查发现 NAS 上早就跑着一份，和本机各自
+-- 独立限速 —— 同一个公网 IP 下对平台的请求密度翻倍，很可能就是 メルカリ 403 频发的原因。
+-- 持有者停了（进程卡死、机器关机）租约到期，待命的那份自动接手 —— 09-15 本机
+-- 轮询线程卡死 40 小时时 NAS 碰巧接了盘，这张表把"碰巧"变成"设计"。
+CREATE TABLE IF NOT EXISTS poller_lease (
+  id         TINYINT      NOT NULL PRIMARY KEY  COMMENT '恒为 1，整张表只有一行',
+  holder     VARCHAR(64)  NOT NULL              COMMENT '当前持有者，主机名:进程号',
+  taken_at   DATETIME     NOT NULL              COMMENT '这个持有者是什么时候拿到的（续期不改它）',
+  expires_at DATETIME     NOT NULL              COMMENT '到这个时间还没续期，别的实例就可以接手。每扫完一个源续一次'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='轮询租约：多实例共库时只有一份在抓';
+
+
 -- 【和 rule_state 分开】市价中位数是跨源合并算的（一份），而轮询进度天然是每源一份：
 -- Mercari 刚扫完不代表 Yahoo 也扫完了，被限流也是各限各的。
 CREATE TABLE IF NOT EXISTS rule_source_state (

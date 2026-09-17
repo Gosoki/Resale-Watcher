@@ -42,3 +42,51 @@ def test_按钮的_props_都走常量():
 def test_同一个动作只能有一个叫法():
     """「保存」和「存」混用过：同一个动作两个名字，人会以为它们不一样。"""
     assert 'ui.button("存"' not in CODE, "保存按钮请统一写「保存」"
+
+
+def test_每个被_refresh_的视图都真的是_refreshable():
+    """装饰器挂错函数 = 整页打不开，而且只在日志里报。
+
+    2026-09-17 实际发生：`@ui.refreshable` 从 `sold_view` 挪到了取数的 `_load_sold`
+    上。取数函数不画界面，refresh() 它只会重跑 SQL 再把结果丢掉；而 `sold_view`
+    没了 `.refresh` 属性，`build_sold` 里那个「刷新」按钮在【建页签时】就要读它 ——
+    切到成交页当场 AttributeError，页签建到一半中断，用户看到的是一片空白。
+    规则页同一处错误，表现是「点保存没反应」。
+
+    这条测试静态扫出所有 `X.refresh`，要求 X 带 `@ui.refreshable`。
+    """
+    import ast  # noqa: PLC0415
+
+    tree = ast.parse(UI.read_text())
+    funcs, refreshable = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs.add(node.name)
+            if any(ast.unparse(d) == "ui.refreshable" for d in node.decorator_list):
+                refreshable.add(node.name)
+
+    bad = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and node.attr == "refresh"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in funcs and node.value.id not in refreshable):
+            bad.setdefault(node.value.id, []).append(node.lineno)
+    assert not bad, (
+        "这些函数被当成 refreshable 用了，但没带 @ui.refreshable —— "
+        f"每一处都会抛 AttributeError：{ {k: sorted(v) for k, v in bad.items()} }")
+
+
+def test_取数函数不该是_refreshable():
+    """`_load_*` 只返回数据、不画任何元素。
+
+    对它 refresh() 是个静默的空操作（重跑一遍 SQL，返回值没人接），
+    而把装饰器放在这儿，往往意味着它是从对应的 `*_view` 上挪过来的 —— 那边一挪走就炸。
+    """
+    import ast  # noqa: PLC0415
+
+    tree = ast.parse(UI.read_text())
+    bad = [n.name for n in ast.walk(tree)
+           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+           and n.name.startswith("_load_")
+           and any(ast.unparse(d) == "ui.refreshable" for d in n.decorator_list)]
+    assert not bad, f"取数函数带了 @ui.refreshable：{bad} —— 装饰器应该在画界面的那个 *_view 上"

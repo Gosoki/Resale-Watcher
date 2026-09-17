@@ -1248,7 +1248,6 @@ def _mark_row(m: dict) -> None:
 
 # ------------------------------------------------------------------ 成交页
 
-@ui.refreshable
 def _load_sold() -> dict:
     """成交页要的数据，5 条 SQL 取完（原先 14 条：每条规则 3 条）。"""
     return {"rules": store.get_rules(), "marks": store.marked_ids(),
@@ -1256,6 +1255,14 @@ def _load_sold() -> dict:
             "samples": store.sold_samples_recent(80)}
 
 
+# 【@ui.refreshable 必须挂在画界面的那个函数上，不能挂在取数的 _load_* 上】
+# 挂错的后果不是"刷新没反应"，是【整页打不开】：装饰器一走，sold_view 就是个
+# 普通函数，没有 .refresh 属性，而 build_sold 里那个「刷新」按钮在【建页签的时候】
+# 就要读 sold_view.refresh —— 于是切到成交页当场抛 AttributeError，页签建到一半
+# 中断，页面上一片空白，而错误只在 journal 里。实际发生过（2026-09-17）。
+# 取数函数不画任何东西，对它 refresh() 只会重跑一遍 SQL 再把结果丢掉，永远不重画。
+# 对照 _load_hits / hits_view：那一对是对的，照着写。
+@ui.refreshable
 def sold_view() -> None:
     """成交页：市场实际用什么价把什么货清掉了。
 
@@ -1313,6 +1320,16 @@ def sold_view() -> None:
                          f"{rule['sold_scan_hours']} 小时跑一次，跑过之后这里才有东西。"
                          ).classes("text-gray-400 text-sm")
                 continue
+
+            if not tracked:
+                # 【没有「跟到成交」的时候也要说一句话】成交样本只汇总进上面那行摘要
+                # （它们只有价格和时间，逐条列出来没有信息量），所以这一块会整个空掉 ——
+                # 展开一个空盒子，看起来和"页面坏了"一模一样，而它其实是正常状态。
+                ui.label(f"这 {len(samples)} 件成交样本只有价格和时间（成交轮按标题级规则"
+                         "扫来的，没拉详情），所以只汇总在上面那一行。"
+                         "下面这一块列的是「跟到成交」的商品 —— 要走完"
+                         "「一直在跟 → 从搜索结果消失 → 对账确认售出」才算，攒得慢。"
+                         ).classes("text-sm text-gray-400 mt-1")
 
             if tracked:
                 ui.label("我们一路跟到成交的（拉过详情、过了完整规则，信息最全）") \
@@ -1642,13 +1659,17 @@ def confirm_delete(rule: dict, host=None) -> None:
     dlg.open()
 
 
-@ui.refreshable
 def _load_rules() -> dict:
     """规则页要的数据，4 条 SQL 取完（原先 33 条：每条规则 2 条 + 每个源 2 条）。"""
     return {"rules": store.get_rules(), "states": store.rule_states(),
             "sstates": store.source_states(), "counts": store.item_counts()}
 
 
+# 装饰器挂在画界面的这个函数上，理由见 sold_view 那里。规则页的「刷新」不在建页签时
+# 读 .refresh，所以它不像成交页那样当场空白 —— 它的表现是【保存/删除规则之后页面不更新】：
+# 四处 rules_view.refresh() 全部抛 AttributeError 被 NiceGUI 吞进日志，
+# 你看到的是"点了保存什么都没发生"。
+@ui.refreshable
 def rules_view(host=None) -> None:
     # 「新建规则」已经移到页面顶上的 toolbar 里，这里只列规则卡片
     d = _load_rules()

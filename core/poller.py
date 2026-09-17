@@ -19,6 +19,7 @@ import logging
 import os
 import random
 import socket
+import threading
 from datetime import timedelta
 
 import config
@@ -36,6 +37,29 @@ DESC_UNREAD = "(描述未读到)"
 # 没有它的话，线程静默死掉后进程照常在跑、面板照常打开、旧数据照常显示，
 # 只有「上次扫描」那个时间戳冻在死亡那一刻，而界面上没有任何地方说这不正常。
 _beat: dict = {"at": None, "running": False, "holder": None}
+
+# 【扫描闸：后台轮询和面板的手动动作不许同时扫】各源的 _lock 只把单个 HTTP 请求
+# 串起来，编排层原先零互斥：面板点「一键抓取」时后台一轮正在跑，两边交错着到达
+# 对账，都在对方 touch_seen 落库前算出同一份 missing → 同一批商品各拉一遍详情。
+# 实测日志里 7 例同一规则×源在几十秒内被扫两遍，而 quick_min 是 7〜30 分钟。
+# 后台 try-acquire 拿不到就跳过本轮（面板在忙，让它先）；面板等最多几秒，
+# 拿不到就告诉人「后台正在扫」—— 闷头阻塞的话面板只会静默卡住。
+SCAN_LOCK = threading.Lock()
+MANUAL_WAIT_SEC = 5
+
+
+class ScanBusy(Exception):
+    """后台正在扫描，手动动作没拿到扫描闸。面板拿它弹提示。"""
+
+
+def manual(fn, *args, **kwargs):
+    """面板的手动动作走这里：等最多 MANUAL_WAIT_SEC 秒拿扫描闸，拿不到就抛 ScanBusy。"""
+    if not SCAN_LOCK.acquire(timeout=MANUAL_WAIT_SEC):
+        raise ScanBusy("后台正在扫描，等它这一轮过去再点（一般几十秒）")
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        SCAN_LOCK.release()
 # 本实例在租约表里的名字。主机名 + 进程号：同一台机器起两个进程也分得开。
 ME = f"{socket.gethostname()}:{os.getpid()}"
 
@@ -106,14 +130,45 @@ def _due(last, interval_min: float) -> bool:
 
 # ------------------------------------------------------------------ 1+2. 扫在售
 
+# 【同关键词的搜索页复用】key = (源, 关键词, 是否成交搜索)；值 = (拿到的时间, 翻这一批的规则 id,
+# 整段页序列, 是否没翻全)。只复用【别的规则】翻的：一条规则永远不会复用自己上一轮的 ——
+# 否则 quick_min 就名存实亡了。
+# 【只缓存翻完整的一批】翻到一半抛了异常（限流）什么都不存：残缺的页序列会让下一条规则的
+# seen 集缺一大截，对账立刻把几十件在售商品判成失踪、拉详情、甚至误标 gone ——
+# 这正是 scan_on_sale 里 truncated 那道闸在防的事，只是换了个入口。
+_page_cache: dict[tuple, tuple] = {}
+
+
+def _pages(src, rule: dict, *, sold: bool) -> tuple[list[dict], bool]:
+    """翻完这条规则要的全部搜索页，返回 (页序列, 是否没翻全)。带复用，理由见上面。"""
+    reuse = store.get_settings().get("search_reuse_min") or 0
+    key = (src.key, (rule.get("keyword") or "").strip(), sold)
+    if reuse:
+        hit = _page_cache.get(key)
+        if hit and hit[1] != rule["id"] and (config.now() - hit[0]) < timedelta(minutes=reuse):
+            return hit[2], hit[3]
+    pages, token = [], ""
+    for _ in range(rule["max_pages"]):
+        page = src.search(rule["keyword"], sold=sold, page_token=token)
+        pages.append(page)
+        token = page["next"]
+        if not token:
+            break
+    truncated = bool(token)
+    if reuse:
+        _page_cache[key] = (config.now(), rule["id"], pages, truncated)
+        cutoff = config.now() - timedelta(minutes=reuse)
+        for k in [k for k, v in _page_cache.items() if v[0] < cutoff]:
+            del _page_cache[k]
+    return pages, truncated
+
+
 def scan_on_sale(src, rule: dict) -> dict:
     rid = rule["id"]
     seen: set[str] = set()
     stat = {"total": 0, "new": 0, "price_down": 0, "pages": 0}
-    token = ""
-
-    for _ in range(rule["max_pages"]):
-        page = src.search(rule["keyword"], page_token=token)
+    pages, truncated = _pages(src, rule, sold=False)
+    for page in pages:
         stat["total"] = page["total"]
         stat["pages"] += 1
         for snap in page["items"]:
@@ -133,11 +188,7 @@ def scan_on_sale(src, rule: dict) -> dict:
                 stat["price_down"] += 1
                 log.info("[%s] 降价 %s ¥%s → ¥%s  %s", src.key, snap["item_id"],
                          f"{res['old_price']:,}", f"{snap['price']:,}", snap["name"][:40])
-        token = page["next"]
-        if not token:
-            break
 
-    truncated = bool(token)
     if truncated:
         log.warning("[%s] 规则「%s」在售 %d 件，%d 页没扫全 —— 本轮跳过售出对账"
                     "（没扫全时「没出现」不等于「卖掉了」）。到设置页调大 max_pages 或收窄关键词。",
@@ -153,9 +204,14 @@ def scan_on_sale(src, rule: dict) -> dict:
 def reconcile_sold(src, rule: dict, seen: set[str]) -> None:
     """库里还标在售、这轮却没扫到的商品：卖了？下架了？还是只是漏翻了一页？"""
     rid = rule["id"]
-    cutoff = config.now() - timedelta(minutes=rule["missing_grace_min"])
+    grace = config.now() - timedelta(minutes=rule["missing_grace_min"])
+    # 【交易中的用长得多的间隔】trading 的商品不会出现在在售搜索里，所以每轮都"失踪"，
+    # 按 missing_grace_min 每 20 分钟拉一次详情 —— 而它从付款到确认成交常常要几天。
+    # 实测稳态失踪队列几乎全是 trading，一天白拉上百次。
+    trade = config.now() - timedelta(minutes=rule.get("trading_recheck_min") or rule["missing_grace_min"])
     missing = [it for it in store.on_sale_items(rid, src.key)
-               if it["item_id"] not in seen and it["last_seen_at"] < cutoff]
+               if it["item_id"] not in seen
+               and it["last_seen_at"] < (trade if it.get("status") == "trading" else grace)]
 
     budget = rule["detail_budget"]
     checked = 0
@@ -163,6 +219,9 @@ def reconcile_sold(src, rule: dict, seen: set[str]) -> None:
         if budget <= 0:
             break
         iid = it["item_id"]
+        # 【拉不到详情的不占预算、不 touch】理由见 Source.can_detail
+        if not src.can_detail(iid):
+            continue
         budget -= 1
         checked += 1
         d = src.detail(iid)
@@ -174,18 +233,24 @@ def reconcile_sold(src, rule: dict, seen: set[str]) -> None:
         # 攒够 detail_budget 个这种僵尸就会把预算吃光，真正卖掉的商品永远轮不到核实，
         # 最后烧穿每日配额导致全源停抓。审查里有 8 条独立发现都指向这一处。
         store.touch_seen(src.key, iid, rid)
+        if d["status"] == "on_sale":
+            # 【核实到还在售，也把详情里的价格/出价数写回】原先只 touch：last_seen_at 是新的、
+            # 「失联」不亮，价格却还是上次搜索到它那一刻的 —— 「失联」徽标的前提
+            # （touch = 拿到了新数据）不成立。追踪刷新那条路早就是这么做的。
+            store.update_tracked(src.key, iid, rid, d, it.get("price") or 0)
         if d["status"] == "sold_out":
             now = config.now()
-            store.set_status(src.key, iid, rid, "sold_out", sold_at=now)
+            store.set_status(src.key, iid, rid, "sold_out", sold_at=now, price=d["price"])
             # 【价格读不到就别进样本】0 进了 sold_sample 会把中位数往下拽，而中位数是
             # 捡漏线的全部依据。状态和价格来自两条不同的解析路径（フリマ 的已售出页
             # 只剩 schema.org 块），能读到"卖掉了"不代表能读到"多少钱卖的"。
             if it["matched"] and d["price"] > 0:
                 # 我们一路跟到成交的商品：拉过详情、过了完整规则，是最可信的市价样本
                 store.add_sold_sample(rid, src.key, iid, d["price"], now, "tracked")
+                store.refresh_median(rid)     # 别等 24 小时后的成交轮，最准的样本进来了就算
             log.info("[%s] 售出 %s ¥%s", src.key, iid, f"{d['price']:,}" if d["price"] else "?")
         elif d["status"] == "trading":
-            store.set_status(src.key, iid, rid, "trading")
+            store.set_status(src.key, iid, rid, "trading", price=d["price"])
         elif d["status"] == "gone":
             # ヤフオク 的流标拍卖（结束了但一次出价都没有）。漏掉这个分支的话，
             # 它既不进 sold_out 也不进 trading，落到最后什么都不做 —— 而它
@@ -317,15 +382,15 @@ def scan_sold(src, rule: dict) -> dict:
     # 成交价不是紧急数据，失败就等下一个周期，比无限重试安全得多。
     store.update_source_state(rid, src.key, last_sold_at=config.now())
     price_rule = dict(rule, price_max=0)
-    token, added = "", 0
+    added = 0
     # 各家的成交检索都不是按【成交时间】排序的，翻回来的样本时间跨度很大
     # （实测 Mercari 5 页 331 件里只有 15 件是近 30 天成交的）。窗口外的直接跳过：
     # 写进去也会被 prune_sold_samples 立刻删掉，白写一趟。
     cutoff = config.now() - timedelta(days=rule["median_window_days"])
 
     seen_sold: dict[str, object] = {}       # item_id -> 平台给的成交时间
-    for _ in range(rule["max_pages"]):
-        page = src.search(rule["keyword"], sold=True, page_token=token)
+    pages, _ = _pages(src, rule, sold=True)
+    for page in pages:
         for snap in page["items"]:
             seen_sold[snap["item_id"]] = snap["updated_at_src"]
             if not judge_snap(price_rule, snap)["matched"]:
@@ -340,9 +405,6 @@ def scan_sold(src, rule: dict) -> dict:
             # sample_kind='scan' 就是在标记这一点；我们自己跟到成交的那些是 'tracked'，更准。
             store.add_sold_sample(rid, src.key, snap["item_id"], snap["price"], sold_at, "scan")
             added += 1
-        token = page["next"]
-        if not token:
-            break
 
     # 【搜到的已售出商品，库里还标在售的，就地改成 sold_out】这些页本来就要翻，
     # 一个请求都不多发。原先卖掉只能靠对账逐件拉详情确认（每轮 detail_budget 件），
@@ -394,18 +456,32 @@ def refresh_tracked(force: bool = False) -> int:
         # daily_request_limit，它谁也绕不过，这里不需要第二道。
         rows = store.tracked_due(0, len(store.tracked_items()))
     else:
-        rows = store.tracked_due(s["track_min"], s["track_budget"])
+        rows = store.tracked_due(s["track_min"], s["track_budget"], s.get("trading_recheck_min"))
     if not rows:
         return 0
     done = 0
+    cooled: set[str] = set()            # 本轮已经被限流的源，剩下的件留到下一轮
+    left: dict[str, int] = {}
     for r in rows:
         src = sources.get(r["source"])
-        if src is None:
+        if src is None or not src.can_detail(r["item_id"]):
+            continue                    # 拉不到详情的（メルカリShops）：不发请求、不 touch
+        if r["source"] in cooled:
+            left[r["source"]] = left.get(r["source"], 0) + 1
             continue
         try:
             d = src.detail(r["item_id"])
         except sources.DailyLimitReached:
             raise                       # 配额耗尽要一路抛到主循环，停掉所有活儿
+        except sources.RateLimited as e:
+            log.warning("[%s] 追踪刷新 %s 失败：%s", r["source"], r["item_id"], e)
+            # 【真限流才 cool 整个源】RateLimited 的契约是"结束本轮，别重试"，
+            # 而这里原先接住之后接着刷同源下一件 —— 一件 60 秒退避刚睡完就再撞一次。
+            # 只认 backed_off 那种（base.py 睡过退避的）；单件性质的失败照旧只跳那一件，
+            # 否则一件长期坏掉的商品会每轮把整个源 cool 掉，同源别的从此刷不到。
+            if getattr(e, "backed_off", False):
+                cooled.add(r["source"])
+            continue
         except Exception as e:          # noqa: BLE001 - 单件失败不该拖垮整批
             log.warning("[%s] 追踪刷新 %s 失败：%s", r["source"], r["item_id"], e)
             continue
@@ -423,6 +499,15 @@ def refresh_tracked(force: bool = False) -> int:
             log.info("[%s] 追踪中的「%s」%s ¥%s —— 结果留在追踪页，不再刷新",
                      r["source"], r["name"][:30],
                      "卖掉了" if d["status"] == "sold_out" else "下架了", f"{d['price']:,}")
+            # 【追踪确认的成交是最准的样本】拉过详情、过了完整规则、价格是接口给的最终价。
+            # 对账那边（reconcile_sold）一直在记，这里原先漏了 —— 你亲手盯到成交的
+            # 那几件反而没进中位数。价格读不到的不记，理由同对账。
+            if d["status"] == "sold_out" and r.get("matched") and d["price"] > 0:
+                store.add_sold_sample(r["rule_id"], r["source"], r["item_id"],
+                                      d["price"], config.now(), "tracked")
+                store.refresh_median(r["rule_id"])
+    for src_key, n in left.items():
+        log.warning("[%s] 被限流，本轮剩下的 %d 件留到下一轮", src_key, n)
     if done:
         log.info("追踪刷新 %d 件（追踪中共 %d 件，每轮上限 %d）",
                  done, len(store.tracked_items()), s["track_budget"])
@@ -575,28 +660,42 @@ def loop(stop_event) -> None:
             continue
 
         halted = False                      # 当天配额已耗尽：停掉所有规则所有源
-        # 【整块包一层】下面 get_source_state / update_source_state 本身也会抛
-        # （数据库短暂拒连就够了），而它们不在任何 try 里 —— 异常会逐层逃出
-        # while 循环，daemon 线程静默死亡，此后再也不抓任何东西。
-        # 【放在整轮扫描之前】一轮要遍历 4 条规则 × 3 个源、每个请求还要等 3~8 秒，
-        # 跑满可能要几分钟。追踪刷新排在后面的话，"更新快"就无从谈起了。
+        # 【面板正在手动抓取就让它先】理由见 SCAN_LOCK。try-acquire 不等：
+        # 等的话心跳会停，面板就要报「轮询已停止」了。
+        if not SCAN_LOCK.acquire(timeout=0):
+            log.info("面板正在手动抓取，本轮让开")
+            stop_event.wait(30)
+            continue
         try:
-            refresh_tracked()
-        except sources.DailyLimitReached as e:
-            log.warning("%s —— 今天不再发请求，等跨日", e)
-            halted = True
-        except Exception:                   # noqa: BLE001 - 追踪坏了不该拖垮主循环
-            log.exception("追踪刷新出错，本轮跳过")
+            # 【整块包一层】下面 get_source_state / update_source_state 本身也会抛
+            # （数据库短暂拒连就够了），而它们不在任何 try 里 —— 异常会逐层逃出
+            # while 循环，daemon 线程静默死亡，此后再也不抓任何东西。
+            # 【放在整轮扫描之前】一轮要遍历 4 条规则 × 3 个源、每个请求还要等 3~8 秒，
+            # 跑满可能要几分钟。追踪刷新排在后面的话，"更新快"就无从谈起了。
+            try:
+                refresh_tracked()
+            except sources.DailyLimitReached as e:
+                log.warning("%s —— 今天不再发请求，等跨日", e)
+                halted = True
+            except Exception:               # noqa: BLE001 - 追踪坏了不该拖垮主循环
+                log.exception("追踪刷新出错，本轮跳过")
 
-        try:
-            # 【必须接住返回值】它返回「当天配额是否已耗尽」，原先这里丢掉了，
-            # 于是 halted 恒为 False，下面那句「耗尽就睡 10 分钟」从来没生效过：
-            # 配额满了之后照样每 30 秒空转一轮，每轮都把所有规则所有源重走一遍
-            # 才在第一个请求处被 _check_quota 拦下。
-            halted = _run_round(rules, stop_event) or halted
-        except Exception:                   # noqa: BLE001 - 循环本身永不退出
-            log.exception("轮询主循环出错，本轮跳过")
-        stop_event.wait(600 if halted else 30)
+            try:
+                # 【必须接住返回值】它返回「当天配额是否已耗尽」，原先这里丢掉了，
+                # 于是 halted 恒为 False，下面那句「耗尽就睡 10 分钟」从来没生效过：
+                # 配额满了之后照样每 30 秒空转一轮，每轮都把所有规则所有源重走一遍
+                # 才在第一个请求处被 _check_quota 拦下。
+                halted = _run_round(rules, stop_event) or halted
+            except Exception:               # noqa: BLE001 - 循环本身永不退出
+                log.exception("轮询主循环出错，本轮跳过")
+        finally:
+            SCAN_LOCK.release()
+        # 【配额耗尽睡 10 分钟也要跳心跳】不跳的话顶栏判成「轮询已停止」、
+        # 看门狗还会往手机推「多半是数据库卡死」—— 而其实只是在等跨日。
+        for _ in range(20 if halted else 1):
+            if stop_event.wait(30):
+                break
+            _tick()
     release()
     log.info("轮询停止")
 

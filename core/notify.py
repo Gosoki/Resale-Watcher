@@ -58,15 +58,46 @@ def deadline(end) -> str:
 def compose(rule: dict, row: dict, median: int | None, final: bool = False) -> str:
     """一条提醒的正文。手机通知栏只看得见前两行，所以最要紧的信息必须在最前面。
 
-    final=True 是「快结束提醒」，也就是这件商品的第二条。头一个词必须换掉：
-    两条正文其余部分几乎一模一样，不换的话你会以为是同一条重复推送、顺手划掉。
+    【价格在第一行】原先第一行是「🟢 捡漏 | 规则名」、价格在第三行 —— 通知栏里
+    正好看不到那个决定你要不要点开的数。现在第一行就是「头 + 价格 + 为什么算」。
+
+    【手动价判出来的捡漏，理由要写"低于手动线"】它的市价百分比可能是 114%，
+    写成「捡漏 …市价的 114%」在手机上读起来自相矛盾 —— 百分比只当参考放第三行。
+
+    final=True 是「快结束提醒」，也就是这件商品的第二条；再跌够 notify_redrop_pct
+    的是「📉 再降」。头一个词必须和第一条不一样：其余部分几乎一模一样，不换的话
+    你会以为是重复推送、顺手划掉。
     """
-    head = "⏰ 捡漏快结束" if final else ("🟢 捡漏" if row["is_deal"] else "命中")
-    lines = [f"{head} | {rule['name']}", row["name"][:60], f"¥{row['price']:,}"]
-    if row.get("deal_pct"):
-        tail = f"（市价的 {row['deal_pct']}%"
-        tail += f"，中位 ¥{median:,}）" if median else "）"
-        lines[2] += tail
+    price, pct = row["price"], row.get("deal_pct")
+    manual = rule.get("deal_price") or 0
+    redrop = bool(row.get("notified_price")) and row["notified_price"] > price
+    if final:
+        head = "⏰ 捡漏快结束"
+    elif redrop:
+        head = "📉 再降"
+    elif row["is_deal"]:
+        head = "🟢 捡漏"
+    else:
+        head = "命中"
+
+    if redrop:
+        why = f"比上次推送低 ¥{row['notified_price'] - price:,}"
+    elif row["is_deal"] and manual:
+        why = f"低于手动线 ¥{manual:,}"
+    elif pct:
+        why = f"市价的 {pct}%"
+    else:
+        why = ""
+    lines = [f"{head} ¥{price:,}" + (f" · {why}" if why else "") + f" | {rule['name']}",
+             row["name"][:60]]
+
+    ref = []
+    if (redrop or (row["is_deal"] and manual)) and pct:
+        ref.append(f"市价的 {pct}%")
+    if median:
+        ref.append(f"中位 ¥{median:,}")
+    if ref:
+        lines.append(" · ".join(ref))
     if row.get("bid_count") is not None:
         # 拍卖的"当前价"只在此刻成立。不写这句，推送就是在误导人 ——
         # 和面板上那条竞价提示是同一个理由。
@@ -107,18 +138,31 @@ def render(template: str, text: str, thumb: str = "") -> str:
     return template.replace("{text}", esc(text)).replace("{thumb}", esc(thumb))
 
 
+class PushFailed(RuntimeError):
+    """推送没发出去。transient=True 是瞬时的（429 / 5xx / 网络），下一轮该再试；
+    False 是地址本身有问题（404 / 401 / 400 模板错），再试也是一样，标已推别再烦。"""
+
+    def __init__(self, msg: str, transient: bool):
+        super().__init__(msg)
+        self.transient = transient
+
+
 def post(url: str, template: str, text: str, thumb: str = "") -> None:
-    """发一条。失败只记日志，绝不向上抛 —— 推送坏了不该影响抓取。"""
-    if template.strip():
-        r = httpx.post(url, content=render(template, text, thumb).encode(),
-                       headers={"content-type": "application/json", "user-agent": UA},
-                       timeout=TIMEOUT)
-    else:
-        r = httpx.post(url, content=text.encode(),
-                       headers={"content-type": "text/plain; charset=utf-8", "user-agent": UA},
-                       timeout=TIMEOUT)
+    """发一条。失败抛 PushFailed；调用方决定标不标已推。"""
+    try:
+        if template.strip():
+            r = httpx.post(url, content=render(template, text, thumb).encode(),
+                           headers={"content-type": "application/json", "user-agent": UA},
+                           timeout=TIMEOUT)
+        else:
+            r = httpx.post(url, content=text.encode(),
+                           headers={"content-type": "text/plain; charset=utf-8", "user-agent": UA},
+                           timeout=TIMEOUT)
+    except httpx.HTTPError as e:
+        raise PushFailed(f"网络错误：{e}", transient=True) from e
     if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code} {r.text[:120]}")
+        raise PushFailed(f"HTTP {r.status_code} {r.text[:120]}",
+                         transient=(r.status_code == 429 or r.status_code >= 500))
 
 
 def push_new(rule: dict) -> int:
@@ -144,7 +188,8 @@ def push_new(rule: dict) -> int:
     if not url:
         return 0
 
-    rows = store.pending_notify(rule["id"], only_deal=(s.get("notify_on") != "matched"))
+    rows = store.pending_notify(rule["id"], only_deal=(s.get("notify_on") != "matched"),
+                                redrop_pct=s.get("notify_redrop_pct") or 0)
     mins = s.get("notify_final_min") or 0
     final = store.pending_final(rule["id"], mins) if mins else []
 
@@ -173,6 +218,7 @@ def push_new(rule: dict) -> int:
     # 【两批合成一个队列再发】GAP 是按"上一条发出去多久"算的，分两个循环的话
     # 第二批的头一条不会等，两条会挤在同一秒里出去 —— 正好撞上 Slack 的 1 条/秒。
     queue = [(r, False) for r in rows] + [(r, True) for r in final]
+    retry_later: list = []                  # 瞬时失败的：这一轮不标，下一轮再试
     for i, (row, is_final) in enumerate(queue):
         if i:                               # 第一条不用等
             time.sleep(GAP)
@@ -181,11 +227,18 @@ def push_new(rule: dict) -> int:
                  row.get("thumb_url") or "")
             sent += 1
         except Exception as e:              # noqa: BLE001 - 推送坏了不该影响抓取
-            # 【失败也标已推，不重试】一条迟到一小时的提醒没有意义，
+            # 【地址本身坏了（404/401/400）：标已推、不重试】一条迟到一小时的提醒没有意义，
             # 而对着挂掉的地址每轮重试会一直拖慢抓取，还把日志刷满。
-            log.warning("推送失败（本条不再重试）：%s", e)
-    store.mark_notified(rows)
-    store.mark_final_notified(final)
+            # 【瞬时的（429 / 5xx / 网络抖动）：不标，下一轮再试】Slack 抽风五分钟
+            # 就把那件捡漏永久丢掉，太亏；每轮最多 notify_max_per_round 条，重试不会失控。
+            who = f"[{row['source']} {row['item_id']}] {row['name'][:40]}"
+            if getattr(e, "transient", False):
+                retry_later.append(id(row))
+                log.warning("推送失败（瞬时，下一轮再试）%s：%s", who, e)
+            else:
+                log.warning("推送失败（本条不再重试）%s：%s", who, e)
+    store.mark_notified([r for r in rows if id(r) not in retry_later])
+    store.mark_final_notified([r for r in final if id(r) not in retry_later])
     if sent:
         log.info("规则「%s」推送 %d 条%s", rule["name"], sent,
                  f"（含快结束提醒 {len(final)} 条）" if final else "")

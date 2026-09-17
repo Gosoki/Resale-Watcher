@@ -41,7 +41,7 @@ SEARCH_HTML = '''
      data-auction-category="2084211540"
      data-auction-title="ASUS ROG ASTRAL RTX 5090 OC"
      data-auction-img="https://auc-pctr.c.yimg.jp/i/y.jpg"
-     data-auction-price="1000000" data-auction-buynowprice="1100000"
+     data-auction-price="1000000" data-auction-buynowprice="1000000"
      data-auction-endtime="1800086400" data-auction-startprice="1000000"
      data-auction-isshoppingitem="1" data-auction-auc-seller-id="seller_dummy_b"></a>
   </div>
@@ -127,7 +127,7 @@ def test_解析出完整的拍卖字段():
 def test_一口价和商家标记():
     src = YahooAuction()
     it = src._parse(_blocks(SEARCH_HTML)[1])
-    assert it["buy_now_price"] == 1100000
+    assert it["buy_now_price"] == 1100000       # 商家品：搜索页给的 1,000,000 是税抜 → 税込 1,100,000
     assert it["bid_count"] is None
     assert it["item_type"] == "shop"            # isshoppingitem 非空
 
@@ -231,3 +231,17 @@ def test_详情价必须取税込_不是税抜():
     assert 'item.get("taxinPrice")' in src, "detail() 必须优先取税込价"
     # 兜底顺序：taxinPrice 优先，没有才退回 price
     assert src.index('taxinPrice') < src.index('or item.get("price")')
+
+
+def test_商家一口价换算成税込_个人出品的不动():
+    """实测 5 件商家品全部 buynow × 110 // 100 == 税込一口价（909,091 → 1,000,000）。
+    个人出品的 buynowprice 本来就是税込，不许动。round 会多 1 日元，要整数除。"""
+    from sources.yahoo_auction import YahooAuction
+    src = YahooAuction.__new__(YahooAuction)
+    shop = ('<a data-auction-id="s1" data-auction-title="t" data-auction-price="938300" '
+            'data-auction-buynowprice="909091" data-auction-isshoppingitem="1" '
+            'data-auction-endtime="0" data-auction-category="0" data-auction-img="" '
+            'data-auction-auc-seller-id="x"></a>')
+    user = shop.replace('data-auction-id="s1"', 'data-auction-id="u1"').replace('isshoppingitem="1"', 'isshoppingitem=""')
+    assert src._parse(shop)["buy_now_price"] == 1_000_000
+    assert src._parse(user)["buy_now_price"] == 909_091

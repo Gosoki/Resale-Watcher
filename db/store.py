@@ -175,7 +175,11 @@ def plan_schema_changes(want: dict, have: dict) -> tuple[list, list]:
         t = re.match(r"\w+\s+(\S+)", definition)
         type_differs = bool(t) and t.group(1).lower() != cur["type"]
         if comment_differs or type_differs:
-            mods.append((table, col, definition))
+            # 【MODIFY 必须剥掉 inline PRIMARY KEY】app_setting.k、poller_lease.id 这种
+            # 定义里带 "PRIMARY KEY" 的列，原样拼进 MODIFY COLUMN 会报
+            # "Multiple primary key defined" —— 而这句跑在启动路径上，等于改一句
+            # 注释就让进程起不来。主键本身不会变，MODIFY 只管类型和注释。
+            mods.append((table, col, re.sub(r"\s+PRIMARY KEY\b", "", definition)))
     return adds, mods
 
 
@@ -454,6 +458,12 @@ def hidden_items() -> list[dict]:
     return query("SELECT * FROM hidden_item ORDER BY hidden_at DESC")
 
 
+def mark_note_of(source: str, item_id: str) -> str:
+    """这条标记的备注；没标记过就是空串。取消标记前问一句用。"""
+    row = one("SELECT note FROM marked_item WHERE source = %s AND item_id = %s", (source, item_id))
+    return (row or {}).get("note") or ""
+
+
 def marked_ids() -> set[tuple[str, str]]:
     """已标记的 (source, item_id) 集合。
 
@@ -557,6 +567,69 @@ def lease_holder() -> str | None:
     if not row or row["expires_at"] < config.now():
         return None
     return row["holder"]
+
+
+# ---------------------------------------------------------------- 面板整页一次取回
+# 【为什么要这一组】面板的每一页原先都是「每条规则一条 SQL、每个源再一条」——
+# 规则页 33 条、命中页 19 条、成交页 14 条。库在远程，每条 SQL 一次往返，
+# 页面的时间几乎全花在往返上。这里每张表整份取回，页面在 Python 里按规则分。
+# 【缺行要给默认值】rule_state / rule_source_state 是 poller 第一次扫到才补的，
+# 新建一条规则、还没扫过就打开页面，字典里就是没有它 —— 渲染处不许直接下标。
+# 【别拿这些替掉 get_state / get_source_state】那两个带 INSERT IGNORE 副作用，
+# poller 的 update_* 靠它们保证行存在；这里只是面板读，不该顺手去写。
+STATE_DEFAULT = {"median_price": None, "sample_count": 0}
+SOURCE_STATE_DEFAULT = {"last_scan_at": None, "last_sold_at": None, "last_total": 0,
+                        "truncated": 0, "last_error": ""}
+
+
+def rule_states() -> dict[int, dict]:
+    return {r["rule_id"]: r for r in query("SELECT * FROM rule_state")}
+
+
+def source_states() -> dict[tuple[int, str], dict]:
+    return {(r["rule_id"], r["source"]): r for r in query("SELECT * FROM rule_source_state")}
+
+
+def item_counts() -> dict[tuple[int, str], dict]:
+    """每个 (规则, 源) 的入库数和在售命中数。SUM 回来的是 Decimal，这里就转成 int。"""
+    return {(r["rule_id"], r["source"]): {"t": int(r["t"] or 0), "h": int(r["h"] or 0)}
+            for r in query("SELECT rule_id, source, COUNT(*) t, "
+                           "SUM(matched = 1 AND status = 'on_sale') h "
+                           "FROM item GROUP BY rule_id, source")}
+
+
+def first_seen_by_rule() -> dict[int, object]:
+    """每条规则库里最早的 first_seen_at —— 命中页判「冷启动」用。"""
+    return {r["rule_id"]: r["m"] for r in
+            query("SELECT rule_id, MIN(first_seen_at) m FROM item GROUP BY rule_id")}
+
+
+def live_matched() -> list[dict]:
+    """全部在售命中，按规则分块、块内按「市价的百分比」升序 —— 命中页规则组直接用。
+    捡漏汇总要跨规则重排，调用方自己 sort。"""
+    return query("SELECT * FROM item WHERE matched = 1 AND status = 'on_sale' "
+                 "ORDER BY rule_id, COALESCE(deal_pct, 999), price")
+
+
+def sold_tracked_all() -> dict[int, list[dict]]:
+    """跟到成交的（matched=1 且 sold_out），按规则分。"""
+    out: dict[int, list[dict]] = {}
+    for r in query("SELECT * FROM item WHERE status = 'sold_out' AND matched = 1 "
+                   "ORDER BY rule_id, sold_at DESC"):
+        out.setdefault(r["rule_id"], []).append(r)
+    return out
+
+
+def sold_samples_recent(per_rule: int = 80) -> dict[int, list[dict]]:
+    """每条规则最近 per_rule 条成交样本，一条 SQL（窗口函数，MySQL 8+）。"""
+    out: dict[int, list[dict]] = {}
+    for r in query("SELECT rule_id, source, price, sold_at, sample_kind FROM ("
+                   "  SELECT rule_id, source, price, sold_at, sample_kind, "
+                   "         ROW_NUMBER() OVER (PARTITION BY rule_id ORDER BY sold_at DESC) rn "
+                   "  FROM sold_sample) t WHERE rn <= %s ORDER BY rule_id, sold_at DESC",
+                   (per_rule,)):
+        out.setdefault(r["rule_id"], []).append(r)
+    return out
 
 
 def get_source_state(rule_id: int, source: str) -> dict:
@@ -669,7 +742,8 @@ def set_deal(source: str, item_id: str, rule_id: int, is_deal: int, deal_pct: in
 TERMINAL = ("sold_out", "gone")
 
 
-def set_status(source: str, item_id: str, rule_id: int, status: str, sold_at=None) -> None:
+def set_status(source: str, item_id: str, rule_id: int, status: str, sold_at=None,
+               price=None) -> None:
     """改状态。
 
     【进终态不摘追踪】卖掉/下架的商品会【留在追踪页上】。你盯一件东西盯了几天，
@@ -678,14 +752,16 @@ def set_status(source: str, item_id: str, rule_id: int, status: str, sold_at=Non
     不刷新它们是另一回事：tracked_due 只挑 on_sale/trading，终态的一个请求都不会再发，
     所以留着不花任何代价。
     """
-    if sold_at is None:
-        execute("UPDATE item SET status = %s "
-                "WHERE source = %s AND item_id = %s AND rule_id = %s",
-                (status, source, item_id, rule_id))
-    else:
-        execute("UPDATE item SET status = %s, sold_at = %s "
-                "WHERE source = %s AND item_id = %s AND rule_id = %s",
-                (status, sold_at, source, item_id, rule_id))
+    # 【读到价就一起写回】对账拉详情确认售出时，接口给的是最终成交价；不写回的话
+    # item.price 停在它在售时的旧值，成交页上的价格/百分比/「曾是捡漏」全是旧的。
+    sets, args = ["status = %s"], [status]
+    if sold_at is not None:
+        sets.append("sold_at = %s"); args.append(sold_at)
+    if price:
+        sets.append("price = %s"); args.append(int(price))
+    execute(f"UPDATE item SET {', '.join(sets)} "
+            "WHERE source = %s AND item_id = %s AND rule_id = %s",
+            (*args, source, item_id, rule_id))
 
 
 def set_tracked(source: str, item_id: str, rule_id: int, on: bool) -> None:
@@ -712,7 +788,7 @@ def tracked_items(rule_id: int | None = None) -> list[dict]:
                  (rule_id,))
 
 
-def tracked_due(track_min: int, limit: int) -> list[dict]:
+def tracked_due(track_min: int, limit: int, trading_min: int | None = None) -> list[dict]:
     """该刷新的追踪商品。
 
     【用 last_seen_at 判到点，不另开一列】它的语义是「最后一次拿到这件商品的新数据」，
@@ -723,10 +799,14 @@ def tracked_due(track_min: int, limit: int) -> list[dict]:
     已经卖掉/下架的不再刷新：状态是终态了，再拉也不会变 —— 但它们【仍然留在
     追踪页上】，只是不花请求。
     """
-    return query("SELECT source, item_id, rule_id, price, name FROM item "
+    # 【交易中的按 trading_min 算】它的详情几天都不会变，按 track_min 每 5 分钟拉一次是白烧
+    now = config.now()
+    return query("SELECT source, item_id, rule_id, price, name, matched FROM item "
                  f"WHERE tracked_at IS NOT NULL AND status IN {LIVE} "
-                 "AND last_seen_at < %s ORDER BY last_seen_at ASC LIMIT %s",
-                 (config.now() - timedelta(minutes=track_min), limit))
+                 "AND last_seen_at < CASE WHEN status = 'trading' THEN %s ELSE %s END "
+                 "ORDER BY last_seen_at ASC LIMIT %s",
+                 (now - timedelta(minutes=trading_min or track_min),
+                  now - timedelta(minutes=track_min), limit))
 
 
 def update_tracked(source: str, item_id: str, rule_id: int, d: dict, old_price: int) -> None:
@@ -764,23 +844,33 @@ def update_tracked(source: str, item_id: str, rule_id: int, d: dict, old_price: 
 #   thumb_url 缺 → 每条都走兜底，图永远出不来（Slack 对空 image_url 回 400）
 #   end_time  缺 → 拍卖推送里没有截止时间，而那正是拍卖最要紧的一个数
 NOTIFY_COLS = ("source, item_id, rule_id, name, price, is_deal, deal_pct, bid_count, "
-               "end_time, thumb_url")
+               "end_time, thumb_url, notified_at, notified_price")
+# 【剔除的不推】用户剔掉一件，意思就是"别再拿它烦我"——命中页不显示了、手机上却
+# 还在响，会被当成 bug。两条待推查询都带上这一句。
+NOT_HIDDEN = ("AND NOT EXISTS (SELECT 1 FROM hidden_item h "
+              "WHERE h.source = item.source AND h.item_id = item.item_id) ")
 
 
-def pending_notify(rule_id: int, only_deal: bool) -> list[dict]:
-    """还没推送过的在售命中商品。
+def pending_notify(rule_id: int, only_deal: bool, redrop_pct: int = 0) -> list[dict]:
+    """该推的在售命中商品：还没推过的，以及（开了 redrop_pct 时）推过之后又跌够了的。
 
     【条件里的 status = 'on_sale' 不能省】商品卖掉之后 matched 仍然是 1
     （它当时确实合适），推一条"快看这个好货"过去而人点进去是已售出，
     比不推还差。
+
+    【再跌 N% 重推】原先一件商品终身只推一次 —— 库里 26 条已推里有 5 条推完又降过价，
+    你一条都不知道。比的是「上次推送时的价格」（notified_price），不是首见价：
+    每推一次基线刷新一次，掉几百块不会反复轰炸。N=0 关闭，也就是老行为。
     """
     sql = (f"SELECT {NOTIFY_COLS} FROM item WHERE rule_id = %s AND matched = 1 "
-           "AND status = 'on_sale' AND notified_at IS NULL")
+           "AND status = 'on_sale' " + NOT_HIDDEN +
+           "AND (notified_at IS NULL OR (%s > 0 AND notified_price IS NOT NULL "
+           "     AND price * 100 <= notified_price * (100 - %s)))")
     if only_deal:
         sql += " AND is_deal = 1"
     # 和面板同一个排序：最划算的排最前，万一撞上限被整批跳过也是先看到好的
-    return query(sql + " ORDER BY COALESCE(deal_pct, 999), price", (rule_id,))
-
+    return query(sql + " ORDER BY COALESCE(deal_pct, 999), price",
+                 (rule_id, redrop_pct, redrop_pct))
 
 def pending_final(rule_id: int, minutes: int) -> list[dict]:
     """快到点的拍卖里，价格还在捡漏线内、而且还没提醒过的那些。
@@ -803,7 +893,7 @@ def pending_final(rule_id: int, minutes: int) -> list[dict]:
         f"SELECT {NOTIFY_COLS} FROM item "
         "WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' AND is_deal = 1 "
         "AND bid_count IS NOT NULL AND end_time IS NOT NULL "
-        "AND end_time > %s AND end_time <= %s "
+        "AND end_time > %s AND end_time <= %s " + NOT_HIDDEN +
         "AND final_notified_at IS NULL "
         "AND notified_at IS NOT NULL "
         "AND notified_at < DATE_SUB(end_time, INTERVAL %s MINUTE) "
@@ -811,25 +901,24 @@ def pending_final(rule_id: int, minutes: int) -> list[dict]:
         (rule_id, now, now + timedelta(minutes=minutes), minutes))
 
 
-def _mark_pushed(rows: list[dict], col: str) -> None:
+def _mark_pushed(rows: list[dict], col: str, extra_set: str = "") -> None:
     """把这批商品的某个推送时间戳戳到现在。
 
     推送成功与否都要标 —— 见 core/notify.py 里「失败也标已推」的说明。
-    col 是本文件写死的列名，不来自外部输入。
+    col / extra_set 是本文件写死的 SQL 片段，不来自外部输入。
     """
     if not rows:
         return
     keys = [(r["source"], r["item_id"], r["rule_id"]) for r in rows]
     holes = ",".join(["(%s,%s,%s)"] * len(keys))
-    execute(f"UPDATE item SET {col} = %s "
+    execute(f"UPDATE item SET {col} = %s{extra_set} "
             f"WHERE (source, item_id, rule_id) IN ({holes})",
             (config.now(), *[v for k in keys for v in k]))
 
 
 def mark_notified(rows: list[dict]) -> None:
-    """标成「第一条已推」。"""
-    _mark_pushed(rows, "notified_at")
-
+    """标成「已推」，顺手记下此刻的价格 —— 「再跌 N% 重推」比的就是它。"""
+    _mark_pushed(rows, "notified_at", ", notified_price = price")
 
 def mark_final_notified(rows: list[dict]) -> None:
     """标成「快结束提醒已推」。这一条每件商品同样只发一次。"""

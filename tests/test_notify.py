@@ -38,7 +38,8 @@ class FakeStore:
     def get_settings(self):
         return self.settings
 
-    def pending_notify(self, rule_id, only_deal):
+    def pending_notify(self, rule_id, only_deal, redrop_pct=0):
+        self.redrop_asked = redrop_pct
         return [r for r in self.rows if r["is_deal"]] if only_deal else list(self.rows)
 
     def pending_final(self, rule_id, minutes):
@@ -104,13 +105,59 @@ def test_反斜杠和换行也要转义():
 # ---------------------------------------------------------------- 正文
 
 def test_正文把最要紧的信息放前两行():
-    """手机通知栏只看得见前两行。"""
+    """手机通知栏只看得见前两行 —— 价格必须在第一行，它才是决定要不要点开的那个数。"""
     lines = notify.compose(RULE, item(), 820000).splitlines()
-    assert lines[0] == "🟢 捡漏 | RTX 5090 单卡"
+    assert lines[0] == "🟢 捡漏 ¥700,000 · 市价的 85% | RTX 5090 单卡"
     assert lines[1] == "RTX 5090"
-    assert "¥700,000" in lines[2] and "85%" in lines[2]
+    assert "中位 ¥820,000" in lines[2]
     assert lines[-1].startswith("https://jp.mercari.com/item/")
 
+
+def test_手动价判出的捡漏不写市价百分比当理由():
+    """市价的 114% 和「捡漏」并排在第一行，手机上读起来自相矛盾。理由写手动线，百分比放第三行。"""
+    rule = {**RULE, "deal_price": 950_000}
+    lines = notify.compose(rule, item(price=900_000, deal_pct=114), 790_000).splitlines()
+    assert lines[0] == "🟢 捡漏 ¥900,000 · 低于手动线 ¥950,000 | RTX 5090 单卡"
+    assert "市价的 114%" in lines[2] and "中位 ¥790,000" in lines[2]
+
+
+def test_再跌重推的头一个词是再降():
+    lines = notify.compose(RULE, item(price=650_000, deal_pct=79, notified_price=700_000),
+                           820000).splitlines()
+    assert lines[0].startswith("📉 再降 ¥650,000 · 比上次推送低 ¥50,000")
+    assert "市价的 79%" in lines[2]
+
+
+def test_推过之后涨价的不算再降():
+    lines = notify.compose(RULE, item(price=720_000, notified_price=700_000), 820000).splitlines()
+    assert lines[0].startswith("🟢 捡漏 ¥720,000")
+
+
+def test_push_new把再跌阈值传给了查询():
+    _, fake, _ = run({}, {"notify_url": "u", "notify_on": "deal", "notify_max_per_round": 5,
+                          "notify_redrop_pct": 7}, [item()])
+    assert fake.redrop_asked == 7
+
+
+def test_待推查询要排除剔除的_并带再跌条件():
+    """剔掉一件的意思就是"别再拿它烦我"；命中页不显示了、手机上却还在响，会被当成 bug。"""
+    from db import store
+
+    sql, params = capture(store.pending_notify, 7, True, 5)
+    assert "hidden_item" in sql and "NOT EXISTS" in sql
+    assert "notified_price" in sql and "price * 100 <= notified_price * (100 - %s)" in sql
+    assert params == (7, 5, 5)
+    sql2, _ = capture(store.pending_final, 7, 60)
+    assert "hidden_item" in sql2, "快结束提醒也不该推剔除的"
+
+
+def test_标已推时顺手记下价格():
+    from db import store
+
+    sql, _ = capture(store.mark_notified, [{"source": "s", "item_id": "i", "rule_id": 1}])
+    assert "notified_price = price" in sql, "不记下推送时的价格，「再跌 N%」就没有基线"
+    sql2, _ = capture(store.mark_final_notified, [{"source": "s", "item_id": "i", "rule_id": 1}])
+    assert "notified_price" not in sql2, "快结束提醒不是价格基线"
 
 def test_拍卖必须带竞价提示():
     """拍卖的「当前价」只在此刻成立。不写这句，推送就是在误导人。"""
@@ -502,3 +549,53 @@ def test_两批之间也要留够间隔():
     sent, _, n = run({}, ON, [item()], final=[auction()])
     assert n == 2
     assert SLEPT == [notify.GAP], f"两批之间没等：{SLEPT}"
+
+
+# ---------------------------------------------------------------- 瞬时失败不标已推
+
+def _sender_raising(exc):
+    def send(url, tpl, text, thumb=""):
+        raise exc
+    return send
+
+
+def test_瞬时失败的不标已推_下一轮再试():
+    """Slack 抽风五分钟就把那件捡漏永久丢掉，太亏。"""
+    rows = [item(item_id="m1"), item(item_id="m2")]
+    exc = notify.PushFailed("HTTP 503", transient=True)
+    _, fake, n = run({}, {"notify_url": "u", "notify_on": "deal", "notify_max_per_round": 5},
+                     rows, sender=_sender_raising(exc))
+    assert n == 0 and fake.marked == [], "瞬时失败不该标已推"
+
+
+def test_地址坏了的照旧标已推不重试():
+    rows = [item(item_id="m1")]
+    exc = notify.PushFailed("HTTP 404", transient=False)
+    _, fake, _ = run({}, {"notify_url": "u", "notify_on": "deal", "notify_max_per_round": 5},
+                     rows, sender=_sender_raising(exc))
+    assert fake.marked == rows
+
+
+def test_post把状态码分成瞬时和永久():
+    import httpx
+
+    class R:
+        def __init__(self, code): self.status_code, self.text = code, "x"
+    saved = notify.httpx.post
+    try:
+        for code, transient in ((429, True), (503, True), (500, True), (404, False), (400, False), (401, False)):
+            notify.httpx.post = lambda *a, **k: R(code)
+            try:
+                notify.post("u", "", "t")
+            except notify.PushFailed as e:
+                assert e.transient is transient, f"HTTP {code} 应该 transient={transient}"
+            else:
+                raise AssertionError(f"HTTP {code} 应该抛")
+        def boom(*a, **k): raise httpx.ConnectError("boom")
+        notify.httpx.post = boom
+        try:
+            notify.post("u", "", "t")
+        except notify.PushFailed as e:
+            assert e.transient is True, "网络错误是瞬时的"
+    finally:
+        notify.httpx.post = saved

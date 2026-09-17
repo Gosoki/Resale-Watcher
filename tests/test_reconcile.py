@@ -34,7 +34,16 @@ RULE = {
 
 
 class FakeStore:
+    def update_tracked(self, *a, **k):   # 对账核实到在售时会写回价/出价数
+        pass
+
     """只实现 poller 在这条路径上真正用到的那几个方法。"""
+
+    def refresh_median(self, rid):   # 成交样本进来后会刷中位数
+        return (None, 0)
+
+    def get_settings(self, force=False):   # _search 读 search_reuse_min；空字典＝不复用
+        return {}
 
     def __init__(self, items):
         self.items = {i["item_id"]: dict(i) for i in items}
@@ -48,7 +57,7 @@ class FakeStore:
     def touch_seen(self, source, item_id, rule_id):
         self.items[item_id]["last_seen_at"] = config.now()
 
-    def set_status(self, source, item_id, rule_id, status, sold_at=None):
+    def set_status(self, source, item_id, rule_id, status, sold_at=None, price=None):
         self.items[item_id]["status"] = status
         self.status_calls.append((item_id, status))
 
@@ -75,6 +84,9 @@ class FakeSource:
 
     def search(self, keyword, *, sold=False, page_token=""):
         return {"items": self.pages, "next": "", "total": len(self.pages)}
+
+    def can_detail(self, iid):
+        return True
 
     def detail(self, item_id):
         self.detail_calls.append(item_id)

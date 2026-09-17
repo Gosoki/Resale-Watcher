@@ -120,6 +120,14 @@ class YahooAuction(Source):
 
     def _parse(self, blk: str) -> dict:
         buynow = _int(_attr(blk, "buynowprice"))
+        item_type = "shop" if _attr(blk, "isshoppingitem") else "user"
+        # 【商家出品的 buynowprice 是税抜，而 price 是税込】实测库里 5 件商家品全部满足
+        # buynow × 110 // 100 == 税込一口价，分毫不差（如 909,091 → 1,000,000）。
+        # 不换算的话面板上的「一口价」比实际要付的少 9%，同一张表里两列还不是一个口径。
+        # 10% 消費税是法定常量，不是可调阈值；切り捨て（整数除）是日本税额显示的惯例，
+        # round 会多 1 日元。detail() 那边直接读平台给的 taxinPrice，口径一致。
+        if item_type == "shop" and buynow:
+            buynow = buynow * 110 // 100
         return {
             "source": self.key,
             "item_id": _attr(blk, "id")[:32],
@@ -131,7 +139,7 @@ class YahooAuction(Source):
             # ヤフオク 的搜索结果【不给品相】。None 会让品相白名单对本源整体失效
             # （见 core/matcher.py 里的说明），这是有意的：不知道 ≠ 不符合。
             "condition_id": None,
-            "item_type": "shop" if _attr(blk, "isshoppingitem") else "user",
+            "item_type": item_type,
             "category_id": _int(_attr(blk, "category")) or None,
             "brand_name": "",
             "seller_id": _attr(blk, "auc-seller-id")[:32],

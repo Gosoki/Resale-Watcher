@@ -119,6 +119,10 @@ def explain(rule: dict, row: dict) -> str:
     if reason == "seller":
         return f"卖家 {row.get('seller_id') or '?'} 在黑名单里"
 
+    if reason == "no_keyword":
+        # 平时不会入库（第一层就丢弃），只有改严必含词之后重判老商品才会出现
+        return f"标题里没有「{rule.get('keyword', '')}」（归一化后比；改了搜索词之后重判出来的）"
+
     if not reason:
         # 合适的商品：这一列改说还有什么值得看一眼的
         bids = row.get("bid_count")

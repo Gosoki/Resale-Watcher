@@ -9,6 +9,7 @@
   设置  —— 全局项（抓取节奏、市价样本窗口、每日上限），改完 10 秒生效
 """
 from contextlib import contextmanager
+import logging
 from datetime import timedelta
 
 from nicegui import run, ui
@@ -20,6 +21,8 @@ from core import poller
 from core.matcher import explain
 from core.normalize import ids
 from db import store
+
+log = logging.getLogger(__name__)
 
 # 暗色样式：ui.dark_mode(True) + ui.colors 定主色 + 这张表修 Quasar 在暗底上的两处短板。
 DARK_CSS = (
@@ -193,6 +196,22 @@ FIELD_HELP = {
 }
 
 
+# 顶栏判「轮询已停」的阈值（分钟）。看门狗用的是设置里的 poller_stall_min，
+# 顶栏要更灵敏一点：你正看着面板，早 7 分钟知道没有坏处。
+TOPBAR_STALL_MIN = 3
+
+
+def fmt_minutes(mins: int) -> str:
+    """分钟数 → 「N 分钟」「N 小时 M 分」「N 天 M 小时」。顶栏和推送里说同一句话。"""
+    if mins < 60:
+        return f"{mins} 分钟"
+    h, m = divmod(mins, 60)
+    if h < 24:
+        return f"{h} 小时 {m} 分" if m else f"{h} 小时"
+    d, h = divmod(h, 24)
+    return f"{d} 天 {h} 小时" if h else f"{d} 天"
+
+
 def notify(message: str, **kw) -> None:
     """弹通知。带 type 的一律改深色前景。
 
@@ -207,7 +226,15 @@ def notify(message: str, **kw) -> None:
     """
     if kw.get("type") in ("positive", "negative", "warning", "info"):
         kw.setdefault("textColor", "dark")
-    ui.notify(message, **kw)
+    try:
+        ui.notify(message, **kw)
+    except RuntimeError:
+        # 【异步动作跑完时，发起它的那个按钮已经不在了】「立即跑一轮」要跑几分钟，
+        # 中途别的动作 refresh 了那一页，按钮所在的容器被删，回来再 notify 就抛
+        # "parent element … deleted"（日志里真出现过两次）。抛出去的后果是这句提示
+        # 和它后面的 *_view.refresh() 一起丢掉 —— 页面停在旧数据上、还没有任何提示。
+        # 各个异步动作里已经用 with client: 兜住了大多数情况，这里是最后一道。
+        log.info("提示没地方弹了（页面已重建）：%s", message)
 
 
 def item_url(source: str, item_id: str) -> str:
@@ -219,6 +246,24 @@ def item_url(source: str, item_id: str) -> str:
 def source_name(key: str) -> str:
     src = sources.get(key)
     return src.name if src else key
+
+
+def deal_line(rule: dict, median) -> str:
+    """这条规则【当前生效】的捡漏线，一句话。算不出就空串。
+    手动价一填就盖过百分比 —— 和 core/matcher.is_deal 同一个口径，面板各处都用这一个函数。"""
+    if rule.get("deal_price"):
+        return f"手动捡漏价 {yen(rule['deal_price'])}"
+    if median and rule.get("deal_ratio"):
+        return f"低于 {yen(median * rule['deal_ratio'] // 100)} 算捡漏"
+    return ""
+
+
+def budget_text(rule: dict) -> str:
+    """价格区间。上限 0 是「不限」，不是 ¥0 —— 「预算 ¥500,000〜¥0」看着像配错了。"""
+    lo, hi = rule.get("price_min") or 0, rule.get("price_max") or 0
+    if hi:
+        return f"{yen(lo)}〜{yen(hi)}"
+    return f"{yen(lo)} 起，不限上限" if lo else "不限"
 
 
 def yen(n) -> str:
@@ -318,13 +363,25 @@ def toggle_track(source: str, item_id: str, rule_id: int, on: bool) -> None:
     track_view.refresh()
 
 
-def toggle_mark(row: dict, rule_name: str, on: bool) -> None:
+def toggle_mark(row: dict, rule_name: str, on: bool):
     """标记/取消标记。和追踪的区别：这个【一个请求都不发】，随便标。
+
+    【有备注的不许一下点没】取消标记＝删那一行，备注跟着没了。旗子就在图角上，
+    误点一下几个月前写的那句"为什么标它"就消失了。有备注的先拒绝并把旗翻回去
+    （返回 False），要删就先把备注清空 —— 多一步，但那一步是有意识的。
 
     【只有标记页当场刷】在标记页点掉一面旗，那一行得当场消失。
     追踪页和成交页上这件商品也画着旗，但你此刻没在看它们 —— 标成过时，
     切过去时再重建。命中页那面旗已经就地翻过去了，不用重建。
     """
+    if not on:
+        note = row.get("note")
+        if note is None:                                # 命中页的行没有 note 列，查一下
+            note = store.mark_note_of(row["source"], row["item_id"])
+        if note:
+            notify("这条标记有备注，没有直接删：先到「标记」页把备注清空再取消（防误点）",
+                   type="warning")
+            return False
     store.set_marked(row, rule_name, on)
     n = len(store.marked_ids())
     notify(f"已标记（共 {n} 件），在「标记」页看" if on else f"已取消标记（还剩 {n} 件）")
@@ -336,14 +393,14 @@ def toggle_hide(row: dict, rule_name: str, on: bool) -> None:
     """从命中页剔除 / 恢复这一件。
 
     【只是不显示，不是删除也不是拉黑】三件事经常被混为一谈，代价差很远：
-      剔除    只有命中页不再显示它。照常抓取、照常对账、照常推送
+      剔除    命中页不再显示它、也不再推送。照常抓取、照常对账
       拉黑卖家 整条规则下这个卖家的所有商品立刻判为不合适
       删规则   连商品带成交样本一起删掉
     所以提示里必须把"它还在"说清楚，否则你会以为自己刚刚扔掉了什么。
     """
     store.set_hidden(row, rule_name, on)
     if on:
-        notify(f"已剔除「{row['name'][:20]}」—— 只是命中页不再显示它，"
+        notify(f"已剔除「{row['name'][:20]}」—— 命中页不再显示、也不再推送，"
                "商品照常抓取，全部页照常看得到。要拿回来：命中页最下面「已剔除」")
     else:
         notify("已恢复，它会重新出现在命中页")
@@ -381,7 +438,10 @@ def corner_toggle(on: bool, icons: tuple[str, str], tips: tuple[str, str],
         box["on"] = not box["on"]
         for d in box["draw"]:
             d()
-        act(box["on"])
+        if act(box["on"]) is False:         # 落库那边拒绝了（比如有备注的标记）：翻回去
+            box["on"] = not box["on"]
+            for d in box["draw"]:
+                d()
 
     btn = ui.button(icons[box["on"]], on_click=lambda _: flip()).props(BTN_CORNER)
     with btn:
@@ -557,7 +617,7 @@ def toolbar(desc: str):
 
 # ------------------------------------------------------------------ 命中页
 
-def _deals_summary(rules: list[dict], cold: dict, marks: set, hidden: set,
+def _deals_summary(rules: list[dict], live: list[dict], cold: dict, marks: set, hidden: set,
                    prevs: dict, twins: dict,
                    fresh_hours: int, warn_h: float, hide_h: float) -> None:
     """跨规则的捡漏汇总 —— 命中页上唯一默认展开的块。
@@ -571,10 +631,9 @@ def _deals_summary(rules: list[dict], cold: dict, marks: set, hidden: set,
     两边显示的件数对不上是最难查的那种 bug —— 你会以为是判定出错了。
     """
     by_id = {r["id"]: r for r in rules}
-    rows = store.query(
-        "SELECT * FROM item WHERE matched = 1 AND status = 'on_sale' AND is_deal = 1 "
-        "ORDER BY COALESCE(deal_pct, 999), price")
-    rows = [r for r in rows if r["rule_id"] in by_id]
+    # 【跨规则重排】live 是按规则分块的；这里要的是"全站最便宜的排最前"
+    rows = sorted((r for r in live if r["is_deal"] and r["rule_id"] in by_id),
+                  key=lambda r: (r["deal_pct"] if r["deal_pct"] is not None else 999, r["price"]))
     # 【剔除要排在撤下前面】理由见 drop_hidden
     kept = drop_hidden(rows, hidden)
     n_hidden, rows = len(rows) - len(kept), kept
@@ -610,20 +669,34 @@ def _deals_summary(rules: list[dict], cold: dict, marks: set, hidden: set,
 
 
 
+def _load_hits() -> dict:
+    """命中页要的数据，8 条 SQL 取完（原先 19 条：每条规则 3 条 + 汇总单独再查一遍）。
+
+    live 是全部在售命中，按规则分块、块内按市价百分比升序；汇总区从它里面挑
+    is_deal 的再【跨规则】重排 —— 直接按分块顺序过滤的话最便宜的那件不会排最前。
+    """
+    live = store.live_matched()
+    return {"rules": store.get_rules(), "marks": store.marked_ids(),
+            "hidden": store.hidden_ids(), "live": live,
+            "prevs": store.prev_prices(live), "first_seen": store.first_seen_by_rule(),
+            "states": store.rule_states()}
+
+
+# 【记住哪几个规则组是展开的】hits_view.refresh() 会把整页重建，expansion 是新元素，
+# 只认构造参数 —— 原先剔除/拉黑/存捡漏价之后，你刚展开的组全部折回去、滚动位置也丢了，
+# 存个捡漏价当前组立刻合上。界面状态，不是阈值，和 _DIRTY 一个路子。
+_OPEN: dict[int, bool] = {}
+
+
 @ui.refreshable
 def hits_view(host=None) -> None:
     # 【整份取出来，不要每行查一次】一屏几十行，每行一个 SELECT 翻页会肉眼卡顿
-    marks = store.marked_ids()
-    hidden = store.hidden_ids()
+    d = _load_hits()
+    marks, hidden, prevs, rules = d["marks"], d["hidden"], d["prevs"], d["rules"]
     # 同一件捡漏商品在这一页上会出现两次（汇总里一次、规则组里一次），
     # 角标要一起翻。这份表跟着本次重建走，重建一次就是新的一份，不会留下
     # 指向已删元素的重画函数。
     twins: dict = {}
-    # 【一次查完整页要用的「上次价格」】每行单独查的话，一屏几十行就是几十个
-    # SELECT，翻页会肉眼卡顿 —— 和 marked_ids 是同一条理由。
-    prevs = store.prev_prices(store.query(
-        "SELECT source, item_id, price FROM item WHERE matched = 1 AND status = 'on_sale'"))
-    rules = store.get_rules()
     if not rules:
         ui.label("还没有规则，去「规则」页新建一条。").classes("text-gray-400 p-4")
         return
@@ -632,27 +705,20 @@ def hits_view(host=None) -> None:
     fresh_hours = cfg["fresh_hours"]
     warn_h, hide_h = cfg["stale_warn_hours"], cfg["stale_hide_hours"]
     # 冷启动判断：这条规则库里【最早】的商品也是刚抓到的，说明监控本身才刚开始。
-    # 【一次算完存起来】汇总区和下面的规则组要用同一份，各算一遍就是每条规则两次查询。
     cold = {}
     for rule in rules:
-        earliest = store.one("SELECT MIN(first_seen_at) m FROM item WHERE rule_id = %s",
-                             (rule["id"],))["m"]
+        earliest = d["first_seen"].get(rule["id"])
         cold[rule["id"]] = bool(earliest) and (config.now() - earliest) < timedelta(hours=fresh_hours)
 
-    _deals_summary(rules, cold, marks, hidden, prevs, twins, fresh_hours, warn_h, hide_h)
+    _deals_summary(rules, d["live"], cold, marks, hidden, prevs, twins, fresh_hours, warn_h, hide_h)
 
     for rule in rules:
-        st = store.get_state(rule["id"])
+        st = d["states"].get(rule["id"]) or store.STATE_DEFAULT
         med = st["median_price"]
         cold_start = cold[rule["id"]]
-        rows = store.query(
-            "SELECT * FROM item WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' "
-            "ORDER BY COALESCE(deal_pct, 999), price", (rule["id"],))
-        # 【太久没见到的从这一页撤下】命中页回答的是「现在有什么能买」。
-        # 一条一天没更新过的记录回答不了这个问题：它显示的价格是一天前的，
-        # 而商品可能早就卖掉了 —— 源在限流时对账拉不到详情，判不出来，
-        # 它就会一直挂在这里冒充在售。宁可撤下让它哪天重新入库，
-        # 也不要拿旧数据糊弄人。撤下不是删除：全部页照常看得到，
+        rows = [r for r in d["live"] if r["rule_id"] == rule["id"]]
+        # 【太久没见到的从这一页撤下】命中页回答的是「现在有什么能买」。一条一天
+        # 没更新过的记录回答不了这个问题。撤下不是删除：全部页照常看得到，
         # 只要它重新出现在搜索结果里，last_seen_at 一刷新就自动回来。
         # 【剔除要排在撤下前面】理由见 drop_hidden
         kept = drop_hidden(rows, hidden)
@@ -660,17 +726,16 @@ def hits_view(host=None) -> None:
         rows, gone_dark = split_stale(rows, hide_h)
 
         # 折叠摘要：折起来之后这一行就是你能看到的全部，所以预算/市价/捡漏线都要在里面
-        summary = [f"预算 {yen(rule['price_min'])}〜{yen(rule['price_max'])}"]
+        summary = [f"预算 {budget_text(rule)}"]
         if med:
             summary.append(f"市价中位 {yen(med)}（{st['sample_count']}件成交）")
         else:
             summary.append(f"成交样本不足{rule['median_min_samples']}件，暂无市价参考")
         # 【手动价填了就盖过百分比】摘要必须如实反映当前生效的那一个，
         # 否则你会对着「低于 ¥706,500 算捡漏」纳闷为什么 ¥70 万的没标捡漏。
-        if rule["deal_price"]:
-            summary.append(f"手动捡漏价 {yen(rule['deal_price'])}")
-        elif med and rule["deal_ratio"]:
-            summary.append(f"低于 {yen(med * rule['deal_ratio'] // 100)} 算捡漏")
+        line = deal_line(rule, med)
+        if line:
+            summary.append(line)
         if gone_dark:
             # 【必须报数】偷偷少几件比显示旧数据更糟：你会以为这个价位真的没货了
             summary.append(f"另有 {len(gone_dark)} 件超过 {hide_h}h 没见到，已撤下")
@@ -683,8 +748,12 @@ def hits_view(host=None) -> None:
         # 【默认折叠】整页四条规则铺开有上百件，一进来就得滚半天才看得到重点。
         # 真正要立刻动手的那几件已经在最上面的「捡漏」汇总里，
         # 这些按规则分的组是「我想翻一翻某一类」时才展开的。
-        with ui.expansion(head, caption=" · ".join(summary), value=False) \
-                .classes(CARD).props("header-class=text-base"):
+        rid = rule["id"]
+        # 【折叠着的组不建行】一页 80 行 × 每行 23 个元素，其中 1500 个藏在默认折叠的组里，
+        # 每次重建都白建、白下发（实测浏览器主线程每次多阻塞 0.5 秒）。
+        # 展开那一刻再建；已经展开过的组（_OPEN）重建时当场建。
+        with ui.expansion(head, caption=" · ".join(summary), value=_OPEN.get(rid, False)) \
+                .classes(CARD).props("header-class=text-base") as group:
             # 【放在「没有商品」判断之前】一件都没命中的时候，恰恰是你最想调这个价的时候。
             # 原先这一行是五个元素平铺：按钮、标签、输入框、按钮、一长串说明 ——
             # 输入框比周围都高、两个按钮同色同权重、说明拖着很长的尾巴，像堆在一起的。
@@ -724,10 +793,26 @@ def hits_view(host=None) -> None:
             # 不设下限的话，笔记本上正文会被压到标题每行只剩几个字。
             # gap 只给 x 方向：纵向的间距由每行自己的 border-t + py-2 负责，
             # 再加 gap-y 会让两列之间的分隔线对不齐。
-            with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
-                for r in rows:
-                    _hit_row(r, rule, marks, prevs, twins, fresh_hours,
-                             cold_start, warn_h, hide_h)
+            holder = ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full")
+            built = {"done": False}
+
+            def build(rows=rows, rule=rule, cold_start=cold_start, holder=holder, built=built):
+                if built["done"]:
+                    return
+                built["done"] = True
+                with holder:
+                    for r in rows:
+                        _hit_row(r, rule, marks, prevs, twins, fresh_hours,
+                                 cold_start, warn_h, hide_h)
+
+            def on_toggle(e, rid=rid, build=build):
+                _OPEN[rid] = bool(e.value)
+                if e.value:
+                    build()
+
+            group.on_value_change(on_toggle)
+            if _OPEN.get(rid):
+                build()
 
     _hidden_block()
 
@@ -743,7 +828,7 @@ def _hidden_block() -> None:
     if not rows:
         return
     with ui.expansion(f"已剔除　{len(rows)} 件",
-                      caption="这些只是不在命中页显示，商品照常抓取、照常推送；"
+                      caption="这些不在命中页显示、也不再推送；商品本身照常抓取；"
                               "点「恢复」就回来",
                       value=False).classes(CARD).props("header-class=text-base"):
         for m in rows:
@@ -827,7 +912,12 @@ def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, twins: dict,
                             f"下面的价格是 {stale:.0f} 小时前的，别当真。"
                             f"超过 {hide_h}h 会直接从这一页撤下")
                     if r["is_deal"]:
-                        ui.badge("捡漏", color="green")
+                        # 【手动价判出来的要说清】它的「市价的 114%」就在右边，
+                        # 不解释的话"捡漏"和"贵了一成"并排，像自相矛盾。
+                        b = ui.badge("捡漏", color="green")
+                        if rule.get("deal_price"):
+                            b.tooltip(f"低于你填的手动捡漏价 {yen(rule['deal_price'])}"
+                                      "（手动价一填就盖过市价百分比那条线）")
                     if show_rule:
                         # 【汇总区必须标规则名】它把四条规则的商品混在一起排，
                         # 不标的话「¥50万算捡漏吗」这个问题没法回答 ——
@@ -934,8 +1024,8 @@ def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, twins: dict,
                     on_click=lambda _, row=dict(r), rn=rule["name"]:
                         toggle_hide(row, rn, True),
                 ).props(BTN_QUIET).classes("btn-muted row-act") \
-                 .tooltip("只是让它不在命中页显示。商品照常抓取、照常对账、"
-                          "照常推送，全部页和追踪页都还看得到。"
+                 .tooltip("让它不在命中页显示、也不再推送到手机。商品照常抓取、"
+                          "照常对账，全部页和追踪页都还看得到。"
                           "剔除的是这个链接本身，它在别的规则下也不再显示。"
                           "要拿回来：命中页最下面那块「已剔除」")
                 # 【必须用默认参数绑死 rid/sid】它们是循环变量，直接引用的话
@@ -1018,7 +1108,8 @@ def track_view() -> None:
     live = sum(1 for r in rows if r["status"] in store.LIVE)
     per_day = int(live * (1440 / max(st["track_min"], 1)))
     done = len(rows) - live
-    ui.label(f"在追 {live} 件 · 每 {st['track_min']} 分钟刷新一次、每轮最多 "
+    ui.label(f"在追 {live} 件 · 每 {st['track_min']} 分钟刷新一次（交易中的每 "
+             f"{st.get('trading_recheck_min') or st['track_min']} 分钟）、每轮最多 "
              f"{st['track_budget']} 件 · 满负荷约 {per_day:,} 次请求/天"
              f"（今日上限 {st['daily_request_limit']:,}）"
              + (f" · 另有 {done} 件已结束，留着看结果，不再发请求" if done else "")
@@ -1158,6 +1249,13 @@ def _mark_row(m: dict) -> None:
 # ------------------------------------------------------------------ 成交页
 
 @ui.refreshable
+def _load_sold() -> dict:
+    """成交页要的数据，5 条 SQL 取完（原先 14 条：每条规则 3 条）。"""
+    return {"rules": store.get_rules(), "marks": store.marked_ids(),
+            "states": store.rule_states(), "tracked": store.sold_tracked_all(),
+            "samples": store.sold_samples_recent(80)}
+
+
 def sold_view() -> None:
     """成交页：市场实际用什么价把什么货清掉了。
 
@@ -1172,26 +1270,24 @@ def sold_view() -> None:
       成交价样本  sold_sample，只有价格和时间（成交轮按标题级规则扫来的，没拉详情），
                   量大，是中位数的实际依据。
     """
-    rules = store.get_rules()
+    d = _load_sold()
+    rules = d["rules"]
     if not rules:
         ui.label("还没有规则，去「规则」页新建一条。").classes("text-gray-400 p-4")
         return
 
-    marks = store.marked_ids()
+    marks = d["marks"]
     for rule in rules:
         rid = rule["id"]
-        st = store.get_state(rid)
+        st = d["states"].get(rid) or store.STATE_DEFAULT
         med = st["median_price"]
         # 【必须加 matched = 1】不加的话这一页会混进被规则判掉的货：
         # 部品取り、GPUなし、纯散热器、笔记本 —— 实测 19 件里有 13 件是这类，
         # 价格从 ¥1,600 到 ¥14,000。它们和你要的卡不是一个东西，
         # 摆在成交页上只会把"这个货色卖多少钱"这个判断整个带偏。
-        tracked = store.query(
-            "SELECT * FROM item WHERE rule_id = %s AND status = 'sold_out' "
-            "AND matched = 1 ORDER BY sold_at DESC", (rid,))
-        samples = store.query(
-            "SELECT source, price, sold_at, sample_kind FROM sold_sample "
-            "WHERE rule_id = %s ORDER BY sold_at DESC LIMIT 80", (rid,))
+        # （matched = 1 的条件在 store.sold_tracked_all 的 SQL 里）
+        tracked = d["tracked"].get(rid, [])
+        samples = d["samples"].get(rid, [])
 
         # 折叠摘要：折起来后这一行就是全部，所以中位数和价格区间都要在里面
         cap = [f"近{rule['median_window_days']}天"]
@@ -1200,10 +1296,13 @@ def sold_view() -> None:
             cap.append(f"成交 {len(samples)} 件　{yen(ps[0])} 〜 {yen(ps[-1])}")
         if med:
             cap.append(f"中位 {yen(med)}")
-            if rule["deal_ratio"]:
-                cap.append(f"捡漏线 {yen(med * rule['deal_ratio'] // 100)}")
         else:
             cap.append(f"样本不足 {rule['median_min_samples']} 件，暂不出中位数")
+        # 【捡漏线按当前生效的那条写】手动价一填就盖过百分比（core/matcher.is_deal），
+        # 原先这里只按百分比算 —— 四条规则都填了手动价，显示的全是不生效的那条线。
+        line = deal_line(rule, med)
+        if line:
+            cap.append(line)
         head = f"{rule['name']}　成交样本 {len(samples)} 件" + (
             f"　🔗 跟到成交 {len(tracked)} 件" if tracked else "")
 
@@ -1266,13 +1365,19 @@ def _sold_row(r: dict, med: int | None, marks: set, rule_name: str) -> None:
 # ------------------------------------------------------------------ 全部页
 
 @ui.refreshable
-def all_view(rule_id: int | None, reason: str) -> None:
+def all_view(rule_id: int | None, reason: str, q: str = "") -> None:
     where, args = ["1=1"], []
     if rule_id:
         where.append("rule_id = %s"); args.append(rule_id)
     if reason != "全部":
         key = next(k for k, v in REASON_LABEL.items() if v == reason)
         where.append("reject_reason = %s"); args.append(key)
+    q = (q or "").strip()
+    if q:
+        # 【搜标题和卖家 ID】300 行按规则/原因翻找一件具体的东西太慢；
+        # 卖家 ID 也能搜 —— 拉黑之前想看看这个人还挂了什么。
+        where.append("(name LIKE %s OR seller_id LIKE %s)")
+        args += [f"%{q}%", f"%{q}%"]
 
     rows = store.query(
         # 【必须覆盖 explain() 读的每一个字段】少一个，「具体原因」那一列就会
@@ -1487,12 +1592,19 @@ def rule_dialog(rule: dict | None, host=None) -> None:
                     notify("没有任何改动")
                     return
                 store.update_rule(rule["id"], payload)
+                # 【立刻重判、重算捡漏】和拉黑卖家、存捡漏价一个路子：都是纯 CPU、
+                # 不发请求。不重判的话命中页会刷出「新摘要 + 旧徽标」——摘要按新规则算，
+                # 每一行的捡漏/命中还是旧的，要等下一轮扫描才对得上。
+                fresh = store.get_rule(rule["id"])
+                poller.revalidate(fresh)
+                poller.mark_deals(fresh)
             else:
                 store.insert_rule(payload)
             close()
             rules_view.refresh()
             hits_view.refresh()
-            notify("已保存，下一轮生效")
+            notify("已保存。库里的商品已按新规则重判；抓取从下一轮起按新规则来"
+                   if rule else "已保存，下一轮开始抓")
 
         def close() -> None:
             # 关了就删掉：每点一次「编辑」都会新建一个 dialog 元素，
@@ -1531,15 +1643,25 @@ def confirm_delete(rule: dict, host=None) -> None:
 
 
 @ui.refreshable
+def _load_rules() -> dict:
+    """规则页要的数据，4 条 SQL 取完（原先 33 条：每条规则 2 条 + 每个源 2 条）。"""
+    return {"rules": store.get_rules(), "states": store.rule_states(),
+            "sstates": store.source_states(), "counts": store.item_counts()}
+
+
 def rules_view(host=None) -> None:
     # 「新建规则」已经移到页面顶上的 toolbar 里，这里只列规则卡片
-    for rule in store.get_rules():
-        st = store.get_state(rule["id"])
+    d = _load_rules()
+    for rule in d["rules"]:
+        rid = rule["id"]
+        st = d["states"].get(rid) or store.STATE_DEFAULT
+        # 【规则级的数要对该规则【全部】源求和，不是只加当前启用的那几个】历史上抓过、
+        # 后来从规则里摘掉的源，它的商品还在库里，「入库」这个数得把它们算进去 ——
+        # 只加显示出来的源，把某条规则的源改窄之后这个数会悄悄变小，没人会发现。
         # 【命中＝当前在售的命中】和「命中」页显示的是同一批。
         # 用 SUM(matched) 会把已售出/已结束的历史命中也算进来，同一个词两个意思。
-        stats = store.one(
-            "SELECT COUNT(*) total, SUM(matched = 1 AND status = 'on_sale') hit "
-            "FROM item WHERE rule_id = %s", (rule["id"],))
+        total = sum(c["t"] for (r, _), c in d["counts"].items() if r == rid)
+        hit = sum(c["h"] for (r, _), c in d["counts"].items() if r == rid)
         with ui.card().classes(CARD):
             with ui.row().classes("items-center w-full gap-3"):
                 ui.label(rule["name"]).classes("text-base font-bold")
@@ -1548,23 +1670,20 @@ def rules_view(host=None) -> None:
                 ui.label(f'搜「{rule["keyword"]}」').classes("text-sm")
                 ui.label(f"{yen(rule['price_min'])}〜{yen(rule['price_max'])}").classes("text-sm")
                 ui.space()
-                ui.label(f"入库 {stats['total'] or 0} · 在售命中 {int(stats['hit'] or 0)}"
-                         ).classes("text-sm text-gray-400")
+                ui.label(f"入库 {total} · 在售命中 {hit}").classes("text-sm text-gray-400")
             ui.label(f"市价中位 {yen(st['median_price'])}"
                      f"（跨源 {st['sample_count']} 件成交）").classes("text-xs text-gray-300")
 
             # 每个数据源单独一行：各源独立计时、独立限速，状态也分开看
             for src in sources.for_rule(rule):
-                ss = store.get_source_state(rule["id"], src.key)
-                n = store.one("SELECT COUNT(*) t, SUM(matched = 1 AND status = 'on_sale') h "
-                              "FROM item WHERE rule_id = %s AND source = %s",
-                              (rule["id"], src.key))
+                ss = d["sstates"].get((rid, src.key)) or store.SOURCE_STATE_DEFAULT
+                n = d["counts"].get((rid, src.key)) or {"t": 0, "h": 0}
                 with ui.row().classes("gap-3 text-xs text-gray-400 items-center"):
                     ui.badge(src.name).classes(BADGE_LABEL)
                     ui.label(f"上次扫描 {ss['last_scan_at']:%m-%d %H:%M}"
                              if ss["last_scan_at"] else "还没扫过")
                     ui.label(f"在售 {ss['last_total']}")
-                    ui.label(f"入库 {n['t'] or 0} · 在售命中 {int(n['h'] or 0)}")
+                    ui.label(f"入库 {n['t']} · 在售命中 {n['h']}")
                     if ss["truncated"]:
                         ui.label("⚠ 上次没扫全，售出对账已跳过").classes("text-orange-400")
                     if ss["last_error"]:
@@ -1578,7 +1697,6 @@ def rules_view(host=None) -> None:
                 ui.button("立即跑一轮", on_click=lambda r=rule: run_now(r)).props(BTN_GHOST)
                 ui.button("删除", on_click=lambda r=rule: confirm_delete(r, host)
                           ).props(BTN_DANGER)
-
 
 # 【进程级的重入闸】面板是多标签页的，而抓取是服务端动作 ——
 # 两个标签页各点一次，就是两轮并发打同一批源。各源的 _lock 会把请求串起来，
@@ -1595,6 +1713,10 @@ async def fetch_all() -> None:
     if not rules:
         notify("没有启用的规则", type="warning")
         return
+    # 【client 要在第一个 await 之前拿】await 回来时发起这个动作的按钮可能已经被
+    # 别的 refresh 删掉了，那时 ui.notify 找不到容器会抛；用 client 当上下文就不依赖
+    # 那个按钮。await 之后再拿就已经晚了（那一刻 slot 已经死了）。
+    client = ui.context.client
     _fetching["busy"] = True
     try:
         st = store.get_settings()
@@ -1604,12 +1726,19 @@ async def fetch_all() -> None:
         for r in rules:
             try:
                 # 【每条规则单独 try】一条失败不该让后面几条一起放弃
-                stat = await run.io_bound(poller.run_once, store.get_rule(r["id"]))
+                # 【走 manual】和后台轮询抢同一把扫描闸，拿不到就抛 ScanBusy
+                stat = await run.io_bound(poller.manual, poller.run_once, store.get_rule(r["id"]))
                 new += stat["new"]
                 matched += stat["matched"]
+            except poller.ScanBusy as e:
+                with client:
+                    notify(str(e), type="warning")
+                break
             except Exception as e:          # noqa: BLE001 - 手动抓取失败只弹提示
-                notify(f"「{r['name']}」失败：{e}", type="negative")
-        notify(f"抓完：新增 {new} 件，当前命中 {matched} 件", type="positive")
+                with client:
+                    notify(f"「{r['name']}」失败：{e}", type="negative")
+        with client:
+            notify(f"抓完：新增 {new} 件，当前命中 {matched} 件", type="positive")
     finally:
         # 【必须在 finally】中途抛异常而不解锁的话，这个按钮就永久点不动了，
         # 而且没有任何办法恢复，只能重启进程。
@@ -1639,6 +1768,7 @@ async def test_notify() -> None:
             "ASUS ROG ASTRAL GeForce RTX 5090 BTF\n"
             "¥850,000（市价的 106%，中位 ¥798,000）\n"
             "https://jp.mercari.com/item/m54103659696")
+    client = ui.context.client          # 理由见 fetch_all
     try:
         # 【必须带一张真图】模板里有 {thumb} 时，不给图会走兜底的纯文本分支，
         # 那就测不出"带图的那条到底长什么样"—— 而那正是你点这个按钮想看的。
@@ -1646,9 +1776,11 @@ async def test_notify() -> None:
                              "ORDER BY last_seen_at DESC LIMIT 1") or [{}])[0].get("thumb_url", "")
         await run.io_bound(push.post, url, s.get("notify_body") or "", text, thumb)
     except Exception as e:      # noqa: BLE001 - 这里就是要把失败摆到脸上
-        notify(f"发送失败：{e}", type="negative")
+        with client:
+            notify(f"发送失败：{e}", type="negative")
         return
-    notify("已发出。去 Slack/手机看一眼 —— 没收到就是地址或请求体模板不对", type="positive")
+    with client:
+        notify("已发出。去 Slack/手机看一眼 —— 没收到就是地址或请求体模板不对", type="positive")
 
 
 async def pull_tracked() -> None:
@@ -1662,24 +1794,36 @@ async def pull_tracked() -> None:
     if _fetching["busy"]:
         notify("已经在抓了，等这一轮跑完再点", type="warning")
         return
-    n = len(store.tracked_items())
-    if not n:
+    # 【分母只算还在刷新的】卖掉/下架的留在追踪页上但不再发请求（tracked_due 只挑
+    # on_sale/trading），拿总件数当分母的话，提示会说「另外 3 件没拉到」——那 3 件本来就不拉。
+    rows = store.tracked_items()
+    n = sum(1 for r in rows if r["status"] in store.LIVE)
+    if not rows:
         notify("还没有追踪任何商品", type="warning")
         return
+    if not n:
+        notify(f"追踪中的 {len(rows)} 件都已结束，不再刷新", type="warning")
+        return
+    client = ui.context.client          # 理由见 fetch_all
     _fetching["busy"] = True
     try:
         st = store.get_settings()
         notify(f"开始拉 {n} 件的详情，每个请求间隔 "
                f"{st['req_delay_min']:g}〜{st['req_delay_max']:g} 秒…")
-        done = await run.io_bound(poller.refresh_tracked, True)
+        done = await run.io_bound(poller.manual, poller.refresh_tracked, True)
         msg = f"拉完 {done} 件"
         if done < n:
             # 【差额要说出来】卖掉的会被自动摘掉追踪，读不出详情的会被跳过，
             # 两种都让件数对不上。不提的话，人只会觉得这按钮没干完活。
             msg += f"（另外 {n - done} 件没拉到，原因看日志）"
-        notify(msg, type="positive" if done else "warning")
+        with client:
+            notify(msg, type="positive" if done else "warning")
+    except poller.ScanBusy as e:
+        with client:
+            notify(str(e), type="warning")
     except Exception as e:          # noqa: BLE001 - 手动拉取失败只弹提示
-        notify(f"失败：{e}", type="negative")
+        with client:
+            notify(f"失败：{e}", type="negative")
     finally:
         # 理由同 fetch_all：不解锁的话这按钮就永久点不动了
         _fetching["busy"] = False
@@ -1692,16 +1836,30 @@ async def pull_tracked() -> None:
 async def run_now(rule: dict) -> None:
     """面板上的手动试跑。走 io_bound 扔到线程里 —— 一轮要遍历所有源、发好几个请求、
     每个之间还要等 3〜8 秒，直接在事件循环里跑会把整个面板卡死。"""
+    # 【和「一键抓取」共用同一个闸】原先只有它没有闸：连点两下就是两个 run_once
+    # 并行，和后台轮询三方一起打同一批源。实测日志里 7 例同一规则×源几十秒内被扫两遍。
+    if _fetching["busy"]:
+        notify("已经在抓了，等这一轮跑完再点", type="warning")
+        return
+    client = ui.context.client          # 理由见 fetch_all
     srcs = "、".join(x.name for x in sources.for_rule(rule))
     st = store.get_settings()          # 别硬编码，这两个值在设置页可改
     notify(f"开始跑「{rule['name']}」（{srcs}），"
            f"每个请求间隔 {st['req_delay_min']:g}〜{st['req_delay_max']:g} 秒，请稍候…")
+    _fetching["busy"] = True
     try:
-        stat = await run.io_bound(poller.run_once, store.get_rule(rule["id"]))
-        notify(f"完成：在售{stat['total']}件 新增{stat['new']} "
-               f"降价{stat['price_down']} 命中{stat['matched']}", type="positive")
+        stat = await run.io_bound(poller.manual, poller.run_once, store.get_rule(rule["id"]))
+        with client:
+            notify(f"完成：在售{stat['total']}件 新增{stat['new']} "
+                   f"降价{stat['price_down']} 命中{stat['matched']}", type="positive")
+    except poller.ScanBusy as e:
+        with client:
+            notify(str(e), type="warning")
     except Exception as e:  # noqa: BLE001 - 手动试跑失败只该弹个提示，不该影响面板
-        notify(f"失败：{e}", type="negative")
+        with client:
+            notify(f"失败：{e}", type="negative")
+    finally:
+        _fetching["busy"] = False
     rules_view.refresh()
     hits_view.refresh()
 
@@ -1738,7 +1896,14 @@ def _setting_row(it: dict, label: str, fields: dict) -> None:
     """
     with ui.element("div").classes("w-full border-t py-2"):
         if it["type"] == "str":
-            comp = ui.input(label, value=it["v"]).classes("w-full max-w-3xl").props(INPUT)
+            if it["k"] == "notify_url":
+                # 【这是一把钥匙】谁拿到都能往你手机推东西。设置页整串明文摆着，
+                # 截图、共享屏幕、路过的人都看得到。遮住，要看再点眼睛。
+                comp = ui.input(label, value=it["v"], password=True,
+                                password_toggle_button=True) \
+                    .classes("w-full max-w-3xl").props(INPUT + ' autocomplete="off"')
+            else:
+                comp = ui.input(label, value=it["v"]).classes("w-full max-w-3xl").props(INPUT)
             _setting_note(it)
         else:
             with ui.row().classes("items-start w-full gap-4 sm:flex-nowrap"):
@@ -1843,20 +2008,37 @@ def create() -> None:
             # 旧数据照常显示，只有「上次扫描」的时间戳冻住 —— 不主动报的话
             # 你可能几天都以为它在监控。
             beat = poller.heartbeat()
-            dead = beat is None or (config.now() - beat) > timedelta(minutes=3)
+            now = config.now()
+            stalled = poller.stalled_for(now, beat, TOPBAR_STALL_MIN) if beat else None
+            quota_out = False
             try:
-                d = store.today_stat()
+                # 【一条 SQL】today_by_source 已经把每个源的 requests/errors 都取回来了，
+                # 合计在 Python 里加就是；原先还多发一条 today_stat 算同一个数。
+                rows = store.today_by_source()
+                req = sum(x["requests"] for x in rows)
+                err = sum(x["errors"] for x in rows)
+                limit = store.get_settings()["daily_request_limit"]
+                quota_out = req >= limit
+                # 【失败数贴在各自的源后面】总数「失败 107」看不出是谁在失败；
+                # 贴在源后面一眼就知道是 メルカリ 在被挡，而这个数本来就查回来了，零成本。
                 per = "  ".join(f"{source_name(x['source'])} {x['requests']}"
-                                for x in store.today_by_source())
-                text = (f"今日请求 {d['requests']}/{store.get_settings()['daily_request_limit']}"
-                        + (f"（{per}）" if per else "")
-                        + f"　失败 {d['errors']}　{config.now():%H:%M:%S}")
+                                + (f"（失败 {x['errors']}）" if x["errors"] else "")
+                                for x in rows)
+                text = (f"今日请求 {req}/{limit}" + (f"（{per}）" if per else "")
+                        + (f"　失败 {err}" if err and not per else "") + f"　{now:%H:%M:%S}")
             except Exception as e:          # noqa: BLE001 - 数据库抽风不该让状态栏整个消失
                 text = f"⚠ 读数据库失败：{str(e)[:60]}"
             holder = poller.lease_holder()
-            if dead:
-                gap = f"（心跳停在 {beat:%H:%M:%S}）" if beat else "（从未启动）"
-                status.text = f"⚠ 轮询已停止{gap}　" + text
+            # 【配额分支必须排在"停摆"前面】配额用完后主循环一睡 10 分钟，心跳看起来
+            # 也像停了；先判配额，人才不会照着「重启进程」白折腾一趟。
+            if quota_out:
+                status.text = ("⏸ 今日请求已到上限，抓取暂停 —— 0 点（JST）自动恢复，"
+                               "不用重启　" + text)
+                status.classes(replace="text-sm text-amber-400 font-bold")
+            elif beat is None or stalled is not None:
+                gap = (f"已停 {fmt_minutes(stalled)}（心跳停在 {beat:%m-%d %H:%M}）"
+                       if beat else "从未启动")
+                status.text = (f"⚠ 轮询{gap} —— 进程还活着但没在抓，重启进程　" + text)
                 status.classes(replace="text-sm text-red-400 font-bold")
             elif holder and holder != poller.ME:
                 # 【待命要写出来】不写的话你看着本机的面板，以为它在抓 ——
@@ -1876,13 +2058,91 @@ def create() -> None:
         # 【切过去的时候才重建过时的那一页】配合 stale_tabs：点一面旗不再
         # 当场重建四个视图（1.24 秒 SQL），只把别的页记成过时；
         # 等你真切过去，那一下的重建藏在切页动作里，看不出来。
+        # 【页签懒建】原先七个页签在打开页面那一刻全部同步建好：≈76 条 SQL、
+        # 首屏 3〜7 秒，而你看的只是命中页。现在只建当前这一页，切过去时再建；
+        # 建过的页改用 _DIRTY 决定要不要重建。
+        # 【built 必须在 index() 里】每个浏览器标签一份。放模块级的话第二次打开
+        # 面板时七个名字都已经"建过"，新页面的容器永远不填 —— 而第一次开是好的。
+        containers: dict = {}
+        built: set = set()
+
+        def build_hits():
+            with toolbar("当前符合条件的在售商品，按「市价的百分之多少」从低到高排"):
+                ui.button("一键抓取", on_click=fetch_all).props(BTN_PRIMARY) \
+                    .tooltip("所有启用的规则立刻各跑一轮。常驻轮询照常继续，"
+                             "两边共用同一套限速，不会因此发得更快")
+                ui.button("刷新", on_click=hits_view.refresh).props(BTN_QUIET) \
+                    .tooltip("只重画页面，不发请求")
+            hits_view(dialog_host)
+
+        def build_track():
+            with toolbar("盯住的几件。它们被单独拉详情刷新，价格、出价数、"
+                         "是否卖掉都比整轮扫描快得多"):
+                ui.button("一键拉取", on_click=pull_tracked).props(BTN_PRIMARY) \
+                    .tooltip("追踪中的每件立刻各拉一次详情，不等刷新间隔到点。"
+                             "请求之间要隔几秒，件数多就得等一会")
+                ui.button("刷新", on_click=track_view.refresh).props(BTN_QUIET) \
+                    .tooltip("只重画页面，不发请求")
+            track_view()
+
+        def build_marks():
+            with toolbar("自己标下来的东西，纯记录。不发请求、不参与判定，"
+                         "存的是你标记那一刻的快照，商品下架了也还在"):
+                ui.button("刷新", on_click=marks_view.refresh).props(BTN_QUIET) \
+                    .tooltip("只重画页面，不发请求")
+            marks_view()
+
+        def build_sold():
+            with toolbar("市场实际用什么价清掉了什么货 —— 定价前先看分布，"
+                         "别只看中位数那一个数字"):
+                ui.button("刷新", on_click=sold_view.refresh).props(BTN_QUIET)
+            sold_view()
+
+        def build_all():
+            rules = store.get_rules()
+            opts = {None: "全部规则", **{r["id"]: r["name"] for r in rules}}
+            with toolbar("抓到的每一件，含被判掉的。「具体原因」那一列说清是哪个词、"
+                         "哪个阈值判的"):
+                sel_rule = ui.select(opts, value=None).props(INPUT)
+                sel_reason = ui.select(["全部"] + list(REASON_LABEL.values()),
+                                       value="全部").props(INPUT)
+                inp = ui.input(placeholder="搜标题 / 卖家ID").props(INPUT + " clearable debounce=400") \
+                    .classes("w-56")
+                redo = lambda: all_view.refresh(sel_rule.value, sel_reason.value, inp.value or "")  # noqa: E731
+                ui.button("刷新", on_click=redo).props(BTN_QUIET)
+            sel_rule.on_value_change(redo)
+            sel_reason.on_value_change(redo)
+            inp.on_value_change(redo)
+            all_view(None, "全部")
+
+        def build_rules():
+            with toolbar("关键词、词表、价格区间、数据源都在这里。改完下一轮生效"):
+                ui.button("新建规则",
+                          on_click=lambda: rule_dialog(None, dialog_host)).props(BTN_PRIMARY)
+            rules_view(dialog_host)
+
+        def build_settings():
+            # 【这一页不用 toolbar】保存按钮和那句说明都在 settings_view 顶上的
+            # sticky 条里 —— 放这儿的话它不跟着滚，等于白放。
+            settings_view()
+
+        BUILD = {"命中": build_hits, "追踪": build_track, "标记": build_marks, "成交": build_sold,
+                 "全部": build_all, "规则": build_rules, "设置": build_settings}
+
         def on_tab(e) -> None:
-            # 【e.value 可能是 Tab 对象也可能是页签名】NiceGUI 两种都发得出来，
-            # 所以两种都认。别去读 Tab 的 .props ——那是个方法不是字典，
-            # 读出来是个 bound method，取 name 会直接抛，而抛在这里的后果是
-            # 切页无声地不刷新，你只会看到一页旧数据。
+            # 【e.value 可能是 Tab 对象也可能是页签名】NiceGUI 两种都发得出来。
             name = e.value if isinstance(e.value, str) else TAB_NAME.get(e.value, "")
-            if name in _DIRTY:
+            # 【tab_panels 构造时会先触发一次】那时容器一个都还没建，naive 版本会把
+            # 命中页画到页面根上。拿不到容器就 return，首页在下面显式建。
+            c = containers.get(name)
+            if c is None:
+                return
+            if name not in built:
+                built.add(name)
+                _DIRTY.discard(name)
+                with c:
+                    BUILD[name]()
+            elif name in _DIRTY:
                 _DIRTY.discard(name)
                 REFRESH[name].refresh()
 
@@ -1894,59 +2154,17 @@ def create() -> None:
             t_all = ui.tab("全部")
             t_rule = ui.tab("规则")
             t_set = ui.tab("设置")
-        TAB_NAME = {t_hit: "命中", t_track: "追踪", t_mark: "标记", t_sold: "成交"}
+        TAB_NAME = {t_hit: "命中", t_track: "追踪", t_mark: "标记", t_sold: "成交",
+                    t_all: "全部", t_rule: "规则", t_set: "设置"}
         REFRESH = {"命中": hits_view, "追踪": track_view,
                    "标记": marks_view, "成交": sold_view}
         # animated=False 的理由见 DARK_CSS 里那条 overflow:visible 的注释：
         # 两者是一组，少一个要么 sticky 不生效、要么切页穿帮。
         with ui.tab_panels(tabs, value=t_hit, animated=False).classes("w-full"):
-            with ui.tab_panel(t_hit):
-                with toolbar("当前符合条件的在售商品，按「市价的百分之多少」从低到高排"):
-                    ui.button("一键抓取", on_click=fetch_all).props(BTN_PRIMARY) \
-                        .tooltip("所有启用的规则立刻各跑一轮。常驻轮询照常继续，"
-                                 "两边共用同一套限速，不会因此发得更快")
-                    ui.button("刷新", on_click=hits_view.refresh).props(BTN_QUIET) \
-                        .tooltip("只重画页面，不发请求")
-                hits_view(dialog_host)
-            with ui.tab_panel(t_track):
-                with toolbar("盯住的几件。它们被单独拉详情刷新，价格、出价数、"
-                             "是否卖掉都比整轮扫描快得多"):
-                    ui.button("一键拉取", on_click=pull_tracked).props(BTN_PRIMARY) \
-                        .tooltip("追踪中的每件立刻各拉一次详情，不等刷新间隔到点。"
-                                 "请求之间要隔几秒，件数多就得等一会")
-                    ui.button("刷新", on_click=track_view.refresh).props(BTN_QUIET) \
-                        .tooltip("只重画页面，不发请求")
-                track_view()
-            with ui.tab_panel(t_mark):
-                with toolbar("自己标下来的东西，纯记录。不发请求、不参与判定，"
-                             "存的是你标记那一刻的快照，商品下架了也还在"):
-                    ui.button("刷新", on_click=marks_view.refresh).props(BTN_QUIET) \
-                        .tooltip("只重画页面，不发请求")
-                marks_view()
-            with ui.tab_panel(t_sold):
-                with toolbar("市场实际用什么价清掉了什么货 —— 定价前先看分布，"
-                             "别只看中位数那一个数字"):
-                    ui.button("刷新", on_click=sold_view.refresh).props(BTN_QUIET)
-                sold_view()
-            with ui.tab_panel(t_all):
-                rules = store.get_rules()
-                opts = {None: "全部规则", **{r["id"]: r["name"] for r in rules}}
-                with toolbar("抓到的每一件，含被判掉的。「具体原因」那一列说清是哪个词、"
-                             "哪个阈值判的"):
-                    sel_rule = ui.select(opts, value=None).props(INPUT)
-                    sel_reason = ui.select(["全部"] + list(REASON_LABEL.values()),
-                                           value="全部").props(INPUT)
-                    ui.button("刷新", on_click=lambda: all_view.refresh(
-                        sel_rule.value, sel_reason.value)).props(BTN_QUIET)
-                sel_rule.on_value_change(lambda: all_view.refresh(sel_rule.value, sel_reason.value))
-                sel_reason.on_value_change(lambda: all_view.refresh(sel_rule.value, sel_reason.value))
-                all_view(None, "全部")
-            with ui.tab_panel(t_rule):
-                with toolbar("关键词、词表、价格区间、数据源都在这里。改完下一轮生效"):
-                    ui.button("新建规则",
-                              on_click=lambda: rule_dialog(None, dialog_host)).props(BTN_PRIMARY)
-                rules_view(dialog_host)
-            with ui.tab_panel(t_set):
-                # 【这一页不用 toolbar】保存按钮和那句说明都在 settings_view 顶上的
-                # sticky 条里 —— 放这儿的话它不跟着滚，等于白放。
-                settings_view()
+            for t, name in TAB_NAME.items():
+                with ui.tab_panel(t) as panel:
+                    containers[name] = panel
+        # 首页当场建：上面 tab_panels 构造时那次 on_change 因为容器还没建已经 return 了
+        built.add("命中")
+        with containers["命中"]:
+            build_hits()

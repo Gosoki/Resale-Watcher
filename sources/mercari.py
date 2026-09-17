@@ -136,6 +136,10 @@ class Mercari(Source):
             "total": int(meta.get("numFound") or 0),
         }
 
+    def can_detail(self, item_id: str) -> bool:
+        # メルカリShops 的商品 ID 不是 m 开头，/items/get 拿不到它们（见下面 detail 的说明）
+        return item_id.startswith("m")
+
     def detail(self, item_id: str) -> dict | None:
         # メルカリShops 的商品 ID 不是 mXXXX 格式，/items/get 拿不到它们 ——
         # 不先挡掉的话，每个 Shops 商品每轮都要打一次注定失败的请求。

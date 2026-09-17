@@ -20,6 +20,8 @@ import config  # noqa: E402
 from core import poller  # noqa: E402
 from sources import yahoo_flea  # noqa: E402
 
+T_NOW = datetime(2026, 9, 17, 5, 0)
+
 SOLD_PAGE = '''<html><head>
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"Product",
 "name":"ASUS ROG Matrix Platinum GeForce RTX 5090 OC","image":["x.jpg"],"url":"https://x",
@@ -63,6 +65,12 @@ def test_detail在没有NEXT_DATA时会走schema_org():
 # ---------------------------------------------------------------- B
 
 class FakeStore:
+    def refresh_median(self, rid):   # 成交样本进来后会刷中位数
+        return (None, 0)
+
+    def get_settings(self, force=False):   # _search 读 search_reuse_min；空字典＝不复用
+        return {}
+
     def __init__(self, items):
         self.items = items
         self.samples, self.statuses, self.touched = [], [], []
@@ -73,8 +81,8 @@ class FakeStore:
     def touch_seen(self, *k):
         self.touched.append(k)
 
-    def set_status(self, source, iid, rid, status, sold_at=None):
-        self.statuses.append((iid, status))
+    def set_status(self, source, iid, rid, status, sold_at=None, price=None):
+        self.statuses.append((iid, status) if price is None else (iid, status, price))
 
     def add_sold_sample(self, rid, source, iid, price, sold_at, kind):
         self.samples.append((iid, price))
@@ -85,6 +93,9 @@ class FakeSrc:
 
     def __init__(self, detail):
         self._detail = detail
+
+    def can_detail(self, iid):
+        return True
 
     def detail(self, iid):
         return self._detail
@@ -108,18 +119,42 @@ def test_读到卖掉了但价格是0时不进样本():
     """状态和价格来自两个不同的解析路径，能读到"卖掉了"不代表能读到"多少钱"。
     0 进了 sold_sample 会把中位数往下拽。"""
     fake = run_reconcile({"status": "sold_out", "price": 0, "description": None})
-    assert fake.statuses == [("z1", "sold_out")], "状态照改"
+    assert fake.statuses == [("z1", "sold_out", 0)], "状态照改（价 0 由 set_status 自己忽略）"
     assert fake.samples == [], "¥0 不许进样本"
 
 
-def test_价格正常时照常进样本():
+def test_价格正常时照常进样本_并写回商品():
+    """【成交价要写回 item】不写回的话成交页上的价格/百分比全是它在售时的旧值。"""
     fake = run_reconcile({"status": "sold_out", "price": 890000, "description": ""})
     assert fake.samples == [("z1", 890000)]
+    assert fake.statuses == [("z1", "sold_out", 890000)]
+
+
+def test_set_status带价时写价_价为0时不动价():
+    from db import store
+
+    def capture(fn, *a, **kw):                     # 截 store.execute 真正发出去的 (SQL, 参数)
+        got = {}
+        saved = store.execute
+        store.execute = lambda sql, params=None: got.update(sql=sql, params=params)
+        try:
+            fn(*a, **kw)
+        finally:
+            store.execute = saved
+        return got["sql"], got["params"]
+
+    sql, params = capture(store.set_status, "s", "i", 1, "sold_out", sold_at=T_NOW, price=890000)
+    assert "price = %s" in sql and 890000 in params
+    sql0, _ = capture(store.set_status, "s", "i", 1, "sold_out", sold_at=T_NOW, price=0)
+    assert "price = %s" not in sql0, "价读不到（0）时不许把 0 写进去"
 
 
 # ---------------------------------------------------------------- C
 
 class SoldScanStore(FakeStore):
+    def get_settings(self, force=False):   # _search 读 search_reuse_min；空字典＝不复用
+        return {}
+
     def __init__(self, live_ids):
         super().__init__([])
         self.live = set(live_ids)

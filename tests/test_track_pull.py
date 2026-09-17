@@ -24,6 +24,9 @@ def item(i):
 class FakeStore:
     """只实现 refresh_tracked 真正用到的那几个方法，并记下 tracked_due 收到的参数。"""
 
+    def refresh_median(self, rid):   # 成交样本进来后会刷中位数
+        return (None, 0)
+
     TERMINAL = ("sold_out", "gone")
 
     def __init__(self, n):
@@ -36,7 +39,7 @@ class FakeStore:
     def tracked_items(self):
         return list(self.rows)
 
-    def tracked_due(self, track_min, limit):
+    def tracked_due(self, track_min, limit, trading_min=None):
         self.due_args = (track_min, limit)
         return self.rows[:limit]
 
@@ -55,6 +58,9 @@ class FakeSources:
 
     def get(self, name):
         return self
+
+    def can_detail(self, iid):
+        return True
 
     def detail(self, item_id):
         return {"status": "on_sale", "price": 700000, "name": "x",

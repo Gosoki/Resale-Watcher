@@ -95,6 +95,15 @@ class Source(ABC):
         if total >= limit:
             raise DailyLimitReached(f"当天全源已发 {total} 次请求，到上限 {limit}")
 
+    def can_detail(self, item_id: str) -> bool:
+        """这件商品的详情能不能拉。默认都能；メルカリShops 的不能（接口不支持）。
+
+        【为什么要问一句】拉不到详情的商品在对账里照样占一份 detail_budget、
+        照样被 touch_seen 成"刚核实过" —— 永远确认不了下架、永远不会失联。
+        问一句就跳过：不占预算、不 touch，让它按正常路径失联、撤下。
+        """
+        return True
+
     def _call(self, method: str, url: str, *, params=None, json_body=None,
               soft: tuple[int, ...] = ()) -> httpx.Response:
         """发一个请求。soft 里的状态码当作【正常回答】原样返回：不计失败、不退避、不抛。
@@ -140,7 +149,13 @@ class Source(ABC):
                             self.name, resp.status_code, back, self._fails)
                 time.sleep(back)
                 self._last_at = time.time()
-                raise RateLimited(f"{self.name} HTTP {resp.status_code}")
+                err = RateLimited(f"{self.name} HTTP {resp.status_code}")
+                # 【标一下"这是真限流、已经睡过退避"】追踪刷新按它决定要不要把这个源
+                # 本轮剩下的件留到下一轮。单件性质的失败（删掉的商品、某件回 500）
+                # 不带这个标，照旧只跳过那一件 —— 否则一件长期坏掉的商品会每轮
+                # 把整个源 cool 掉，同源别的商品从此再也刷不到。
+                err.backed_off = True
+                raise err
             raise RateLimited(f"{self.name} HTTP {resp.status_code}: {resp.text[:200]}")
 
     # ------------------------------------------------------------ 工具

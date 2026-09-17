@@ -124,3 +124,12 @@ def test_两个开关都不许重建命中页():
         assert "hits_view.refresh" not in code, (
             f"{fn.__name__} 又去重建命中页了 —— 点一下要多等 697ms。"
             "要让别的页跟上，用 stale_tabs()")
+
+
+def test_落库拒绝时图标翻回去():
+    """toggle_mark 遇到有备注的标记会拒绝（返回 False）—— 旗子不能停在翻过去的那一面。"""
+    twins = {}
+    webui.corner_toggle(True, ICONS, TIPS, BASE, "star-on", lambda v: False, twins, ("x", "s", "i"))
+    btn = _last_button()
+    _clicker(btn)()
+    assert label(btn) == "★" and "star-on" in btn._classes, "被拒绝后应该翻回原状"

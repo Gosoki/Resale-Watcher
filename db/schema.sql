@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS item (
   listed_at     DATETIME      NULL                    COMMENT '商品上架时间。ヤフオク 的搜索结果不给这个，会是 NULL',
   end_time      DATETIME      NULL                    COMMENT '结束时间。ヤフオク=拍卖截止（到点就没了，最要紧的一个数）；Yahoo!フリマ=出品期限；Mercari 没有',
   bid_count     INT           NULL                    COMMENT '出价数。只有拍卖有；NULL=不是拍卖。>0 说明正在竞价，当前价还会涨',
-  buy_now_price INT           NULL                    COMMENT '一口价／即決価格（日元）。0 或 NULL=没有一口价，只能竞价',
+  buy_now_price INT           NULL                    COMMENT '一口价／即決価格（日元），【已归一到税込】：ヤフオク 商家出品的搜索页给的是税抜，入库前 ×110÷100 切り捨て。0 或 NULL=没有一口价，只能竞价',
   first_seen_at DATETIME      NOT NULL                COMMENT '本脚本首次抓到它的时间',
   last_seen_at  DATETIME      NOT NULL                COMMENT '最后一次在搜索结果里见到它的时间',
   sold_at       DATETIME      NULL                    COMMENT '确认售出的时间',
@@ -135,6 +135,7 @@ CREATE TABLE IF NOT EXISTS item (
   tracked_at    DATETIME      NULL                    COMMENT '开始追踪的时间。NULL=没在追踪。【追踪的商品会单独拉详情刷新】不等整轮关键词扫描，所以价格/出价数/是否卖掉更新得快得多——代价是每件每次刷新都是一个真实请求，所以有 track_min 间隔和 track_budget 每轮上限两道闸',
 
   notified_at   DATETIME      NULL                    COMMENT '推送过这件商品的时间。NULL=还没推过。【失败也会写】推送失败不重试：一条迟到一小时的提醒没有意义，而对着挂掉的地址每轮重试会拖慢抓取',
+  notified_price INT          NULL                    COMMENT '上次推送时它的价格。notify_redrop_pct>0 时，比这个价再跌够百分比就再推一条（每推一次刷新一次）',
   final_notified_at DATETIME  NULL                COMMENT '推过「拍卖快结束」提醒的时间。NULL=还没推过。【和 notified_at 分开存】第一条是它刚变成捡漏那一刻发的（可能还剩两天），这一条是到点前的临门一脚，两条互不顶替；共用一列的话第二条永远发不出去',
 
   ship_from     VARCHAR(16)   NOT NULL DEFAULT ''     COMMENT '发货地都道府县，如「東京都」。【只有拉过详情的商品才有】三个源都只在详情响应里给这个字段，搜索结果里没有；没拉过详情的是空串＝未知，不打标签（不知道≠不是）。メルカリShops 的商品详情接口不支持，永远是空',
@@ -221,7 +222,7 @@ CREATE TABLE IF NOT EXISTS hidden_item (
   hidden_at  DATETIME     NOT NULL             COMMENT '按下剔除的时间。恢复列表按它倒序',
   PRIMARY KEY (source, item_id),
   KEY idx_hidden (hidden_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='手动从命中页剔除的商品。【只影响命中页的显示】商品照常抓取、照常对账、照常推送，全部页/追踪页/成交页都还看得到';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='手动从命中页剔除的商品。命中页不再显示、【也不再推送】（含快结束提醒）；商品本身照常抓取、照常对账，全部页/追踪页/成交页都还看得到';
 
 
 -- ============================================================

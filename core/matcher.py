@@ -13,7 +13,7 @@
 reject_reason 的先后顺序是有讲究的：把「永远不会翻身」的原因排在前面。
 一件因 excluded_title 被排掉的商品永远不会变合适，而 price_over 的降价后就会。
 """
-from core.normalize import ids, norm, word_pairs, words
+from core.normalize import norm, word_pairs, words
 
 def judge_snap(rule: dict, snap: dict) -> dict:
     """用搜索结果里的信息做初筛（不含商品描述 —— 那要另发一次详情请求）。
@@ -33,13 +33,23 @@ def judge_snap(rule: dict, snap: dict) -> dict:
     def reject(reason):
         return {"keep": True, "matched": 0, "reject_reason": reason}
 
-    # 【黑名单排在第 2 层最前面】它是你最明确的主动意图，应该盖过别的原因 ——
+    # 【拉黑列表排在第 2 层最前面】它是你最明确的主动意图，应该盖过别的原因 ——
     # 拉黑之后在「全部」页看到的却是「标题排除词」，你会以为拉黑没生效。
+    #
+    # 【列表是全局的，不再属于任何一条规则】拉黑一次对所有规则、所有源生效。
+    # 它由 db/store._with_settings 从 get_settings 并进每一个规则字典，所以这个
+    # 函数仍然是两参纯函数，4 个调用点一个都不用改 —— 这正是选这条路的理由：
+    # 改签名就有"某个调用方漏传"的可能，而漏传的表现是静默放行。
+    # 【键名不能叫 exclude_sellers】watch_rule 里那一列已废弃但永远删不掉
+    # （sync_schema 只增不删），重名的话 SELECT * 带回的空串会把全局列表整个盖掉。
+    # 【进来的必须是集合】字符串的 in 是子串匹配，会静默误杀ID里恰好含它的卖家。
+    # 类型由 store 出口一处保证，这里不做防御性检查（只在一边加会让判定和面板
+    # 按钮态各说各话）。
     seller = (snap.get("seller_id") or "").strip().lower()
     # 【卖家ID未知时不判】和下面品相白名单同一个道理：ヤフオク 有一部分商品不给
     # 卖家ID，メルカリShops 的卖家是店铺不是用户（接口返回哨兵 "0"，已在源那边
-    # 归一成空串）。按"不在黑名单里"放行是对的 —— 不知道 ≠ 命中。
-    if seller and seller in ids(rule.get("exclude_sellers")):
+    # 归一成 shop.id 或空串）。按"不在列表里"放行是对的 —— 不知道 ≠ 命中。
+    if seller and seller in (rule.get("blocked_sellers") or frozenset()):
         return reject("seller")
 
     if not rule.get("allow_shops") and snap.get("item_type") == "shop":
@@ -117,7 +127,7 @@ def explain(rule: dict, row: dict) -> str:
         return "メルカリShops 商家出品（规则没开「收 Shops」）"
 
     if reason == "seller":
-        return f"卖家 {row.get('seller_id') or '?'} 在黑名单里"
+        return f"卖家 {row.get('seller_id') or '?'} 在拉黑列表里"
 
     if reason == "no_keyword":
         # 平时不会入库（第一层就丢弃），只有改严必含词之后重判老商品才会出现

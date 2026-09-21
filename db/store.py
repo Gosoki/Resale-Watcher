@@ -258,8 +258,13 @@ def seed_settings() -> None:
 
 
 def get_settings(force: bool = False) -> dict:
-    """全局设置，按 SETTINGS_SPEC 声明的类型转好。带 10 秒缓存 ——
-    每轮判定都要读它，不缓存的话一轮几百次查询全打在数据库上。"""
+    """全局设置 + 全局拉黑列表，两样共用这一份 10 秒缓存。
+
+    每轮判定都要读它们，不缓存的话一轮几百次查询全打在数据库上。
+    【拉黑列表为什么搭这趟车】它也是全局的、也要经 _with_settings 送到 matcher、
+    也是每件商品读一次 —— 另开一份缓存就等于多一个"谁哪天忘了失效"的地方。
+    它不是 SETTINGS_SPEC 里的项，所以不会出现在设置页上、也不会被整页回写冲掉。
+    """
     now = time.monotonic()
     if not force and _settings_cache["data"] and now - _settings_cache["at"] < _SETTINGS_TTL:
         return _settings_cache["data"]
@@ -267,6 +272,18 @@ def get_settings(force: bool = False) -> dict:
         raw = {r["k"]: r["v"] for r in query("SELECT k, v FROM app_setting")}
     except Exception:                      # noqa: BLE001 - 库抽风时用默认值顶着，别让判定逻辑崩掉
         raw = {}
+    try:
+        blocked = frozenset(
+            s for s in ((r["seller_id"] or "").strip().lower()
+                        for r in query("SELECT seller_id FROM blocked_seller")) if s)
+    except Exception:                      # noqa: BLE001
+        # 【这一项必须沿用上一份，不能像上面那样回落成空】连接层刻意不自动重试
+        # （见本文件开头）：服务端在两次 ping 之间掐掉连接时，第一条查询必然抛一次。
+        # 回落成空集合的后果是这一轮 revalidate 把【所有】被拉黑的商品判回 matched=1，
+        # 而它们 notified_at IS NULL —— 紧接着的 push_new 就会把你亲手拉黑的那个人
+        # 一串推到手机上，10 秒后又静默判回去，日志里一条线索都没有。
+        blocked = _settings_cache["data"].get("blocked_sellers", frozenset())
+        log.warning("读拉黑列表失败，沿用上一份（%d 人）", len(blocked))
     data = {}
     for k, (typ, default, _note) in config.SETTINGS_SPEC.items():
         v = raw.get(k)
@@ -281,8 +298,22 @@ def get_settings(force: bool = False) -> dict:
             log.warning("设置项 %s 的值 %r 不是合法的 %s，本次回落到默认值 %r",
                         k, v, typ.__name__, default)
             data[k] = default
+    # 【必须是集合，不能是逗号串】matcher 里是 `seller in 它`：对字符串这个运算是
+    # 【子串匹配】—— 列表里有 967987475 会连坐 96798747，而那个人只是从此不再出现，
+    # 你永远不会发现。frozenset 顺便挡住"谁顺手往里加一个"。
+    data["blocked_sellers"] = blocked
     _settings_cache.update(at=now, data=data)
     return data
+
+
+def _drop_settings_cache() -> None:
+    """让这份缓存立刻失效，下次读就是新值。
+
+    【设置和拉黑列表都要走它】改完设置、拉黑完一个人，紧接着的动作（面板重判、
+    finalize）必须读到新值 —— 不清的话面板会提示「已拉黑，0 件改判」而商品原地
+    不动，人只会再点一次。两样共用一份缓存，所以也共用这一个失效点。
+    """
+    _settings_cache["at"] = 0.0
 
 
 def all_settings() -> list[dict]:
@@ -309,14 +340,16 @@ def save_setting(k: str, v) -> None:
     execute("INSERT INTO app_setting (k, v, note, updated_at) VALUES (%s, %s, '', %s) "
             "ON DUPLICATE KEY UPDATE v = VALUES(v), updated_at = VALUES(updated_at)",
             (k, str(v), config.now()))
-    _settings_cache["at"] = 0.0            # 立即失效，下次读就是新值
+    _drop_settings_cache()
 
 
 # ---------------------------------------------------------------- 规则
 
 RULE_COLUMNS = (
     "name, enabled, keyword, sources, include_all, include_any, exclude_any, warn_desc, "
-    "exclude_sellers, "
+    # 【exclude_sellers 2026-09-17 摘掉】卖家黑名单改成全局表 blocked_seller 了。
+    # 列还在库里（sync_schema 只增不删），但从此不读不写；留在这里的话规则对话框
+    # 保存时会把一个没人读的列写来写去，而人以为自己在维护黑名单。
     "price_min, price_max, condition_ids, allow_shops, check_desc, "
     "deal_price, deal_ratio, quick_min, note"
 )
@@ -329,9 +362,16 @@ def _with_settings(rule: dict) -> dict:
     """把全局设置并进规则字典。
 
     这样 core/matcher.py 不用 import store 就能拿到 max_pages 之类的全局项，
-    保持纯函数、好测试；调用方也不必到处传 settings 参数。
-    规则自身的字段优先（虽然目前两边没有重名）。写回时 update_rule 只认
-    RULE_FIELDS，多出来的键不会被误写进 watch_rule 表。
+    保持纯函数、好测试；调用方也不必到处传 settings 参数。全局拉黑列表
+    （blocked_sellers）也走这条路 —— judge_snap 的 4 个调用点全部经过
+    get_rule/get_rules，所以结构上漏不了，不用去改它的签名。
+
+    规则自身的字段优先，所以【全局键绝不能和 watch_rule 的列同名】：get_rules 是
+    SELECT *，库里那列哪怕已废弃、值是空串，也会把全局值整个盖掉，而且不报任何错。
+    全局拉黑列表叫 blocked_sellers 而不是沿用 exclude_sellers，就是为了躲开这个
+    （exclude_sellers 那一列 sync_schema 永远不会删）。有一条测试钉着这一点。
+
+    写回时 update_rule 只认 RULE_FIELDS，多出来的键不会被误写进 watch_rule 表。
     """
     return {**get_settings(), **rule}
 
@@ -456,6 +496,77 @@ def hidden_ids() -> set[tuple[str, str]]:
 def hidden_items() -> list[dict]:
     """剔除列表，最近剔的在前。"""
     return query("SELECT * FROM hidden_item ORDER BY hidden_at DESC")
+
+
+# ---------------------------------------------------------------- 全局拉黑（对所有规则生效）
+
+def block_seller(seller_id: str, row: dict | None = None) -> None:
+    """把一个卖家加进全局拉黑列表。
+
+    【只按 seller_id 记，不带源也不带规则】和剔除按 (source, item_id) 记是同一个
+    道理的另一面：你说「不想再看到这个人」，指的是这个人本身，不是「他在某条规则
+    下的那些行」，也不是「他挂在某个源上的那些行」。
+
+    【存一份快照】source / item_id / item_name 是拉黑那一刻他挂的那件东西，只给
+    列表显示（拼成可点的链接）—— 判定永远不比它们。手动添加的没有商品可快照，留空。
+
+    【原样存，不转小写】面板上那串ID要能直接复制回源站打开。去重靠主键的
+    utf8mb4_unicode_ci（大小写不敏感），比对靠 get_settings 建集合时的 lower()。
+
+    【重复拉黑不覆盖时间】ON DUPLICATE 里故意什么都不改，理由同 set_hidden。
+
+    【空ID直接忽略】ヤフオク 有一部分商品不给卖家ID。空串进表会在列表里留下一行
+    点不掉的幽灵，而它一件商品也拦不住（judge_snap 对卖家未知的一律放行）。
+    """
+    sid = (seller_id or "").strip()
+    if not sid:
+        return
+    # 【sid 超长在这里只会被静默截断成一个错的键】所以"人手输入"那条路由
+    # web/ui.py 的 add_blocked 先拦一道（粘一整条卖家主页 URL 是真会发生的）。
+    # 按钮那条路传进来的 ID 本来就是从 VARCHAR(32) 的列里读出来的，不可能超。
+    r = row or {}
+    execute("INSERT INTO blocked_seller (seller_id, source, item_id, item_name, blocked_at) "
+            "VALUES (%s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE seller_id = seller_id",
+            (sid[:32], (r.get("source") or "")[:16], (r.get("item_id") or "")[:32],
+             (r.get("name") or "")[:255], config.now()))
+    _drop_settings_cache()
+
+
+def unblock_seller(seller_id: str) -> None:
+    """解除拉黑。被误杀的商品下一次重判就回到命中页 —— 这正是拉黑只判 matched=0
+    而【仍然入库】的理由。"""
+    execute("DELETE FROM blocked_seller WHERE seller_id = %s", ((seller_id or "").strip(),))
+    _drop_settings_cache()
+
+
+def blocked_sellers() -> frozenset:
+    """全局拉黑的卖家ID（已小写）。判定和面板的按钮态都用它。
+
+    【故意不自己查库】走 get_settings 那一份 10 秒缓存：判定时每件商品都要它，
+    一轮几百次；「全部」页每行也要算一次按钮态，300 行就是 300 次。
+    """
+    return get_settings()["blocked_sellers"]
+
+
+def blocked_items() -> list[dict]:
+    """拉黑列表，最近拉的在前。只给规则页页尾那一块用（1 条 SQL，进了页面预算）。"""
+    return query("SELECT * FROM blocked_seller ORDER BY blocked_at DESC")
+
+
+def seller_item_count(seller_id: str) -> int:
+    """这个卖家名下入了库的商品件数，只用来给拉黑/解除的提示写一个【真实】的数字。
+
+    【不能拿 revalidate 的返回值当这个数】它连 desc_warn 的重算也算进去，
+    全局重判之后那个数会把别的规则、别处积压的分歧一起算上（见 poller.revalidate_all）。
+
+    【按链接数去重，不数 item 的行数】item 的主键是 (source, item_id, rule_id)：
+    同一个链接被 N 条规则抓到就是 N 行。实测有个卖家 22 行 / 只有 10 件商品 ——
+    直接 COUNT(*) 会写成「他名下 22 件商品」，而这个函数存在的唯一理由就是
+    给人看一个真实的数字。
+    """
+    return (one("SELECT COUNT(DISTINCT source, item_id) n FROM item "
+                "WHERE LOWER(seller_id) = %s",
+                ((seller_id or "").strip().lower(),)) or {"n": 0})["n"]
 
 
 def mark_note_of(source: str, item_id: str) -> str:
@@ -849,6 +960,15 @@ NOTIFY_COLS = ("source, item_id, rule_id, name, price, is_deal, deal_pct, bid_co
 # 还在响，会被当成 bug。两条待推查询都带上这一句。
 NOT_HIDDEN = ("AND NOT EXISTS (SELECT 1 FROM hidden_item h "
               "WHERE h.source = item.source AND h.item_id = item.item_id) ")
+# 【拉黑的不推】和剔除同一个道理，但更硬：拉黑是"这个人的东西一件都别给我看"。
+# 【为什么不能只靠判定】被拉黑的商品 matched 会被重判成 0，本来就选不出来 ——
+# 但那要等下一次 revalidate，而另一台机器（NAS）手里的拉黑列表最多旧 10 秒，
+# 窗口里它会把 matched=1 写回去，而那些行 notified_at IS NULL，下一步就是推送。
+# 写死在 SQL 里，推送从此和缓存新鲜度、和两个进程的时序完全无关。
+# 【item.seller_id <> '' 不能省】ヤフオク 有一部分商品不给卖家ID，万一表里混进
+# 一行空串，这一句会把所有"卖家未知"的商品一次性静默停推 —— 违「宁可漏筛不可误杀」。
+NOT_BLOCKED = ("AND NOT EXISTS (SELECT 1 FROM blocked_seller b "
+               "WHERE item.seller_id <> '' AND b.seller_id = item.seller_id) ")
 
 
 def pending_notify(rule_id: int, only_deal: bool, redrop_pct: int = 0) -> list[dict]:
@@ -863,7 +983,7 @@ def pending_notify(rule_id: int, only_deal: bool, redrop_pct: int = 0) -> list[d
     每推一次基线刷新一次，掉几百块不会反复轰炸。N=0 关闭，也就是老行为。
     """
     sql = (f"SELECT {NOTIFY_COLS} FROM item WHERE rule_id = %s AND matched = 1 "
-           "AND status = 'on_sale' " + NOT_HIDDEN +
+           "AND status = 'on_sale' " + NOT_HIDDEN + NOT_BLOCKED +
            "AND (notified_at IS NULL OR (%s > 0 AND notified_price IS NOT NULL "
            "     AND price * 100 <= notified_price * (100 - %s)))")
     if only_deal:
@@ -893,7 +1013,7 @@ def pending_final(rule_id: int, minutes: int) -> list[dict]:
         f"SELECT {NOTIFY_COLS} FROM item "
         "WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' AND is_deal = 1 "
         "AND bid_count IS NOT NULL AND end_time IS NOT NULL "
-        "AND end_time > %s AND end_time <= %s " + NOT_HIDDEN +
+        "AND end_time > %s AND end_time <= %s " + NOT_HIDDEN + NOT_BLOCKED +
         "AND final_notified_at IS NULL "
         "AND notified_at IS NOT NULL "
         "AND notified_at < DATE_SUB(end_time, INTERVAL %s MINUTE) "

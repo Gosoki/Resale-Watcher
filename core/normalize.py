@@ -41,6 +41,18 @@ def words(csv: str | None) -> list[str]:
 
 
 
+def id_tokens(csv: str | None) -> list[str]:
+    """把逗号分隔的【标识符】拆开，只去空白，【保留原样大小写】。
+
+    下面的 ids() 是它的小写版，那是【比对】用的口径。要入库、要显示给人看的
+    时候必须用这一个：ヤフオク 和 メルカリShops 的 ID 是大小写敏感的 base62，
+    压成小写之后那串字符就再也复制不回源站打开了。
+    """
+    if not csv:
+        return []
+    return [t.strip() for t in _SPLIT.split(csv) if t.strip()]
+
+
 def ids(csv: str | None) -> set[str]:
     """把逗号分隔的【标识符】拆开，只做去空白 + 转小写。
 
@@ -51,6 +63,4 @@ def ids(csv: str | None) -> set[str]:
     不同的 ID 抹成同一个。转小写是为了容忍手抄时的大小写出入：
     实测库里 179 个卖家 ID 小写化之后【没有任何碰撞】。
     """
-    if not csv:
-        return set()
-    return {t.strip().lower() for t in _SPLIT.split(csv) if t.strip()}
+    return {t.lower() for t in id_tokens(csv)}

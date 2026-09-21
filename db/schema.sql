@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS watch_rule (
   include_any   VARCHAR(512)  NOT NULL DEFAULT ''     COMMENT '任含词（OR）：出现任意一个即可。留空=不检查',
   exclude_any   VARCHAR(1024) NOT NULL DEFAULT ''     COMMENT '排除词：出现任意一个就判不合适。例：ジャンク,部品取り,箱のみ,ノート,ゲーミングPC',
 
-  exclude_sellers VARCHAR(1024) NOT NULL DEFAULT ''   COMMENT '卖家黑名单，逗号分隔的卖家ID。命中就判不合适（reject_reason=seller），但仍入库——取消拉黑后会被重判回来。【每条规则各自一份】和其它词表一致；同一个卖家要在多条规则里分别拉黑。面板命中页每行有「拉黑」按钮，不用手抄ID。【卖家ID未知的商品一律不判】ヤフオク 部分商品不给卖家ID，メルカリShops 的卖家不是用户——不知道≠命中',
+  exclude_sellers VARCHAR(1024) NOT NULL DEFAULT ''   COMMENT '【已废弃 2026-09-17】卖家黑名单已改成全局表 blocked_seller：拉黑一次对所有规则、所有源生效，起因是「按规则各拉一次」同一个刷屏卖家要表达N遍、漏掉一条就照样推到手机。这一列任何代码都不再读写（也不在 RULE_COLUMNS 里），里面的值是迁移前的原样备份，留着不删——sync_schema 只增不删，自动DROP列是不可逆地删数据',
 
   price_min     INT           NOT NULL DEFAULT 0      COMMENT '价格下限（日元，含）。0=不限。低于它多半是配件/废品',
   price_max     INT           NOT NULL DEFAULT 0      COMMENT '价格上限（日元，含）。0=不限。这是「合适」的硬门槛',
@@ -116,7 +116,7 @@ CREATE TABLE IF NOT EXISTS item (
   item_type     VARCHAR(8)    NOT NULL DEFAULT 'user' COMMENT 'user=个人出品 shop=商家出品（メルカリShops 等）',
   category_id   INT           NULL                    COMMENT '该平台的分类ID（各家编号体系不同，不跨源比较）',
   brand_name    VARCHAR(64)   NOT NULL DEFAULT ''     COMMENT '品牌名。只有 Mercari 和 Yahoo!フリマ 给，且经常为空或不准；ヤフオク 恒为空',
-  seller_id     VARCHAR(32)   NOT NULL DEFAULT ''     COMMENT '卖家ID。【宽度按最长的源定】实测 ヤフオク 的是 28~29 字符，Mercari 是 1~9 位数字，Yahoo!フリマ 是 p+数字共 5~9；原本 VARCHAR(24) 会把 ヤフオク 的全部截断，于是你从网页上复制完整ID填进卖家黑名单会匹配不上',
+  seller_id     VARCHAR(32)   NOT NULL DEFAULT ''     COMMENT '卖家ID。【宽度按最长的源定】实测 ヤフオク 的是 28~29 字符，Mercari 是 1~9 位数字，Yahoo!フリマ 是 p+数字共 5~9；原本 VARCHAR(24) 会把 ヤフオク 的全部截断，于是你从网页上复制完整ID填进拉黑列表（blocked_seller）会匹配不上',
   thumb_url     VARCHAR(255)  NOT NULL DEFAULT ''     COMMENT '缩略图，面板里显示用',
 
   listed_at     DATETIME      NULL                    COMMENT '商品上架时间。ヤフオク 的搜索结果不给这个，会是 NULL',
@@ -223,6 +223,19 @@ CREATE TABLE IF NOT EXISTS hidden_item (
   PRIMARY KEY (source, item_id),
   KEY idx_hidden (hidden_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='手动从命中页剔除的商品。命中页不再显示、【也不再推送】（含快结束提醒）；商品本身照常抓取、照常对账，全部页/追踪页/成交页都还看得到';
+
+
+-- ============================================================
+-- 全局拉黑的卖家 —— 拉黑一次，所有规则、所有源都不再出现他的商品
+-- ============================================================
+CREATE TABLE IF NOT EXISTS blocked_seller (
+  seller_id  VARCHAR(32)  NOT NULL             COMMENT '卖家ID。【原样存，不转小写】面板上这串ID要能直接复制回源站打开，而 ヤフオク 和 メルカリShops 的是大小写混合的base62。比对时才小写（core/normalize.ids 的口径）；本表 collation 是 utf8mb4_unicode_ci，主键天生大小写不敏感，同一个人不会存成两行',
+  source     VARCHAR(16)  NOT NULL DEFAULT ''  COMMENT '拉黑那一刻他挂在哪个源（快照，只给列表显示）。【判定完全不比它】比了就等于把「按规则分别拉黑」换成「按源分别拉黑」，那正是这次要取消的东西。手动添加的留空',
+  item_id    VARCHAR(32)  NOT NULL DEFAULT ''  COMMENT '拉黑时点的那件商品ID，列表里拼成可点的链接。光看一串22位base62，一周后根本认不出拉黑的是谁。手动添加的留空',
+  item_name  VARCHAR(255) NOT NULL DEFAULT ''  COMMENT '那件商品的标题快照。理由同 hidden_item.name：那条 item 可能已经被删规则带走了，只存ID的话这一页就剩一排认不出的编号',
+  blocked_at DATETIME     NOT NULL             COMMENT '按下拉黑的时间。列表按它倒序。【重复拉黑不覆盖它】保持第一次按下的那一刻，理由同 hidden_item',
+  PRIMARY KEY (seller_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='全局卖家拉黑列表。命中就判不合适（reject_reason=seller）、也不再推送，但商品【仍然入库】——解除后重判一次就回到命中页，不用等他重新上架。【只按卖家ID记，不带源也不带规则】三个源的ID体系互不重叠：Mercari个人是9位数字、Shops是22位base62的shop.id、Yahoo!フリマ是p+数字、ヤフオク是28~29位base62。加第四个源时必须重新核对这一条。【卖家ID未知的商品一律放行】ヤフオク 部分商品不给卖家ID，不知道≠命中';
 
 
 -- ============================================================

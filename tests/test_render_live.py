@@ -27,7 +27,12 @@ def _db_ok() -> bool:
 pytestmark = pytest.mark.skipif(not _db_ok(), reason="数据库连不上，跳过真库渲染")
 
 # 每页最多允许发几条 SQL —— 超了就是有人在循环里加了"顺手查一下"
-BUDGET = {"命中": 8, "追踪": 4, "标记": 2, "成交": 5, "全部": 2, "规则": 4, "设置": 2}
+# 【规则 4→5、设置 2→3 是 2026-09-17 全局拉黑带来的】规则页页尾那块「拉黑列表」
+# 自己读一次 blocked_seller（和命中页的 hidden_items 同性质，整行取、没法折进缓存）；
+# 设置页的 all_settings 里有一次 get_settings(force=True)，现在会连带读一次那张表。
+# 别的五页是 0 增量：get_rules → _with_settings → get_settings 已经把列表读进缓存，
+# blocked_sellers() 只是读缓存。数字要动必须先想清楚是不是又有人在循环里加了查询。
+BUDGET = {"命中": 8, "追踪": 4, "标记": 2, "成交": 5, "全部": 2, "规则": 5, "设置": 3}
 
 
 @pytest.mark.parametrize("name", list(BUDGET))
@@ -40,6 +45,8 @@ def test_视图在真库上渲染_且SQL条数在预算内(name):
     saved_q, saved_e = store.query, store.execute
     store.query = lambda sql, args=(): (calls.append(sql), saved_q(sql, args))[1]
     store.execute = lambda sql, args=(): (calls.append(sql), saved_e(sql, args))[1]
+    # 预热：这一句现在也把拉黑列表读进了同一份缓存。删掉它会让好几页的计数
+    # 一起变（那是冷缓存的真实代价），不是 bug。
     store.get_settings(force=True)
     calls.clear()
     fns = {

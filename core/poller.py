@@ -353,6 +353,24 @@ def revalidate(rule: dict) -> int:
     return changed
 
 
+def revalidate_all() -> int:
+    """全局拉黑列表变了之后重判【所有】规则，返回改判总行数。
+
+    【必须含 enabled=0 的规则】停用的规则不再被扫描、也进不了 finalize，跳过它
+    等于它名下的 reject_reason 永远停在旧值：「全部」页显示的理由和实际对不上，
+    哪天重新启用还要再等一轮才收敛。所以走 store.get_rules()，不带 enabled_only。
+
+    【返回值不是"他名下几件商品"】revalidate 顺带重算 desc_warn，所以这个数会把
+    所有规则上积压的任何分歧一起算进来。要给人看的数字用 store.seller_item_count。
+
+    【同步跑，不套 SCAN_LOCK】和 revalidate 一样是纯数据库、不发任何请求。实测
+    4 条规则 / item 共 734 行，一次全局重判不到 0.5 秒。代价是这期间面板是冻住的，
+    而且会随规则条数线性涨 —— 规则涨到十几条时要改成 run.io_bound，现在不值得
+    为它引入 async。
+    """
+    return sum(revalidate(r) for r in store.get_rules())
+
+
 # ------------------------------------------------------------------ 5. 捡漏（跨源）
 
 def mark_deals(rule: dict) -> None:
@@ -525,6 +543,12 @@ def finalize(rule_id: int) -> dict:
     原样判回命中 —— 用户最明确的一次主动操作被静默回滚，面板上那几件商品
     当着人的面又冒出来，而日志里什么都没有。
 
+    【拉黑列表还要多强刷一次】它是全局的，走 get_settings 那份 10 秒缓存 ——
+    get_rule 那条无缓存的 SELECT 保不住它。强刷只把窗口从 10 秒缩到「这一次
+    revalidate 跑完」，不是消除；真正的硬保证在推送那一侧（store.NOT_BLOCKED
+    是一句写死的 SQL，和缓存新鲜度无关），所以窗口里最坏也只是面板上多显示
+    一会儿，不会推到手机上。
+
     【扫描阶段用旧快照是可以接受的】scan_on_sale 期间 upsert 可能按旧规则
     写回 matched=1，但紧接着这里就用新规则整体重判一遍，同一轮内就收敛了。
 
@@ -533,6 +557,7 @@ def finalize(rule_id: int) -> dict:
     （./run.sh start / systemd）下一条都发不出去，而且待推的商品会一直
     堆到某次手动触发时超过 notify_max_per_round，被整批标成已推、永久丢掉。
     """
+    store.get_settings(force=True)                  # 连拉黑列表一起现取，理由见上
     rule = store.get_rule(rule_id)
     if rule is None:
         return {"rejudged": 0, "notified": 0}       # 规则在这一轮里被删了

@@ -19,7 +19,7 @@ import sources
 from core import notify as push          # 【必须改名】本文件里的 notify() 是弹提示的
 from core import poller
 from core.matcher import explain
-from core.normalize import ids
+from core.normalize import id_tokens
 from db import store
 
 log = logging.getLogger(__name__)
@@ -175,7 +175,7 @@ REASON_LABEL = {
     # 重判【已在库】的商品 —— 你把必含词改严之后，老商品就会被写成这个原因留在库里
     "no_keyword": "关键词不匹配",
     "condition": "品相不符", "shop_item": "Shops商家品",
-    "seller": "卖家黑名单",
+    "seller": "卖家拉黑",
 }
 
 # 编辑对话框里每个字段的提示。写在这里而不是只靠 DDL 注释 ——
@@ -188,9 +188,6 @@ FIELD_HELP = {
     "exclude_any": "标题排除词，命中任一即判不合适。整机靠 CPU 型号（ryzen/ultra9/14900）最好认",
     "warn_desc": "描述警示词，只查描述。【命中只打黄标，不会毙掉商品】所以可以放宽一点填，"
                  "宁可多挂个标签让你看一眼，也别静悄悄漏掉一块好卡",
-    "exclude_sellers": "卖家黑名单：逗号分隔的卖家ID，命中就判不合适。"
-                       "【不用手抄】命中页每行有「拉黑卖家」按钮，点一下就加进来。"
-                       "取消拉黑（从这里删掉）后，被误杀的商品下一轮会自己回到命中列表",
     "condition_ids": "品相白名单 1新品〜6状态差，逗号分隔。留空=不限",
     "note": "备注",
 }
@@ -394,7 +391,7 @@ def toggle_hide(row: dict, rule_name: str, on: bool) -> None:
 
     【只是不显示，不是删除也不是拉黑】三件事经常被混为一谈，代价差很远：
       剔除    命中页不再显示它、也不再推送。照常抓取、照常对账
-      拉黑卖家 整条规则下这个卖家的所有商品立刻判为不合适
+      拉黑卖家 【所有规则、所有源】下这个卖家的商品立刻判为不合适，也不再推送
       删规则   连商品带成交样本一起删掉
     所以提示里必须把"它还在"说清楚，否则你会以为自己刚刚扔掉了什么。
     """
@@ -567,39 +564,99 @@ def drop_hidden(rows: list[dict], hidden: set) -> list[dict]:
     return [r for r in rows if (r["source"], r["item_id"]) not in hidden]
 
 
-def blacklist_seller(rule_id: int, seller_id: str) -> None:
-    """把这个卖家加进该规则的黑名单，并【立刻】重判一次。
+def blacklist_seller(seller_id: str, row: dict | None = None) -> None:
+    """把这个卖家加进【全局】拉黑列表，并立刻重判所有规则。
 
-    立刻重判（而不是等下一轮）是因为这是个手动动作：点完按钮商品还挂在页面上，
-    人会以为没生效、然后再点一次。revalidate 是纯 CPU、不发任何请求，
-    在这里同步跑一次的代价只是几百行 UPDATE。
+    【为什么是全局】同一个刷屏的店铺会同时撞上好几条规则，按规则各拉一次等于
+    同一个意图要表达 N 遍，而且漏掉一条，他的商品照样从那条规则推到你手机上。
+
+    【为什么要立刻重判、而且是全部规则】这是个手动动作：点完按钮商品还挂在
+    页面上，人会以为没生效然后再点一次。只重判当前这条的话，别的规则下那批
+    商品在改判之前就已经被 finalize 推出去了。代价见 poller.revalidate_all。
     """
-    rule = store.get_rule(rule_id)
-    if not rule:
-        notify("这条规则不在了（可能刚被删掉）", type="warning")
+    sid = (seller_id or "").strip()
+    if not sid:
+        notify("这件商品没有卖家ID，没有可拉黑的对象", type="warning")
         return
-    cur = rule["exclude_sellers"] or ""
-    if seller_id.strip().lower() in ids(cur):
-        notify(f"{seller_id} 已经在黑名单里了")
+    if sid.lower() in store.blocked_sellers():
+        notify(f"{sid} 已经在拉黑列表里了")
         return
-    new = f"{cur},{seller_id}" if cur else seller_id
-    # exclude_sellers 是 VARCHAR(1024)。满了必须出声 —— 非严格模式下 MySQL 会
-    # 【静默截断】，那会把最后一个 ID 砍成半截：既没拉黑成，又可能误伤一个
-    # 前缀恰好相同的卖家，而面板上显示的是「已拉黑」。
-    if len(new) > 1024:
-        notify("黑名单满了（上限 1024 字符）—— 去规则页删掉几个不再需要的 ID",
-               type="negative")
+    store.block_seller(sid, row)
+    # 【必须写完库再重判】block_seller 末尾才让缓存失效；顺序反了就是拿旧列表
+    # 重判，结果是「已拉黑」却一件都没改判，而商品原地不动 —— 人只会再点一次。
+    poller.revalidate_all()
+    notify(f"已拉黑 {sid}：他名下 {store.seller_item_count(sid)} 件商品在所有规则下"
+           "都判为不合适，也不再推送。要反悔：「规则」页最下面的「拉黑列表」")
+    _refresh_after_block()
+
+
+def unblock_seller(seller_id: str) -> None:
+    """解除拉黑。被误杀的商品下一次重判就回到命中页 —— 这正是拉黑只判
+    matched=0 而【仍然入库】的理由。"""
+    store.unblock_seller(seller_id)
+    poller.revalidate_all()
+    notify(f"已解除 {seller_id}，他名下 {store.seller_item_count(seller_id)} 件商品已重判"
+           "（合适的回到命中页）")
+    _refresh_after_block()
+
+
+# 卖家ID 的列宽（blocked_seller.seller_id / item.seller_id 都是 VARCHAR(32)）
+SELLER_ID_MAX = 32
+
+
+def add_blocked(inp) -> None:
+    """手动添加。一次可以粘多个 —— 半角/全角逗号、顿号、分号、换行都认。
+
+    【这个入口不能省】拉黑按钮只在有卖家ID的行上有，而你可能是在源站页面上
+    先看到这个人的。规则对话框里原本那个 exclude_sellers 文本框没了，手输的
+    路子必须在这里补回来。
+
+    【原样入库，只拿小写去重】用 id_tokens 而不是 ids：ids() 的小写是【比对】
+    口径，拿它的结果直接入库会把 ヤフオク / メルカリShops 那些大小写敏感的
+    base62 压成小写。判定照常（两边都小写），但列表里显示的那串就再也复制
+    不回源站打开了 —— 而手动加的那行没有商品链接，那串ID是它唯一的把手。
+
+    【不像 ID 的先拦下来出声】提示语写着"卖家ID"，人照样会顺手粘一整条
+    卖家主页 URL。它比列宽长，落库时会被截成半截、拦不住任何商品，而下次
+    再粘同一条时"已在列表里"又比不中（库里是截断后的），于是每次都提示
+    「已拉黑 1 人」、每次都白跑一遍全局重判，永远收敛不了，日志里毫无线索。
+    """
+    have = store.blocked_sellers()
+    fresh, dup, bad = [], 0, []
+    for raw in id_tokens(inp.value):
+        if len(raw) > SELLER_ID_MAX or "/" in raw or ":" in raw:
+            bad.append(raw)
+        elif raw.lower() in have or raw.lower() in {x.lower() for x in fresh}:
+            dup += 1
+        else:
+            fresh.append(raw)
+    if bad:
+        notify(f"这些不像卖家ID（超过 {SELLER_ID_MAX} 个字符，或者是网址）：" +
+               "、".join(b[:40] for b in bad[:3]) +
+               "。只粘ID那一段，别粘整条链接", type="negative")
         return
-    store.update_rule(rule_id, {"exclude_sellers": new})
-    n = poller.revalidate(store.get_rule(rule_id))
-    # 【提示里要点名是哪条规则】黑名单是按规则存的，而「全部」页可以同时列出
-    # 多条规则的商品 —— 不说清楚的话，你以为拉黑了这个人，其实只在一条规则里生效。
-    notify(f"「{rule['name']}」已拉黑 {seller_id}，{n} 件商品改判")
-    # 两个页都要刷：从哪个页点的都可能。refresh() 不带参数会沿用各自最近一次的
-    # 参数（NiceGUI 的 target.args = args or target.args），所以「全部」页的
-    # 筛选条件不会被重置回「全部规则」。没渲染过的页 targets 为空，是空操作。
+    if not fresh:
+        notify("没有新的 ID（空的，或者都已经在列表里了）", type="warning")
+        return
+    for sid in fresh:
+        store.block_seller(sid)
+    # 输入框不用手动清空：下面的 rules_view.refresh() 会把这一块整个重建。
+    poller.revalidate_all()
+    notify(f"已拉黑 {len(fresh)} 人" + (f"（另有 {dup} 个已经在列表里）" if dup else "") +
+           "，全部规则已重判")
+    _refresh_after_block()
+
+
+def _refresh_after_block() -> None:
+    # 三个页都要刷：动作可能从命中页或「全部」页发起，而列表在规则页。
+    # 【不要改写成 stale_tabs("规则")】REFRESH 里只登记了命中/追踪/标记/成交
+    # 四页，切过去时 REFRESH[name].refresh() 会 KeyError。
+    # refresh() 不带参数会沿用各自最近一次的参数（NiceGUI 的
+    # target.args = args or target.args），所以「全部」页的筛选条件不会被重置回
+    # 「全部规则」。没渲染过的页 targets 为空，是空操作。
     hits_view.refresh()
     all_view.refresh()
+    rules_view.refresh()
 
 
 @contextmanager
@@ -846,6 +903,53 @@ def _hidden_block() -> None:
                     .props(BTN_GHOST).classes("shrink-0")
 
 
+def _blocked_block() -> None:
+    """规则页页尾的「拉黑列表」—— 拉黑唯一的退路，兼手动添加的入口。
+
+    【和命中页那块「已剔除」不是一回事】剔除只管眼前这一条、只影响命中页；
+    拉黑是全局的：所有规则、所有源，他的商品一律判不合适，也不再推送。
+
+    【为什么放规则页而不是命中页】① 命中页那 8 条 SQL 正好顶在预算上，而这一块
+    一周看不了一次；② 命中页「已剔除」那段注释明写"放这儿是因为它只影响这一页"，
+    把一个全局控件挂在那条论证下面，下一个人会照着推出错的结论。
+    动作入口在命中页和「全部」页，那两处的 tooltip 都指到这里来。
+
+    【空列表也要画出来，不能像 _hidden_block 那样直接 return】它还兼着手动添加：
+    空了就 return 的话，列表一旦删空就再也加不回去了。
+    """
+    rows = store.blocked_items()
+    with ui.expansion(f"拉黑列表　{len(rows)} 人",
+                      caption="对【所有规则、所有源】生效：他的商品一律判不合适、"
+                              "也不再推送，但仍照常入库 —— 点「解除」下一次重判就回来",
+                      value=False).classes(CARD).props("header-class=text-base"):
+        with ui.row().classes("items-center w-full gap-2"):
+            inp = ui.input(placeholder="卖家ID，可一次粘多个（逗号分隔）") \
+                .classes("flex-1 min-w-0").props(INPUT)
+            ui.button("添加", on_click=lambda: add_blocked(inp)).props(BTN_GHOST)
+        for m in rows:
+            with ui.row().classes("items-center w-full gap-3 border-t py-2 sm:flex-nowrap"):
+                if m["source"]:
+                    ui.badge(source_name(m["source"])).classes(BADGE_LABEL)
+                ui.label(m["seller_id"]).classes("shrink-0")
+                # 【要一个能点开的链接】光一串 22 位 base62，一周之后你根本认不出
+                # 自己拉黑的是谁。存的是拉黑那一刻他挂的那件商品（快照）。
+                if m["item_id"]:
+                    ui.link(m["item_name"] or m["item_id"],
+                            item_url(m["source"], m["item_id"]),
+                            new_tab=True).classes("flex-1 min-w-0 break-words")
+                else:
+                    # 手动添加的没有商品可链接；迁移进来的那几条在 item_name 里
+                    # 写着自己的来历，照样显示出来，不然这一行只剩一串数字。
+                    ui.label(m["item_name"] or "（手动添加）") \
+                        .classes("flex-1 min-w-0 break-words text-gray-400")
+                ui.label(f"{m['blocked_at']:%m-%d %H:%M} 拉黑") \
+                    .classes("text-xs text-gray-500 shrink-0")
+                # 【绑死 sid】m 是循环变量，理由同上面
+                ui.button("解除", on_click=lambda _, sid=m["seller_id"]:
+                          unblock_seller(sid)) \
+                    .props(BTN_GHOST).classes("shrink-0")
+
+
 def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, twins: dict,
              fresh_hours: int, cold_start: bool, warn_h: float, hide_h: float,
              show_rule: bool = False) -> None:
@@ -1014,7 +1118,7 @@ def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, twins: dict,
             price_history(r, prev)
             # 追踪已经挪到图片角上的星了，这里剩「剔除这一件」和「拉黑这个人」。
             # 【两个挨着放是有意的】它们长得像、作用范围差一个数量级：
-            # 剔除只管眼前这一条，拉黑是这条规则下这个卖家的【全部】商品。
+            # 剔除只管眼前这一条，拉黑是【所有规则、所有源】下这个卖家的全部商品。
             # 并排摆着、一个灰一个红，按之前先看清自己在按哪个。
             with ui.row().classes("items-center gap-1 mt-auto"):
                 # 【必须用默认参数绑死 row/rn】r 和 rule 是循环变量，直接引用的话
@@ -1028,32 +1132,39 @@ def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, twins: dict,
                           "照常对账，全部页和追踪页都还看得到。"
                           "剔除的是这个链接本身，它在别的规则下也不再显示。"
                           "要拿回来：命中页最下面那块「已剔除」")
-                # 【必须用默认参数绑死 rid/sid】它们是循环变量，直接引用的话
+                # 【必须用默认参数绑死 sid/row】它们是循环变量，直接引用的话
                 # 等你点下去时早就指向最后一件商品了 —— 每个按钮拉黑同一个人。
                 # 卖家ID为空时不给按钮：ヤフオク 有一部分商品不给卖家ID，
                 # 没有可拉黑的对象，画个点不动的按钮只会让人以为坏了。
+                # 【这里不需要「已拉黑」态】被拉黑的商品 matched=0，根本进不了
+                # live_matched，这一页上永远看不到已拉黑的人（「全部」页才需要）。
                 if r["seller_id"]:
                     ui.button(
                         "拉黑卖家",
-                        on_click=lambda _, rid=rule["id"], sid=r["seller_id"]:
-                            blacklist_seller(rid, sid),
+                        on_click=lambda _, sid=r["seller_id"], row=dict(r):
+                            blacklist_seller(sid, row),
                     ).props(BTN_DANGER).classes("btn-muted row-act") \
                      .tooltip(
                         f"卖家 {r['seller_id']}\n"
-                        "拉黑后这条规则下他的全部商品立刻判为不合适。"
-                        "想反悔就去规则页把 ID 从 exclude_sellers 里删掉")
+                        "拉黑后【所有规则】下他的商品立刻判为不合适，也不再推送，"
+                        "商品本身照常抓取。要解除：「规则」页最下面的「拉黑列表」")
 
 
-def _can_blacklist(row: dict, rule: dict) -> bool:
-    """这一行能不能拉黑：有卖家ID、且还没在该规则的黑名单里。"""
+def _can_blacklist(row: dict, blocked: frozenset | set) -> bool:
+    """这一行能不能拉黑：有卖家ID、且还没在全局拉黑列表里。
+
+    【列表必须由调用方传进来，不许在这里现查】它在「全部」页的行数据推导里
+    每行调一次，300 行就是 300 次往返。store.blocked_sellers() 虽然走缓存，
+    但那份缓存 10 秒会过期一次，正好卡在渲染中间就是一次真查询。
+    """
     sid = (row.get("seller_id") or "").strip().lower()
-    return bool(sid) and sid not in ids(rule.get("exclude_sellers"))
+    return bool(sid) and sid not in blocked
 
 
-def _act_label(row: dict, rule: dict) -> str:
+def _act_label(row: dict, blocked: frozenset | set) -> str:
     if not (row.get("seller_id") or "").strip():
         return "—"
-    return "拉黑" if _can_blacklist(row, rule) else "已拉黑"
+    return "拉黑" if _can_blacklist(row, blocked) else "已拉黑"
 
 
 def save_deal_price(rule_id: int, value) -> None:
@@ -1398,7 +1509,7 @@ def all_view(rule_id: int | None, reason: str, q: str = "") -> None:
 
     rows = store.query(
         # 【必须覆盖 explain() 读的每一个字段】少一个，「具体原因」那一列就会
-        # 静默退化成兜底文案（seller_id 漏掉时每行都显示「卖家 ? 在黑名单里」），
+        # 静默退化成兜底文案（seller_id 漏掉时每行都显示「卖家 ? 在拉黑列表里」），
         # 而这一列存在的全部意义就是说清楚是哪个条件、哪个值判掉的。
         f"SELECT source, item_id, rule_id, name, price, matched, reject_reason, status, "
         f"condition_id, seller_id, desc_warn, desc_checked, bid_count, buy_now_price, "
@@ -1407,6 +1518,9 @@ def all_view(rule_id: int | None, reason: str, q: str = "") -> None:
         f"ORDER BY first_seen_at DESC LIMIT 300", args)
     # 拿完整规则（不只是名字）：原因列要用规则里的词表和阈值把「为什么」算出来
     rules = {r["id"]: r for r in store.get_rules()}
+    # blocked_sellers() 和上面 get_rules 里的 _with_settings 走的是同一个
+    # get_settings() 缓存入口，所以这一行放前放后都不多发查询（实测都是 3 条）。
+    blocked = store.blocked_sellers()
 
     ui.label(f"{len(rows)} 件（最多显示 300 件，按发现时间倒序）").classes("text-sm text-gray-400")
     tbl = ui.table(
@@ -1438,16 +1552,16 @@ def all_view(rule_id: int | None, reason: str, q: str = "") -> None:
             "status": {"on_sale": "在售", "sold_out": "已售出",
                        "trading": "交易中", "gone": "已下架"}.get(r["status"], r["status"]),
             "name": r["name"],
-            # 下面三个不作为列显示，只放在行数据里给模板和事件回调取用。
-            # rule_id 必须逐行带：这一页可以同时显示多条规则的商品（筛选选「全部规则」时），
-            # 拉黑只能落在该行自己那条规则上。
+            # 下面四个不作为列显示，只放在行数据里给模板和事件回调取用。
+            # src_key / iid / name 是拉黑时要存的那份商品快照（列表里拼成可点的链接）。
             "link": item_url(r["source"], r["item_id"]),
             "seller": r["seller_id"],
-            "rule_id": r["rule_id"],
+            "src_key": r["source"],
+            "iid": r["item_id"],
             # 【按钮的文案和可点性在这里算好】插槽模板每行只实例化一份同样的元素，
             # Python 侧没法逐行控制，所以条件得预先算成行数据、模板里只做绑定。
-            "act": _act_label(r, rules.get(r["rule_id"]) or {}),
-            "can_bl": _can_blacklist(r, rules.get(r["rule_id"]) or {}),
+            "act": _act_label(r, blocked),
+            "can_bl": _can_blacklist(r, blocked),
         } for r in rows],
         row_key="id", pagination=50,
     )
@@ -1472,7 +1586,7 @@ def all_view(rule_id: int | None, reason: str, q: str = "") -> None:
     # 这一格要回调到 Python，走 table.cell + 元素自己的 on() 是官方支持的路径，
     # 不用去赌 `$parent.$emit` 在 scoped slot 里指向哪个组件。
     # 文案三态：没有卖家ID → 「—」（ヤフオク 有一部分商品不给，メルカリShops
-    # 的卖家是店铺不是用户）；已经在黑名单里 → 「已拉黑」；其余才可点。
+    # 的卖家是店铺不是用户）；已经在拉黑列表里 → 「已拉黑」；其余才可点。
     with tbl.add_slot("body-cell-act"):
         with tbl.cell("act"):
             ui.button().props(
@@ -1480,10 +1594,16 @@ def all_view(rule_id: int | None, reason: str, q: str = "") -> None:
                 ':label="props.row.act" :disable="!props.row.can_bl"'
             ).on(
                 "click",
-                # 【rule_id 必须逐行取】这一页可以同时列出多条规则的商品，
-                # 拉黑只能落在该行自己那条规则上。
-                js_handler="() => emit(props.row.rule_id, props.row.seller)",
-                handler=lambda e: blacklist_seller(e.args[0], e.args[1]),
+                # 【必须多参数 emit，不要包成一个数组】nicegui.js 的
+                # stringifyEventArgs 永远返回数组，所以 e.args 本来就是 list：
+                # emit(x) 时 e.args == [x]，而 emit([x]) 时 e.args == [[x]] ——
+                # e.args[0] 拿到的是【列表】，blacklist_seller 里一句 .strip() 就
+                # AttributeError，按钮点下去什么都不发生，异常被 NiceGUI 吞进日志。
+                js_handler="() => emit(props.row.seller, props.row.src_key, "
+                           "props.row.iid, props.row.name)",
+                handler=lambda e: blacklist_seller(
+                    e.args[0], {"source": e.args[1], "item_id": e.args[2],
+                                "name": e.args[3]}),
             )
 
 
@@ -1502,7 +1622,7 @@ def rule_dialog(rule: dict | None, host=None) -> None:
     data = dict(rule) if rule else {
         "name": "", "enabled": 1, "keyword": "", "sources": "",
         "include_all": "", "include_any": "",
-        "exclude_any": "", "warn_desc": "", "exclude_sellers": "",
+        "exclude_any": "", "warn_desc": "",
         "price_min": 0, "price_max": 0,
         "condition_ids": "", "allow_shops": 0, "check_desc": 1,
         "deal_price": 0, "deal_ratio": 85, "quick_min": 7, "note": "",
@@ -1516,7 +1636,8 @@ def rule_dialog(rule: dict | None, host=None) -> None:
                 ui.input(f, value=data[f]).classes("w-full").props(INPUT) \
                     .bind_value(data, f).tooltip(FIELD_HELP.get(f, ""))
                 ui.label(FIELD_HELP.get(f, "")).classes("text-xs text-gray-400 -mt-2")
-            for f in ("exclude_any", "warn_desc", "exclude_sellers"):
+            # 【卖家黑名单不在这里了】2026-09-17 改成全局的拉黑列表，在规则页最下面。
+            for f in ("exclude_any", "warn_desc"):
                 ui.textarea(f, value=data[f]).classes("w-full").props(INPUT + " rows=3") \
                     .bind_value(data, f)
                 ui.label(FIELD_HELP.get(f, "")).classes("text-xs text-gray-400 -mt-2")
@@ -1599,9 +1720,11 @@ def rule_dialog(rule: dict | None, host=None) -> None:
             if rule:
                 # 【只写真正改过的字段，不要整行覆盖】data 是打开对话框那一刻的快照，
                 # 而这个对话框是刻意建在 dialog_host 里的（要能撑过几分钟的「立即跑一轮」），
-                # 开着的时候你完全可以切到命中页点「拉黑卖家」。整行写回会拿旧快照
-                # 把 exclude_sellers 冲回空串 —— 两次操作都提示成功，而拉黑没了，
-                # 下一轮那些商品又回到命中列表，人只会觉得「黑名单不生效」。
+                # 开着的时候你完全可以切到命中页点「存捡漏价」（那是个单字段写），
+                # 或者在另一台机器的面板上改这条规则。整行写回会拿旧快照把
+                # deal_price 冲回原值 —— 两次操作都提示成功，而后一次没了，
+                # 人只会觉得「改了不生效」。（这个竞态原先是靠拉黑卖家踩出来的，
+                # 拉黑现在走独立表、不再经 update_rule，但竞态本身还活着。）
                 before = {k: clean(v) for k, v in rule.items() if k in store.RULE_FIELDS}
                 payload = {k: v for k, v in payload.items() if v != before.get(k)}
                 if not payload:
@@ -1718,6 +1841,10 @@ def rules_view(host=None) -> None:
                 ui.button("立即跑一轮", on_click=lambda r=rule: run_now(r)).props(BTN_GHOST)
                 ui.button("删除", on_click=lambda r=rule: confirm_delete(r, host)
                           ).props(BTN_DANGER)
+
+    # 【不要塞进 _load_rules】那边的测试是「发了哪几条 SQL」的精确相等，
+    # 而这一块的查询是渲染时才发的，和规则数据不是一回事。
+    _blocked_block()
 
 # 【进程级的重入闸】面板是多标签页的，而抓取是服务端动作 ——
 # 两个标签页各点一次，就是两轮并发打同一批源。各源的 _lock 会把请求串起来，

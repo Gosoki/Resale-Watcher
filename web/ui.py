@@ -38,33 +38,50 @@ DARK_CSS = (
     # 【等宽数字】这是个盯价格的工具，一整列 ¥ 数字不等宽的话，
     # 位数不同的价格左右横跳，扫一眼比大小要重新对焦。
     # 对汉字假名没有任何影响，只管阿拉伯数字。
-    "body{font-size:14px;font-variant-numeric:tabular-nums}"
+    # 【15px 是参考项目的基准字号】app.css L10 写死 font-size:15px/line-height:1.5。
+    # 行内那些 text-xs / text-sm 都是显式指定的，不受这里影响；变的只是
+    # 没写字号的标签 —— 也就是页面上绝大多数说明文字。
+    "body{font-size:15px;line-height:1.5;font-variant-numeric:tabular-nums}"
     # Quasar 的卡片/表格默认带投影，那是给亮底设计的；暗底上投影看不见，只会糊成一团。
     # 换成极淡的白色描边来分层。
-    ".q-card{box-shadow:none!important;border:1px solid rgba(255,255,255,.08)}"
+    # 【底色和圆角必须一起给】只换描边的话，卡片底仍是 Quasar 暗色的 --q-dark
+    # #1d1d1d、圆角仍是它默认的 4px —— 而紧挨着的折叠块已经是 #26262b + 10px，
+    # 同一页上两种灰、两种圆角。参考端 .card(app.css L96) 是一套：surface 底、
+    # 1px line 描边、10px 圆角、零投影。
+    ".q-card{box-shadow:none!important;background:var(--rw-surface);"
+    "border:1px solid var(--rw-line);border-radius:var(--rw-radius)}"
     ".q-table__container,.q-table__card,.q-table{box-shadow:none!important}"
     ".q-table tbody td,.q-table thead th{font-size:14px}"
     # 命中列表每行之间的分隔线：Tailwind 的 border-t 默认取亮底灰，暗底上几乎是白的
-    ".border-t{border-top:1px solid rgba(255,255,255,.08)!important}"
+    ".border-t{border-top:1px solid var(--rw-line)!important}"
     "@layer overrides{"
     # 徽标背景统一到 Tailwind -400 档（和文字色同一套），免得 Quasar 原色在暗底上过饱和
-    ".q-badge.bg-green{background:oklch(72.3% 0.219 149.579)!important}"     # green-500
-    ".q-badge.bg-orange{background:oklch(75% 0.183 55.934)!important}"       # orange-400
-    ".q-badge.bg-amber{background:oklch(82.8% 0.189 84.429)!important}"      # amber-400
-    ".q-badge.bg-grey{background:oklch(70.7% 0.022 261.325)!important}"      # gray-400
-    ".q-badge.bg-teal{background:oklch(77.7% 0.152 181.912)!important}"      # teal-400
-    ".q-badge.bg-red{background:oklch(70.4% 0.191 22.216)!important}"        # red-400
+    # 【这 6 枚直接取自参考项目】src/Themes/Dark.xaml L28-33 的状态色刷。
+    # 它那套 Web CSS 只定义了危险红，剩下五枚在 WPF 主题里 —— 两边的红
+    # 本来就是同一个 #f87171，说明这 6 枚和 Web 令牌是配套调出来的。
+    # 【语义以调用点为准，别照着色名猜】下面每条后面写的是它【实际】挂在哪些徽标上，
+    # 是 grep 过 ui.badge() 的调用点核出来的 —— 之前这里按色名想当然写过一轮，
+    # 错了三条（把 orange 写成"已降价"、amber 写成"新上架"、red 写成"警示"）。
+    ".q-badge.bg-green{background:#4ade80!important}"                        # 捡漏、曾是捡漏
+    ".q-badge.bg-orange{background:#fb923c!important}"                       # 新上架
+    ".q-badge.bg-amber{background:#facc15!important}"                        # 描述警示、交易中
+    ".q-badge.bg-grey{background:#9a9aa3!important}"                         # 中性：失联/已卖掉/已下架/停用
+    # 【是 blue-grey 不是 teal】「新发现」那枚写的是 color="blue-grey"，
+    # 全项目没有一处 color="teal" —— 写成 .bg-teal 的话这条选不中任何元素，
+    # 那枚徽标会独自留在 Quasar 原色 #607d8b 的白字上，还漏掉下面那条深字规则。
+    ".q-badge.bg-blue-grey{background:#60a5fa!important}"                    # 新发现
+    ".q-badge.bg-red{background:#f87171!important}"                          # 已降 ¥xxx
     # 【这半条和上面是同一个决定】Quasar 的 .q-badge{color:#fff} 是写死的白字，
     # 而上面这批背景亮度在 70%~83% —— amber 上白字只有 1.7:1、green 2.2:1，全线看不清。
     # 亮底一律改配深色前景。
     ".q-badge.bg-green,.q-badge.bg-orange,.q-badge.bg-amber,.q-badge.bg-grey,"
-    ".q-badge.bg-teal,.q-badge.bg-red,.q-badge.bg-purple{color:#18181b!important}"
+    ".q-badge.bg-blue-grey,.q-badge.bg-red,.q-badge.bg-purple{color:#18181b!important}"
     # 【来源是标签，不是信号】メルカリ/ヤフオク 这类徽标回答的是"它在哪"，
     # 而捡漏/已降/新上架回答的是"要不要点进去"。两者同样是实心色块的话，
     # 一行里五六个色块抢注意力，真正的信号反而沉下去了。
     # 改成描边：同样占位、同样可读，但视觉重量降一档。
-    ".q-badge.badge-label{background:transparent!important;color:rgba(255,255,255,.55)!important;"
-    "border:1px solid rgba(255,255,255,.22);font-weight:400}"
+    ".q-badge.badge-label{background:transparent!important;color:var(--rw-muted)!important;"
+    "border:1px solid var(--rw-line);font-weight:400}"
     # Quasar 的按钮为大写英文留了字距，中日文标签上只会显得松散
     ".q-btn{letter-spacing:0}"
     # 【淡化的危险按钮】拉黑这类操作每行都有一个，全红会把整页压成一片红。
@@ -120,7 +137,7 @@ DARK_CSS = (
     ".btn-muted:hover{opacity:1}"
     # 東京都 原先用 teal，和「捡漏」的绿是相邻色相，扫一眼分不开，而这俩语义
     # 完全不同（一个说地点、一个说机会）。换到紫档，和绿/橙/红/琥珀/灰都拉开。
-    ".q-badge.bg-purple{background:oklch(71.4% 0.203 305.504)!important}"    # purple-400
+    ".q-badge.bg-purple{background:#a78bfa!important}"                       # 東京都
     # 【没有这一条，设置页那根 sticky 保存条是死代码】Quasar 的标签面板套了两层
     # 滚动容器：.q-tab-panels.q-panel-parent 是 overflow:hidden，里面每个
     # .q-panel 还带 class="scroll"（overflow:auto）。position:sticky 的偏移参照
@@ -132,7 +149,188 @@ DARK_CSS = (
     # 【必须配合 animated=False】切标签页时 Quasar 会把两个面板绝对定位叠在一起，
     # overflow:hidden 正是用来裁掉它的；不关动画就会看到两页互相穿帮。
     ".q-tab-panels.q-panel-parent,.q-tab-panels .q-panel.scroll{overflow:visible}"
+    # 【次操作按钮的字要用亮档，不能用主色】BTN_GHOST 是 flat+color=primary，
+    # 而主色现在是参考端的【填充档】#4a78c0 —— 那个色是拿来铺底的，当文字压在
+    # #1d1d1d/#26262b/#2f2f36 上只有 3.0〜3.8:1，全线不过 AA（换主色之前是 6.6〜7.4）。
+    # 参考端自己就把强调色分成两档：填充用 --accent-dim、文字和链接用 --accent，
+    # 这里正是那条规矩落地的地方。
+    # 【必须写在 @layer overrides 里、且带 !important】Quasar 的
+    # .text-primary{color:var(--q-primary)!important} 在 quasar_importants 层。
+    # !important 的层序是【反】的：先声明的层赢 —— overrides 排在 quasar_importants
+    # 前面，所以这里压得住；写在本文件那段无层 CSS 里则永远压不住。
+    ".q-btn--flat.text-primary,.q-btn--flat.text-primary .q-btn__content"
+    "{color:var(--rw-accent)!important}"
     "}"
+    # ══════════════════════════════════════════════════════════════════════
+    # 【以下整块复刻自 R-18MediaLibrary 的 src/Web/app.css】那是它自带的局域网
+    # 网页端，和它的 WPF 桌面端共用一套设计语言。我们同样是网页，所以抄 Web 那份
+    # 而不是 XAML —— 它已经把 backdrop-filter、rgba 遮罩这些只有浏览器才有的
+    # 东西调好了；XAML 那套色偏冷蓝（#15171c/#232834），而截图上的实际观感是
+    # 中性灰（取过像素核对：#1b1b1f/#26262b/#4a78c0 三个点分毫不差）。
+    #
+    # 【为什么这一整块不写 !important】NiceGUI 在 index.html 里声明了层序：
+    #   @layer theme, base, quasar, nicegui, components, utilities, overrides, quasar_importants;
+    # 而 add_head_html 注进来的这段【不属于任何层】。CSS 的规矩是两套相反的：
+    #   普通声明 —— 无层胜过所有层，所以这里不加 !important 就已经压得住 Quasar；
+    #   !important —— 层序反转，无层反而【输给】任何层里的 important。
+    # 所以硬碰 Quasar 的 important（比如主色按钮底色）在这儿是写不赢的，
+    # 那一处改走 ui.colors() 直接换 --q-primary。
+    # ══════════════════════════════════════════════════════════════════════
+    # 设计令牌：app.css L2-4 原样搬来，加 rw- 前缀避开 Quasar 自己的 --q-*。
+    # 【强调色有亮暗两档，分工不能混】--rw-accent 亮档只用于 focus 描边和链接，
+    # --rw-accent-dim 暗档用于大面积填充（激活的导航项、主按钮）。
+    # 暗底上用亮档铺满一整条导航项会刺眼，这是那份 CSS 分两档的全部理由。
+    ":root{--rw-bg:#1b1b1f;--rw-surface:#26262b;--rw-surface2:#2f2f36;--rw-line:#3a3a42;"
+    "--rw-text:#e8e8ea;--rw-muted:#9a9aa3;--rw-accent:#6aa3ff;--rw-accent-dim:#4a78c0;"
+    "--rw-radius:10px}"
+    # 页面底 / 主区底。Quasar 暗色给的是 #121212 和 #1d1d1d，比参考端各深/亮一档
+    "body,.q-page-container{background:var(--rw-bg);color:var(--rw-text)}"
+    ".q-tab-panels,.q-tab-panel{background:transparent}"
+    ".q-tab-panel{padding:12px 12px 40px}"            # app.css L74 main{padding:12px … 40px}
+    # ---------- 左侧导航栏（app.css L39-49 .nav / .navitem）----------
+    # 【QDrawer 的 class 落在内容层不是壳层】它是 inheritAttrs:false，把 attrs
+    # 展开到内层的 .q-drawer__content 上 —— 所以 .nav-drawer 选中的是内容层，
+    # 壳层要另外用 aside.q-drawer 兜一句，否则 .q-dark 的 #1d1d1d 会从边上透出来。
+    "aside.q-drawer{background:var(--rw-surface)}"
+    ".q-drawer__content.nav-drawer{background:var(--rw-surface);"
+    "border-right:1px solid var(--rw-line);padding:12px 10px;gap:4px;align-items:stretch}"
+    ".nav-brand{font-weight:700;font-size:16px;line-height:1.2;padding:6px 10px 14px;"
+    "color:var(--rw-text)}"
+    # 【导航项 = 被改造过的 QTab】indicator 是 QTab 永远渲染的一个 div，
+    # indicator-color 只改颜色不改存在，所以直接 display:none 换成整块底色。
+    # 【height:auto 不是可选项】q-tabs--vertical 默认 height:100%，七项一旦装不下
+    # 就会冒出上下两个滚动箭头（暗底上是两团白光斑）。让它按内容长，滚动交给抽屉本身。
+    ".nav-tabs.q-tabs--vertical{height:auto}"
+    ".nav-tabs .q-tabs__content{height:auto;overflow:visible;gap:4px}"
+    ".nav-tabs .q-tab__indicator{display:none}"
+    ".nav-tabs .q-tab{min-height:0;padding:10px 12px;border-radius:8px;"
+    "justify-content:flex-start;text-align:left;color:var(--rw-muted);"
+    "transition:background-color .12s,color .12s}"
+    # 【左对齐要靠 align-items 而不是 justify-content】.q-tab__content 是
+    # flex-direction:column（竖着放图标和文字），主轴是纵向 —— justify-content
+    # 管的是上下，横向得用 align-items。之前两条都写在 justify-content 上，
+    # 于是文字一直是居中的，和参考端 .navitem 的左对齐对不上。
+    ".nav-tabs .q-tab__content{padding:0;min-width:0;width:100%;"
+    "justify-content:center;align-items:flex-start}"
+    # 字号定在 __label 上，改外层 .q-tab 无效 —— 和下面 .row-act 那个坑同源
+    ".nav-tabs .q-tab__label{font-size:14.5px;font-weight:500;line-height:1.5}"
+    ".nav-tabs .q-tab--inactive{opacity:1}"          # 默认 .85，改用颜色区分深浅
+    ".nav-tabs .q-tab:hover{background:var(--rw-surface2);color:var(--rw-text)}"
+    ".nav-tabs .q-tab--active{background:var(--rw-accent-dim);color:#fff}"
+    # 激活项已经是蓝底了，Quasar 的 hover 白膜(.q-focus-helper 15%)只会把它冲淡
+    ".nav-tabs .q-tab--active .q-focus-helper{display:none}"
+    # 【焦点指示要单独补回来】上一条为了不让白膜冲淡蓝底，把激活项的
+    # .q-focus-helper 关掉了；而 Quasar 的 .q-focusable{outline:0} 把原生轮廓也去了，
+    # 两下一叠，键盘 Tab 进侧栏正好落在【激活项】上却全程没有任何提示。
+    # :focus-visible 只在键盘操作时亮，鼠标点击不会触发，不影响观感。
+    ".nav-tabs .q-tab:focus-visible{outline:2px solid var(--rw-accent);"
+    "outline-offset:-2px}"
+    # ---------- 顶栏（app.css L15-24 header/.topbar/.title）----------
+    # 【高度必须钉死 45px】设置页那根 sticky 保存条写的是 top-[45px]，
+    # 那个数就是实测出来的顶栏高。这里一松，那根条子立刻钻到顶栏底下。
+    ".q-header.rw-header{background:rgba(27,27,31,.96);backdrop-filter:blur(8px);"
+    "-webkit-backdrop-filter:blur(8px);border-bottom:1px solid var(--rw-line);"
+    "box-shadow:none;color:var(--rw-text);min-height:45px}"
+    # 【下面两条才是"45px"真正成立的原因，缺一条都不成立】
+    # min-height 只是下限、不封顶，光靠它什么都钉不住：
+    #   ① ☰ 是 flat dense round，Quasar 给的 min-height 是 2.4em=33.6px，
+    #      加顶栏 py-2 的 16px 加 1px 下边框正好 50.6px —— 只要窗口 <1024px
+    #      （☰ 因 lt-md 出现）顶栏就必然超高，和文案长短无关。压成 28px：28+16+1=45。
+    #   ② 状态那行字在窄屏会折成两行，一折就是 98px。改成截断不折行。
+    # 【为什么非要 45px 不可】设置页那根 sticky 保存条写死 top-[45px]；顶栏一旦更高，
+    # 条子就整条缩在顶栏底下 —— 手机上「保存全部」直接按不着（实测点到的是顶栏的状态字）。
+    ".rw-header .q-btn{min-height:28px;min-width:28px;width:28px;height:28px;padding:0}"
+    ".rw-header .text-sm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+    "min-width:0}"
+    ".rw-title{font-weight:600;font-size:16px;overflow:hidden;text-overflow:ellipsis;"
+    "white-space:nowrap}"
+    ".rw-header .q-btn{color:var(--rw-text)}"
+    # ---------- 每页顶上那一行（app.css L76 .toolbar / L75 .count）----------
+    # 参考端的 .icon-btn 是「有底色的扁按钮」：surface2 底 + 1px 描边，
+    # hover 只换描边色、底色不动。这个质感只给页首工具条上的按钮 ——
+    # 行内那些「剔除 / 拉黑卖家」是刻意做轻的，套上底色会把整页压满按钮框。
+    ".rw-toolbar .q-btn--flat{background:var(--rw-surface2);"
+    "border:1px solid var(--rw-line);color:var(--rw-text)}"
+    ".rw-toolbar .q-btn--flat:hover{border-color:var(--rw-accent-dim)}"
+    ".rw-desc{color:var(--rw-muted);font-size:13px}"
+    # ---------- 控件（app.css L21-36 .icon-btn / input）----------
+    # 【必须排除 round】.q-btn--round 是 border-radius:50%，被这条盖掉的话
+    # 缩略图角上的 ★ ⚑ 会从正圆变成圆角方块 —— 那两颗的尺寸注释里已经为
+    # 类似的事栽过一次（椭圆那次）。
+    ".q-btn:not(.q-btn--round){border-radius:8px}"
+    ".q-field--outlined .q-field__control{border-radius:8px;background:var(--rw-surface2)}"
+    ".q-field--outlined .q-field__control:before{border:1px solid var(--rw-line)}"
+    ".q-field--outlined .q-field__control:hover:before{border-color:var(--rw-accent-dim)}"
+    # 【hover 用暗档、focus 用亮档】这是参考端全站唯一区分两档强调色的地方
+    ".q-field--outlined.q-field--focused .q-field__control:after{"
+    "border:1px solid var(--rw-accent)}"
+    ".q-field__native,.q-field__input{color:var(--rw-text)}"
+    ".q-field__label,.q-field__prefix,.q-field__suffix{color:var(--rw-muted)}"
+    # 徽标取参考端 .pill 的形（L278：全圆角、12px），不是贴图上的 .badge（6px 圆角）——
+    # 我们的徽标是跟在文字行里的，不压在缩略图上
+    # 【不要在这里定 font-weight】参考端的 .pill(L278) 本来就不定字重；而且这段是
+    # 无层的，一旦定了就会反过来压死 @layer overrides 里 .badge-label 的
+    # font-weight:400（无层普通声明胜过所有层 —— 这条规矩对自家旧规则同样成立），
+    # 「来源是标签不是信号、视觉重量降一档」那个设计就丢了一半。
+    ".q-badge{border-radius:999px;padding:2px 8px;font-size:12px;line-height:1.4}"
+    # ---------- 容器（app.css L96-98 .card / L285 .sec）----------
+    # 【折叠块不加 overflow:hidden】参考端的 .card 是带的，但 overflow 一旦不是
+    # visible 就会成为 position:sticky 的包含块 —— 设置页那根保存条正是栽在
+    # 这类祖先上过一次。圆角那点溢出肉眼看不见，这个风险不值得换。
+    ".q-expansion-item{background:var(--rw-surface);border:1px solid var(--rw-line);"
+    "border-radius:var(--rw-radius);transition:border-color .12s}"
+    ".q-expansion-item .q-item__label--caption{color:var(--rw-muted)}"
+    # 【必须掐掉 Quasar 的 hover 白膜】它是 .q-focus-helper：鼠标移到折叠块头上时
+    # 铺一层 currentColor、15% 不透明度。问题出在它的 border-radius 是 0，而折叠块是
+    # 10px 圆角、上面那条注释又说明了不能给容器加 overflow:hidden —— 于是这层方角的膜
+    # 直接糊出圆角外面：实测 hover 时圆角外本该是页底 #1b1b1f，实际被染成 #3b3b3e，
+    # 弧内侧更亮到 #55555c，看上去就是角上有一团脏阴影。
+    # 【换成参考端的做法】那套 CSS 里根本没有"灰膜"这种东西，可点的表面 hover 一律
+    # 只换描边色（app.css L98 .card:hover{border-color:var(--accent-dim)}）——
+    # 描边跟着容器自己的圆角走，不存在戳出来的问题。
+    ".q-expansion-item .q-item:hover > .q-focus-helper{opacity:0}"
+    ".q-expansion-item:hover{border-color:var(--rw-accent-dim)}"
+    ".q-separator{background:var(--rw-line)}"
+    # ---------- 表格（app.css L272-277 .dt）----------
+    ".q-table thead th{color:var(--rw-muted);font-weight:500;background:var(--rw-bg);"
+    "border-bottom:1px solid var(--rw-line)}"
+    ".q-table tbody td{border-bottom:1px solid var(--rw-line)}"
+    ".q-table tbody tr:hover td{background:var(--rw-surface)}"
+    # ---------- 浮层 / 链接 ----------
+    # 【这条必须进 @layer components】无层的 a{} 会连 <a class="text-blue-400"> 这种
+    # 行内指定的 Tailwind 颜色类一起压掉（普通声明先比层再比特异性，无层最大），
+    # 表现是"改了没反应"且不报错。放进 components 层就排在 utilities 前面，
+    # 既压得住 NiceGUI 的默认链接色，又让行内写的颜色类照常生效。
+    "@layer components{a{color:var(--rw-accent)}}"
+    ".q-dialog .q-card,.q-menu{background:var(--rw-surface);"
+    "border:1px solid var(--rw-line);border-radius:var(--rw-radius)}"
+    ".q-menu .q-item:hover{background:var(--rw-surface2)}"
+    ".q-dialog__backdrop{background:rgba(0,0,0,.55)}"      # app.css L408 .overlay
+    # 【参考端全站只有三处投影，这里是其中两处】它的分层一律靠 1px 描边，
+    # 只有"浮在页面之上"的东西才给投影：移动端抽屉和弹出层。照抄它的值。
+    ".q-drawer--on-top{box-shadow:2px 0 18px rgba(0,0,0,.55)}"   # app.css L62 移动抽屉
+    ".q-menu{box-shadow:0 6px 24px rgba(0,0,0,.4)}"              # app.css L372 .apopup
+    # 【抽屉遮罩这一处抄不了，也不该硬抄】参考端 .drawer-backdrop 是 rgba(0,0,0,.5)，
+    # 而 Quasar 把遮罩色写成【内联样式】（滑动关闭时要一路渐变它的透明度），
+    # CSS 写 .q-drawer__backdrop{background:...} 是条死规则、根本不生效。
+    # 加 !important 确实压得住内联，但会把那段拖拽渐变冻死 —— 为 0.1 的透明度差
+    # 换掉一个手势动画不划算。留着 Quasar 的 .4，差别肉眼看不出来。
+    ".q-tooltip{background:var(--rw-surface2);color:var(--rw-text);"
+    "border:1px solid var(--rw-line);font-size:12.5px}"
+    # 滚动条：参考端没定义（它跑在 Windows 上，系统滚动条本来就是暗的），
+    # 而 macOS/Linux 的浏览器会画一条亮灰，贴在 #1b1b1f 上是一道白杠。
+    # 这是复刻之外我们自己补的一处，取的是同一套令牌。
+    "::-webkit-scrollbar{width:10px;height:10px}"
+    "::-webkit-scrollbar-track{background:var(--rw-bg)}"
+    "::-webkit-scrollbar-thumb{background:var(--rw-line);border-radius:6px}"
+    "::-webkit-scrollbar-thumb:hover{background:var(--rw-muted)}"
+    # 【把 Tailwind 的灰接到参考端的 --muted 上】全站 38 处说明文字写的是
+    # text-gray-400 = #9ca3af，而参考端的次要文字是 #9a9aa3 —— 差别只在
+    # 那一点蓝味，但正是这点蓝味构成了它那套色和 Tailwind 灰阶的分界
+    #（参考端整套是中性灰，WPF 那套才是冷蓝灰）。改一条比改 38 处干净。
+    # 【只接 400 这一档】gray-300/500 在我们这儿是刻意的第三档（分区标题、
+    # 设置项脚注），参考端信息密度没这么高、只有两档，接过去会把层级压平。
+    ".text-gray-400{color:var(--rw-muted)}"
     "</style>"
 )
 
@@ -153,9 +351,11 @@ BTN_GHOST = "flat dense no-caps color=primary"                # 次操作：设�
 BTN_QUIET = "flat dense no-caps color=grey-5"                 # 轻操作：刷新、取消、设置规则
 BTN_DANGER = "flat dense no-caps color=negative"              # 危险：拉黑、删除
 BTN_DANGER_SOLID = "unelevated dense no-caps color=negative"  # 危险且要确认：删除对话框
-# 压在缩略图角上的图标按钮（追踪星、标记旗）。它不属于上面那几档 —— 没有文字、
-# 没有底色、尺寸由 .star-btn 的 font-size 决定，所以单列一个常量而不是硬写。
-BTN_CORNER = "flat dense round"                               # 图片角标：★ 追踪、⚑ 标记
+# 纯图标按钮（缩略图角上的追踪星/标记旗，以及窄屏顶栏那颗 ☰）。它不属于上面
+# 那几档 —— 没有文字、没有底色、是圆的，所以单列一个常量而不是硬写。
+# 【不要为 ☰ 再开一个常量】那会是两个值完全相同的常量，正好违反上面那条
+# 「别再发明第四种」—— 角色是同一个：图标、扁平、圆形。
+BTN_CORNER = "flat dense round"                               # 纯图标：★ 追踪、⚑ 标记、☰ 导航
 INPUT = "dense outlined"                                      # 所有输入框
 
 # 徽标分两类：信号（实心，抢眼）和标签（描边，只说明"它是什么"）
@@ -667,9 +867,13 @@ def toolbar(desc: str):
     按钮后面、设置页的塞在正文第一行，字号和间距也各不相同。
     页面一多，这种参差比任何单点的丑都更显得没收拾过。
     """
-    with ui.row().classes("items-center gap-2 mb-3 flex-wrap w-full"):
+    # 【rw-toolbar 是给 CSS 定位用的】参考端的 .icon-btn 有底色有描边，
+    # 但那个质感只该给页首这一行的按钮 —— 行内那些「剔除 / 拉黑卖家」是
+    # 刻意做轻的，套上按钮框会把整页压满方块。作用域靠这个类圈出来。
+    with ui.row().classes("rw-toolbar items-center gap-2 mb-3 flex-wrap w-full"):
         yield
-        ui.label(desc).classes("text-xs text-gray-400")
+        # 参考端的 .count（app.css L75）：13px、muted 色，顶栏底下那行小灰字
+        ui.label(desc).classes("rw-desc")
 
 
 # ------------------------------------------------------------------ 命中页
@@ -2117,14 +2321,19 @@ def settings_view() -> None:
     # 【top 不能是 0】ui.header() 是 Quasar 的 fixed-top，实测高 45px
     #（q-page-container 的 padding-top 就是它撑出来的）。top-0 的话这根条子
     # 一滚就钻到顶栏底下，按钮点不着 —— 比原先放在页面最底部还糟。
-    with ui.row().classes("sticky top-[45px] z-20 w-full items-center gap-3 py-2 mb-2 "
-                          "backdrop-blur bg-black/80 rounded"):
+    # 【rw-toolbar 是补上来的】这一行是手写的 sticky 条、没走 toolbar()，
+    # 漏了那个类的话「测试推送」是一句光秃秃的蓝字，而别的六页页首的「刷新」
+    # 都是带底带框的按钮 —— 页面一多，这种参差比任何单点的丑都更显眼。
+    with ui.row().classes("rw-toolbar sticky top-[45px] z-20 w-full items-center gap-3 "
+                          "py-2 mb-2 backdrop-blur bg-[#1b1b1f]/95 rounded"):
         ui.button("保存全部", on_click=save).props(BTN_PRIMARY)
         ui.button("测试推送", on_click=test_notify).props(BTN_GHOST) \
             .tooltip("照现在【已保存】的推送设置真发一条出去。改完地址要先保存再测。"
                      "推送失败平时是静默的（只写日志），这是唯一能当场看出通没通的地方")
+        # 【和 toolbar() 里那行同一个角色，就得同一个类】上面刚把按钮统一了，
+        # 这行说明文字漏下的话，七页里只有设置页的说明小一号（12px vs 13px）。
         ui.label("对所有规则生效。改完保存，10 秒内自动生效，不用重启"
-                 ).classes("text-xs text-gray-400")
+                 ).classes("rw-desc")
 
     # 【按 SETTING_GROUPS 渲染，不是按 all_settings 的顺序】没分组的项会整个看不见，
     # 所以 tests/test_settings_ui.py 锁死了两边的键必须完全一致。
@@ -2142,14 +2351,46 @@ def create() -> None:
     @ui.page("/")
     def index() -> None:
         ui.dark_mode(True)
-        # 主色 blue-400 / 负色 red-400，用 oklch —— P3 屏上不走 sRGB 夹紧
-        ui.colors(primary="oklch(70.7% 0.165 254.624)", negative="oklch(70.4% 0.191 22.216)")
+        # 【直接取参考项目的两个色值】app.css 的 --accent-dim #4a78c0（大面积填充
+        # 那一档）和它的危险红 #f87171。原先用 oklch 是为了 P3 屏不被 sRGB 夹紧，
+        # 但复刻的前提是色值对得上，而参考端给的就是这两个十六进制值。
+        # 【主色只能从这里改】Quasar 的 .bg-primary 是 @layer quasar_importants 里的
+        # !important，而 add_head_html 注入的 CSS 无层 —— 无层的 !important 打不过
+        # 层里的 !important。所以硬碰是写不赢的，只能换 --q-primary 本身。
+        ui.colors(primary="#4a78c0", negative="#f87171")
         ui.add_head_html(DARK_CSS)
-        # 顶栏默认会被染成主色（亮蓝），暗色下太跳；压成近黑并用淡描边收边
-        with ui.header().classes("items-center justify-between px-4 py-2").style(
-                "background:#15171c;border-bottom:1px solid rgba(255,255,255,.08);box-shadow:none"):
-            ui.label("Resale Watcher").classes("text-lg font-bold")
+        # 【顶栏 = 参考端的 sticky header】半透明 96% + 背后模糊 8px + 1px 下边框。
+        # 原先那句内联 .style() 必须去掉：内联样式赢过任何层、任何 !important，
+        # 留着的话 DARK_CSS 里 .rw-header 那一段一条都不生效。
+        # 【wrap=False 不是样式偏好，是 45px 的前提】默认 wrap=True 时状态那行字
+        # 在窄屏会折行，顶栏从 45px 涨到 98px，设置页那根 sticky 保存条就被埋了。
+        # 不折行 + CSS 里给状态字加省略号，窄屏上截断的是最不重要的尾部（时间戳），
+        # 开头的 ⏸ / ⚠ 和那句话照常看得见。
+        with ui.header(wrap=False).classes("items-center gap-2 px-3 py-2 rw-header"):
+            # 【☰ 只在窄屏出现】lt-md 是 Quasar 自带的断点类（<1024px 才显示），
+            # 和下面 left_drawer 的 breakpoint=1023 精确对齐：侧栏自动收起的
+            # 那一刻，呼出它的按钮正好出现；宽屏上侧栏常驻，这颗按钮不存在。
+            ui.button(icon="menu", on_click=lambda: nav.toggle()) \
+                .props(BTN_CORNER).classes("lt-md")
+            # 【页名在顶栏、导航在左栏】这是参考项目的分工（app.css L23 .title）。
+            # 宽屏上左栏亮着的那一项已经说明你在哪页，这行是给窄屏用的 ——
+            # 那时侧栏整个收起来，不写页名就不知道自己在看什么。
+            page_title = ui.label("命中").classes("rw-title")
+            ui.space()
             status = ui.label().classes("text-sm")
+
+        # 【左侧导航栏】复刻参考端 app.css L39 的 .nav：210px、surface 底、
+        # 右侧一条 1px 线，品牌在顶上，七个页签竖排成导航项。
+        # 【top_corner=True 是关键】它把 Quasar 的 layout view 第 0 位从 h 改成 l，
+        # 于是三件事全自动：侧栏从 y=0 起（参考端 .nav{top:0}）、顶栏自己吐出
+        # left:210px、主区自己吐出 padding-left:210px。自己去写 margin-left 的话
+        # 会和 Quasar 那份内联 padding 叠成两倍，主区被推到屏幕外。
+        # 【宽度只能走 prop，不能走 CSS】Quasar 拿 props.width 同时算这三处；
+        # 用 CSS 改宽度只改得动侧栏自己，另外两处还停在默认的 300px。
+        # 【breakpoint=1023】≥1024px 常驻、没有任何收起入口；窄屏自动变成覆盖式
+        # 抽屉，带遮罩和滑动关闭 —— 参考端手写的那套 .layout-mobile 在这儿是白送的。
+        nav = ui.left_drawer(top_corner=True, bordered=False, elevated=False) \
+            .props("width=210 breakpoint=1023").classes("nav-drawer")
 
         def tick() -> None:
             # 【先看采集还活着没】轮询线程崩掉后进程照常在跑、面板照常打开、
@@ -2280,6 +2521,10 @@ def create() -> None:
         def on_tab(e) -> None:
             # 【e.value 可能是 Tab 对象也可能是页签名】NiceGUI 两种都发得出来。
             name = e.value if isinstance(e.value, str) else TAB_NAME.get(e.value, "")
+            # 【顶栏页名跟着页签走】必须放在下面容器判空【之前】：tab_panels
+            # 构造时那次空触发也该把标题定成首页，否则窄屏首屏顶栏是空的。
+            if name:
+                page_title.text = name
             # 【tab_panels 构造时会先触发一次】那时容器一个都还没建，naive 版本会把
             # 命中页画到页面根上。拿不到容器就 return，首页在下面显式建。
             c = containers.get(name)
@@ -2294,14 +2539,21 @@ def create() -> None:
                 _DIRTY.discard(name)
                 REFRESH[name].refresh()
 
-        with ui.tabs(on_change=on_tab).classes("w-full") as tabs:
-            t_hit = ui.tab("命中")
-            t_track = ui.tab("追踪")
-            t_mark = ui.tab("标记")
-            t_sold = ui.tab("成交")
-            t_all = ui.tab("全部")
-            t_rule = ui.tab("规则")
-            t_set = ui.tab("设置")
+        # 【七个页签原样搬进左栏，只是竖过来】QTabs 有原生 vertical，tabs 与
+        # tab_panels 的联动是 Python 侧的 bind_value，不靠 DOM 相邻 —— 所以
+        # 侧栏里的 tabs 和主区里的 tab_panels 照常同步，下面那整套懒建机制
+        # （containers / built / _DIRTY / on_tab）一行都不用动。
+        with nav:
+            ui.label("Resale Watcher").classes("nav-brand")
+            with ui.tabs(on_change=on_tab).props("vertical no-caps") \
+                    .classes("w-full nav-tabs") as tabs:
+                t_hit = ui.tab("命中")
+                t_track = ui.tab("追踪")
+                t_mark = ui.tab("标记")
+                t_sold = ui.tab("成交")
+                t_all = ui.tab("全部")
+                t_rule = ui.tab("规则")
+                t_set = ui.tab("设置")
         TAB_NAME = {t_hit: "命中", t_track: "追踪", t_mark: "标记", t_sold: "成交",
                     t_all: "全部", t_rule: "规则", t_set: "设置"}
         REFRESH = {"命中": hits_view, "追踪": track_view,

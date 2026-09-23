@@ -1,8 +1,12 @@
 """NiceGUI 面板：改规则、看命中、调排除词。
 
-四个页签各对应一件事：
+外观复刻 R-18MediaLibrary 的网页端：左侧导航栏放七个页，顶栏放页名和状态。
+七页各对应一件事：
   命中  —— 平时只看这一页：通过全部规则的在售商品，按规则折叠，
             组内按「市价百分比」升序（最划算的排最前）
+  追踪  —— 盯住的几件，单独拉详情刷新，比整轮扫描快
+  标记  —— 自己标下来的东西，纯记录，商品下架了也还在
+  成交  —— 市场实际用什么价清掉了什么货，定价前看分布
   全部  —— 调规则时看这一页：一张平铺表，可按规则/判定原因筛选，
             「具体原因」列会告诉你每一件是被哪个词判掉的
   规则  —— 你自己填的那张表，以及每条规则在各个源上的轮询状态
@@ -65,7 +69,7 @@ DARK_CSS = (
     ".q-badge.bg-green{background:#4ade80!important}"                        # 捡漏、曾是捡漏
     ".q-badge.bg-orange{background:#fb923c!important}"                       # 新上架
     ".q-badge.bg-amber{background:#facc15!important}"                        # 描述警示、交易中
-    ".q-badge.bg-grey{background:#9a9aa3!important}"                         # 中性：失联/已卖掉/已下架/停用
+    ".q-badge.bg-grey{background:var(--rw-muted)!important}"                 # 中性：失联/已卖掉/已下架/停用
     # 【是 blue-grey 不是 teal】「新发现」那枚写的是 color="blue-grey"，
     # 全项目没有一处 color="teal" —— 写成 .bg-teal 的话这条选不中任何元素，
     # 那枚徽标会独自留在 Quasar 原色 #607d8b 的白字上，还漏掉下面那条深字规则。
@@ -158,8 +162,23 @@ DARK_CSS = (
     # .text-primary{color:var(--q-primary)!important} 在 quasar_importants 层。
     # !important 的层序是【反】的：先声明的层赢 —— overrides 排在 quasar_importants
     # 前面，所以这里压得住；写在本文件那段无层 CSS 里则永远压不住。
-    ".q-btn--flat.text-primary,.q-btn--flat.text-primary .q-btn__content"
+    # 【必须排除 round】缩略图角上的 ★ ⚑ 和顶栏 ☰ 都是 BTN_CORNER（flat round、
+    # 不指定 color），Quasar 照样给它们挂 text-primary。不排除的话这条（0,3,0）
+    # 压过 .star-btn/.star-on/.mark-on（0,2,0）—— 同在这一层、同带 !important，
+    # 比的就是特异性：白星白旗全变蓝，【已追踪的琥珀星、已标记的青旗也变蓝】，
+    # 缩略图上再也分不出追没追、标没标。上一轮就栽在这儿，测试锁着。
+    ".q-btn--flat.text-primary:not(.q-btn--round),"
+    ".q-btn--flat.text-primary:not(.q-btn--round) .q-btn__content"
     "{color:var(--rw-accent)!important}"
+    # 【工具条上的按钮字一律用正文色】参考端 .icon-btn 是 color:var(--text)：
+    # 有了底色和描边，按钮已经一眼认得出，不需要再靠蓝字区分；「主操作」那一档
+    # 靠的是实心蓝底（BTN_PRIMARY），不是字色。原先「刷新」是 grey-5 的 #bdbdbd，
+    # 「测试推送」是蓝字 —— 同一排两个扁按钮两种字色。
+    # 【必须写在上一条之后】两条特异性相同，同分靠顺序。
+    ".rw-toolbar .q-btn--flat,.rw-toolbar .q-btn--flat .q-btn__content"
+    "{color:var(--rw-text)!important}"
+    # 顶栏 ☰ 用正文色。同样得写在这一层：它也挂着 text-primary 的 !important。
+    ".rw-header .q-btn,.rw-header .q-btn .q-btn__content{color:var(--rw-text)!important}"
     "}"
     # ══════════════════════════════════════════════════════════════════════
     # 【以下整块复刻自 R-18MediaLibrary 的 src/Web/app.css】那是它自带的局域网
@@ -186,6 +205,12 @@ DARK_CSS = (
     # 页面底 / 主区底。Quasar 暗色给的是 #121212 和 #1d1d1d，比参考端各深/亮一档
     "body,.q-page-container{background:var(--rw-bg);color:var(--rw-text)}"
     ".q-tab-panels,.q-tab-panel{background:transparent}"
+    # 【主区内距只能有这一层】NiceGUI 的页面根 .nicegui-content 自带 16px 内距和
+    # 16px 子元素间距；而它的第一个孩子是那个高度为 0 的 dialog_host（对话框的家），
+    # 间距照样算 —— 于是顶栏和工具条之间凭空多出 16+16=32px 的空带，左右也各多 16px。
+    # 实测工具条顶在 y=89，参考端的内容顶在 45+12=57。两层都归零，只留下面这一层
+    # 12px，才是参考端 main{padding:12px} 的样子。
+    ".nicegui-content{padding:0;gap:0}"
     ".q-tab-panel{padding:12px 12px 40px}"            # app.css L74 main{padding:12px … 40px}
     # ---------- 左侧导航栏（app.css L39-49 .nav / .navitem）----------
     # 【QDrawer 的 class 落在内容层不是壳层】它是 inheritAttrs:false，把 attrs
@@ -244,13 +269,15 @@ DARK_CSS = (
     "min-width:0}"
     ".rw-title{font-weight:600;font-size:16px;overflow:hidden;text-overflow:ellipsis;"
     "white-space:nowrap}"
-    ".rw-header .q-btn{color:var(--rw-text)}"
     # ---------- 每页顶上那一行（app.css L76 .toolbar / L75 .count）----------
     # 参考端的 .icon-btn 是「有底色的扁按钮」：surface2 底 + 1px 描边，
     # hover 只换描边色、底色不动。这个质感只给页首工具条上的按钮 ——
     # 行内那些「剔除 / 拉黑卖家」是刻意做轻的，套上底色会把整页压满按钮框。
+    # 字色不写在这里：工具条上的扁按钮全都带 color=（grey-5 / primary），Quasar 会挂
+    # .text-* 的 !important，这段无层 CSS 压不住 —— 在这里写 color 是条死声明。
+    # 真正生效的那条在上面 @layer overrides 里。
     ".rw-toolbar .q-btn--flat{background:var(--rw-surface2);"
-    "border:1px solid var(--rw-line);color:var(--rw-text)}"
+    "border:1px solid var(--rw-line)}"
     ".rw-toolbar .q-btn--flat:hover{border-color:var(--rw-accent-dim)}"
     ".rw-desc{color:var(--rw-muted);font-size:13px}"
     # ---------- 控件（app.css L21-36 .icon-btn / input）----------
@@ -290,7 +317,6 @@ DARK_CSS = (
     # 描边跟着容器自己的圆角走，不存在戳出来的问题。
     ".q-expansion-item .q-item:hover > .q-focus-helper{opacity:0}"
     ".q-expansion-item:hover{border-color:var(--rw-accent-dim)}"
-    ".q-separator{background:var(--rw-line)}"
     # ---------- 表格（app.css L272-277 .dt）----------
     ".q-table thead th{color:var(--rw-muted);font-weight:500;background:var(--rw-bg);"
     "border-bottom:1px solid var(--rw-line)}"
@@ -2357,7 +2383,11 @@ def create() -> None:
         # 【主色只能从这里改】Quasar 的 .bg-primary 是 @layer quasar_importants 里的
         # !important，而 add_head_html 注入的 CSS 无层 —— 无层的 !important 打不过
         # 层里的 !important。所以硬碰是写不赢的，只能换 --q-primary 本身。
-        ui.colors(primary="#4a78c0", negative="#f87171")
+        # 【通知条的三种类型色也换成参考端的状态色】不换的话「已保存」「已经在抓了」
+        # 这些提示是 Quasar 出厂的 #21BA45 / #F2C037，和徽标用的那套绿黄不是一家。
+        # 深色字由 notify() 统一加，这三个亮底上都在 7:1 以上。
+        ui.colors(primary="#4a78c0", negative="#f87171",
+                  positive="#4ade80", warning="#facc15", info="#60a5fa")
         ui.add_head_html(DARK_CSS)
         # 【顶栏 = 参考端的 sticky header】半透明 96% + 背后模糊 8px + 1px 下边框。
         # 原先那句内联 .style() 必须去掉：内联样式赢过任何层、任何 !important，

@@ -155,6 +155,81 @@ def test_看门狗自己出错不会死():
     assert clock.rounds == 6, "出错之后应该继续转，而不是退出"
 
 
+class SleepyClock(Clock):
+    """第 sleep_round 轮醒来时墙钟一下跳过 sleep 这么久 —— 整个进程被挂起（电脑睡眠）的样子。"""
+
+    def __init__(self, start, sleep_round, sleep):
+        super().__init__(start)
+        self.sleep_round, self.sleep = sleep_round, sleep
+
+    def wait(self, x):
+        done = super().wait(x)
+        if self.rounds == self.sleep_round:
+            self.now += self.sleep
+        return done
+
+
+def run_sleepy(rounds, beat_fn, sleep_round=3, sleep=timedelta(hours=8)):
+    """跑一段中间睡过一觉的看门狗。beat_fn(clock) 决定每一刻心跳停在哪。"""
+    from db import store
+
+    clock = SleepyClock(T0, sleep_round, sleep)
+    clock.max_rounds = rounds
+    sent = []
+    saved = config.now, poller.heartbeat, store.get_settings
+    config.now = lambda: clock.now
+    poller.heartbeat = lambda: beat_fn(clock)
+    store.get_settings = lambda force=False: ON
+    try:
+        poller.watchdog(clock, alert=lambda url, tpl, text: sent.append(text))
+    finally:
+        config.now, poller.heartbeat, store.get_settings = saved
+    return sent
+
+
+def test_电脑睡醒那一刻不许误报():
+    """【真事】2026-09-17〜20 这台 Mac 推了 8 条「轮询已停」，全在唤醒后几秒内，全是假的。
+
+    醒来时心跳停在 8 小时前，但那是睡眠、不是卡死：主循环醒来后几十秒内就会跳心跳。
+    模拟：睡前心跳一直在跳；醒来后第 1 轮主循环还没来得及跳，第 2 轮起恢复正常。
+    """
+    wake = {}
+
+    def beat(clock):
+        if clock.rounds < 3:                       # 睡前：一直在跳
+            return clock.now
+        wake.setdefault("at", clock.now)
+        if clock.rounds == 3:                      # 刚醒：心跳还停在睡前
+            return T0 + timedelta(minutes=2)
+        return clock.now - timedelta(seconds=20)   # 主循环恢复
+
+    sent = run_sleepy(rounds=30, beat_fn=beat)
+    assert sent == [], f"睡醒后主循环 1 分钟内就恢复了，却推了告警：{sent}"
+
+
+def test_睡醒之后真卡死_照样告警且只告一次():
+    """跳过的只是"醒来那一轮"。醒来之后心跳还是不动，就是真卡死 —— 必须报。
+
+    停了多久从醒来那一刻算（睡眠 8 小时不算卡死），而且告警里要说清楚这一点，
+    否则「已停 10 分钟」配上一个 8 小时前的心跳时间，读的人会以为时间算错了。
+    """
+    sent = run_sleepy(rounds=60, beat_fn=lambda clock: T0)
+    assert len(sent) == 1, f"真卡死应该恰好报 1 条，实际 {len(sent)}"
+    assert "10 分钟" in sent[0], f"应从醒来那一刻起算，到阈值 10 分钟报：{sent[0]}"
+    assert "不含中间电脑睡眠" in sent[0]
+
+
+def test_判挂起的依据必须是墙钟():
+    """time.monotonic() 在 macOS 上是 mach_absolute_time()，睡眠期间不走 ——
+    用它量出来睡 8 小时也只隔了 60 秒，整段逻辑等于没写。"""
+    import inspect
+    src = inspect.getsource(poller.watchdog)
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    body = code[code.index('"""', code.index('"""') + 3) + 3:]      # 跳过 docstring
+    assert "monotonic" not in body, "看门狗判挂起不许用 monotonic（macOS 睡眠期间不走）"
+    assert "config.now()" in body
+
+
 # ---------------------------------------------------------------- 4. 防双启
 
 def test_轮询不许起第二个():

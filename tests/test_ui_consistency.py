@@ -90,3 +90,23 @@ def test_取数函数不该是_refreshable():
            and n.name.startswith("_load_")
            and any(ast.unparse(d) == "ui.refreshable" for d in n.decorator_list)]
     assert not bad, f"取数函数带了 @ui.refreshable：{bad} —— 装饰器应该在画界面的那个 *_view 上"
+
+
+def test_次操作按钮的字色规则不许波及圆形图标按钮():
+    """【真事】2026-09-23 为了让 BTN_GHOST 的蓝字过 AA，在 @layer overrides 里加了
+    .q-btn--flat.text-primary{color:亮蓝!important}。缩略图角上的 ★ ⚑ 也是 flat、
+    也被 Quasar 挂了 text-primary，而这条的特异性（0,3,0）高过 .star-on/.mark-on（0,2,0）——
+    已追踪的琥珀星、已标记的青旗全被刷成蓝色，缩略图上分不出追没追、标没标。
+    单元测试里没有浏览器，只能锁住"这条规则必须排除 round"这个写法本身。
+    """
+    import re
+    from web.ui import DARK_CSS
+    rules = [r for r in re.findall(r"[^{}]+\{[^{}]*\}", DARK_CSS)
+             if ".q-btn--flat.text-primary" in r]
+    assert rules, "找不到次操作按钮的字色规则 —— 被删了还是改名了？"
+    for r in rules:
+        sel = r.split("{")[0]
+        for part in sel.split(","):
+            if ".q-btn--flat.text-primary" in part:
+                assert ":not(.q-btn--round)" in part, (
+                    f"这个选择器会刷到 ★ ⚑ ☰ 上：{part.strip()!r}")

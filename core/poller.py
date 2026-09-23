@@ -621,28 +621,54 @@ def watchdog(stop_event, alert=None, interval: float = 60.0) -> None:
     持续不恢复的话 6 小时再提醒一次。恢复了就把状态清掉，下次再停会重新告警。
 
     alert 参数只是给测试注入用的；正常跑用 core.notify.post。
+
+    【整个进程被挂起过的那一轮不判】2026-09-17〜20 这台 Mac 推了 8 条「轮询已停」，
+    全是假的：每条都在 pmset 记录的唤醒事件几秒之内，而那几天 NAS 上的实例一直在抓。
+    机制是电脑一睡，轮询线程和看门狗【一起】被冻住；醒来那一刻看门狗常常抢在主循环
+    跳心跳之前先跑，看到的是一个睡前留下的、几小时前的心跳。
+    指纹也很清楚：真卡死的话，阈值 10 分钟 + 每 60 秒看一次，停后 11 分钟就该报；
+    实际延迟却是 23〜51 分钟 —— 看门狗自己也停过。所以反过来用这一点：两轮之间的
+    墙钟间隔远大于 interval，停的就是整个进程而不是轮询线程，这一轮跳过，并且
+    从醒来那一刻重新计时。真卡死不受影响：醒来之后心跳还是不动，照样在阈值到点时报。
+    【必须用墙钟，不能用 time.monotonic()】macOS 上它是 mach_absolute_time()，
+    睡眠期间不走 —— 用它的话睡了 8 小时量出来还是 60 秒，这段逻辑等于没写。
     """
     from core import notify
 
     last_alert = None                       # 上一次告警的时间；None＝当前没在停机段里
+    prev = config.now()                     # 上一轮看门狗醒来的墙钟时间
+    resumed_at = None                       # 进程刚从挂起里恢复的时刻；None＝没有
     while not stop_event.wait(interval):
         try:
+            now = config.now()
+            gap = (now - prev).total_seconds()
+            prev = now
+            if gap > interval * 3:
+                resumed_at = now
+                log.info("看门狗两轮之间隔了 %d 分钟（应为 %d 秒）—— 整个进程刚被挂起过，"
+                         "多半是电脑睡眠。这一轮不判，从现在起重新计时", gap // 60, interval)
+                continue
+            beat = heartbeat()
+            if resumed_at and beat is not None and beat >= resumed_at:
+                resumed_at = None           # 醒来之后主循环跳过心跳了，一切照旧
+            # 醒来之后还没跳过心跳的话，停了多久从醒来那一刻算 —— 睡眠时间不算卡死
+            ref = resumed_at if (resumed_at and beat is not None) else beat
             s = store.get_settings()
-            mins = stalled_for(config.now(), heartbeat(), s.get("poller_stall_min") or 0)
+            mins = stalled_for(now, ref, s.get("poller_stall_min") or 0)
             if mins is None:
                 last_alert = None
                 continue
-            if last_alert and (config.now() - last_alert) < timedelta(hours=6):
+            if last_alert and (now - last_alert) < timedelta(hours=6):
                 continue
-            beat = heartbeat()
-            text = (f"⚠ 轮询已停 {mins} 分钟（心跳停在 {beat:%m-%d %H:%M}）\n"
+            text = (f"⚠ 轮询已停 {mins} 分钟（心跳停在 {beat:%m-%d %H:%M}）"
+                    + ("，不含中间电脑睡眠的时间" if ref is not beat else "") + "\n"
                     "进程还活着、面板还开着，但没在抓。多半是数据库连接卡死。\n"
                     "重启一下：./run.sh restart")
             log.error(text.replace("\n", " "))
             url = (s.get("notify_url") or "").strip()
             if url:
                 (alert or notify.post)(url, s.get("notify_body") or "", text)
-            last_alert = config.now()
+            last_alert = now
         except Exception as e:              # noqa: BLE001 - 看门狗自己不能死
             log.warning("看门狗这一轮失败：%s", e)
 

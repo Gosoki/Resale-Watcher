@@ -267,8 +267,10 @@ DARK_CSS = (
     ".rw-header .q-btn{min-height:28px;min-width:28px;width:28px;height:28px;padding:0}"
     ".rw-header .text-sm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
     "min-width:0}"
+    # 【flex-shrink:0】顶栏不折行之后，窄屏上空间不够时 flex 会把所有子元素一起压 ——
+    # 页名跟着状态字被压成「命」。该截断的只有状态字（尾巴是时间戳），页名最多两个字。
     ".rw-title{font-weight:600;font-size:16px;overflow:hidden;text-overflow:ellipsis;"
-    "white-space:nowrap}"
+    "white-space:nowrap;flex-shrink:0}"
     # ---------- 每页顶上那一行（app.css L76 .toolbar / L75 .count）----------
     # 参考端的 .icon-btn 是「有底色的扁按钮」：surface2 底 + 1px 描边，
     # hover 只换描边色、底色不动。这个质感只给页首工具条上的按钮 ——

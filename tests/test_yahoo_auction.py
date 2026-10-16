@@ -349,9 +349,29 @@ def test_页面说有货却一件ID都拿不到_抛SourceBroken而不是返回�
         _src_with("<html><div>検索結果 84件</div></html>").search("x")
 
 
-def test_真没货时正常返回空_不报错():
+def test_真没货时正常返回空_不报错_并标明是平台说的():
     r = _src_with(_next_html([], total=0)).search("x")
-    assert r == {"items": [], "next": "", "total": 0}
+    assert r["items"] == [] and r["total"] == 0 and r["next"] == ""
+    assert r["empty_ok"] is True, "认出了结果容器、平台明确说 0 件 —— 轮询层据此放行，不当成解析失效"
+
+
+def test_返回里带着过滤前的条数():
+    r = _src_with(_next_html([_auc("x1"), _auc("z1", flea=True)])).search("x")
+    assert len(r["items"]) == 1 and r["raw"] == 2 and r["empty_ok"] is False
+
+
+def test_认不出主列表时宁可报改版_不拿推荐模块顶替():
+    # featuredListing（注目のオークション）形状和主列表一样、但只有 1〜3 件。拿它顶替会让
+    # 「能发现的改版」变成「悄悄只拿到 1 件」：两层 SourceBroken 都拦不住，对账照样空转。
+    html = _next_html([_auc("f0000000001")], box_key="somethingElse",
+                      featured=[_auc("f0000000001")]) + "<div>検索結果 84件</div>"
+    with pytest.raises(SourceBroken):
+        _src_with(html).search("x")
+
+
+def test_列表头上插了个广告位_主列表照样认得出():
+    html = _next_html([{"type": "AD"}, _auc("x0000000008")])
+    assert [it["item_id"] for it in _src_with(html).search("x")["items"]] == ["x0000000008"]
 
 
 def test_总数正好整百时多翻的那一页是空的_不算改版():

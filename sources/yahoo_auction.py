@@ -10,8 +10,9 @@
           【改版是悄无声息的】新页面上一个 `<li class="Product">` 都没有了，旧解析器
           照常返回「0 件、已到底」—— 上层就把库里所有在售商品当成失踪，每轮拉详情核实，
           9 小时白花 1595 个请求，新上架的一件没抓到。所以现在：
-            · 先按已知路径找，找不到再按「形状」找（带 totalResultsAvailable、
+            · 先按已知路径找，找不到再按「形状」找（键名叫 listing、带 totalResultsAvailable、
               items 里是 auctionId 的那个容器），对方挪个位置不至于立刻瞎掉；
+              推荐模块（featuredListing）形状一样但只有几件，绝不拿它顶替；
             · 两种都找不到才退回下面的旧版块解析；
             · 页面说有 N 件、我们却一件 ID 都拿不到 → 抛 SourceBroken，绝不当成"没货"。
 
@@ -93,7 +94,11 @@ class YahooAuction(Source):
         # 【按未过滤的条数推进】b= 是"从第几件开始"的偏移量，按过滤后的件数推进
         # 会让下一页从已经看过的位置重新开始，越滤越退回去。
         nxt = str(begin + len(raw)) if len(raw) >= PAGE_SIZE else ""
-        return {"items": items, "next": nxt, "total": total}
+        # raw：过滤前拿到了几个 ID。一页全是 フリマ 时 items 是空的，但解析是好的 ——
+        #      轮询层判「解析突然失效」时要看它，不能只看过滤后的 items。
+        # empty_ok：认出了结果容器、平台明确说 0 件。这是真没货，不是解析坏了。
+        return {"items": items, "next": nxt, "total": total, "raw": len(ids),
+                "empty_ok": listing is not None and total == 0}
 
     def detail(self, item_id: str) -> dict | None:
         resp = self._call("GET", ITEM_PAGE.format(item_id))
@@ -217,9 +222,12 @@ def _listing(html: str) -> dict | None:
     """新版搜索页的结果容器 {items, totalResultsAvailable}；不是新版页面就返回 None。
 
     先走已知路径；找不到再按形状找 —— 对方把它挪个位置、换个外层键名，
-    只要容器本身还是这个形状就照样能用，不至于一改版就全瞎。
-    【按形状找时优先认 "listing" 这个键】同一页里还有 featuredListing、newArrival
-    这类推荐模块，形状一样，但里面的商品不是这次搜索的结果。
+    只要容器还叫 listing、还是这个形状就照样能用，不至于一改版就全瞎。
+    【按形状找时只认 "listing" 这个键，认不出宁可返回 None】同一页里还有
+    featuredListing（注目のオークション）这类推荐模块，形状一模一样，但只有 1〜3 件。
+    原先认不出 listing 时会退而挑总数最大的那个容器 —— 结果是悄悄拿到那 1〜3 件、
+    当成完整结果：两层 SourceBroken 判定都拦不住，售出对账照样把其余几十件当失踪。
+    返回 None 之后会走旧版块解析，那里一件都拿不到、页面又写着「N件」，就会抛 SourceBroken。
     """
     m = _NEXT_DATA.search(html)
     if not m:
@@ -234,21 +242,17 @@ def _listing(html: str) -> dict | None:
                 .get("items") or {}).get("listing"))
         if _is_result_box(lst):
             return lst
-    found = list(_result_boxes(blob))
-    if not found:
-        return None
-    named = [box for key, box in found if key == "listing"]
-    if named:
-        return named[0]
-    return max((box for _, box in found), key=lambda b: _int(b.get("totalResultsAvailable")))
+    named = [box for key, box in _result_boxes(blob) if key == "listing"]
+    return named[0] if named else None
 
 
 def _is_result_box(o) -> bool:
     if not isinstance(o, dict) or "totalResultsAvailable" not in o:
         return False
     items = o.get("items")
+    # 看任意一条，不只看第 0 条：列表头上插一个广告位，不该让整个结果容器认不出来
     return isinstance(items, list) and (
-        not items or (isinstance(items[0], dict) and "auctionId" in items[0]))
+        not items or any(isinstance(x, dict) and "auctionId" in x for x in items))
 
 
 def _result_boxes(o, key: str = ""):

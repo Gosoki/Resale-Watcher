@@ -95,3 +95,16 @@ def test_写默认设置只发一条INSERT_外加清孤儿的一条DELETE(monkey
     assert sql.rstrip().endswith("ON DUPLICATE KEY UPDATE note = VALUES(note)"), "v 不能被覆盖"
     assert args[0::4] == list(config.SETTINGS_SPEC), "每行的 k 按 SPEC 顺序"
     assert calls[1][0].startswith("DELETE FROM app_setting WHERE k NOT IN")
+
+
+def test_改了关键词_换了源_重新启用时_清掉旧的平台总数(monkeypatch):
+    """轮询拿上一轮的 last_total 判「解析突然失效」（上一轮一堆、这一轮 0 件）。把关键词改窄、
+    新词在某个源上本来就 0 件时，旧词的数会让它被一直误判成改版、永远不做售出对账。"""
+    from db import store
+    for changed, expect_reset in ((["keyword"], True), (["sources"], True), (["enabled"], True),
+                                  (["price_max", "note"], False)):
+        calls = []
+        monkeypatch.setattr(store, "execute", lambda sql, args=(): calls.append(sql))
+        store.update_rule(7, {k: 1 for k in changed})
+        reset = [c for c in calls if c.startswith("UPDATE rule_source_state SET last_total = 0")]
+        assert bool(reset) is expect_reset, (changed, calls)

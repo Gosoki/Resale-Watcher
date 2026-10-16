@@ -180,10 +180,15 @@ def scan_on_sale(src, rule: dict, prev_total: int | None = None) -> dict:
     # （ヤフオク 就是：页面说有 N 件却一件 ID 都拿不到）。但 JSON 接口换了字段名之类的情况，
     # 源那一层常常只会安静地返回空列表。不在这里拦住，下面的售出对账就会把库里所有在售商品
     # 当成失踪、每轮拉详情去核实 —— 2026-10 ヤフオク 改版时就是这样白烧了六成的请求。
-    if (prev_total or 0) >= SUSPECT_DROP_FROM and not any(p["items"] for p in pages):
+    # 【看过滤前的条数】ヤフオク 在源里滤掉 フリマ 商品，一页全是 フリマ 时 items 为空、
+    # 但 raw > 0，那是解析好好的。【平台明确说 0 件（empty_ok）也放行】那是真没货。
+    # 改关键词 / 换源 / 重新启用时 update_rule 会把 last_total 清零，旧词的数不拿来比。
+    parsed = any(p["items"] or p.get("raw") or p.get("empty_ok") for p in pages)
+    if (prev_total or 0) >= SUSPECT_DROP_FROM and not parsed:
         raise sources.SourceBroken(
             f"{src.name} 上一轮还有 {prev_total} 件，这一轮一件都没解析出来"
-            "（多半是平台改版或被拦截）—— 本轮不做售出对账")
+            "（多半是平台改版或被拦截；如果这个词在平台上真的一件都没了，等有新货就会自己恢复）"
+            "—— 本轮不做售出对账")
     for page in pages:
         stat["total"] = page["total"]
         stat["pages"] += 1
@@ -214,6 +219,8 @@ def scan_on_sale(src, rule: dict, prev_total: int | None = None) -> dict:
                               last_total=stat["total"], truncated=int(truncated))
     if not truncated:
         reconcile_sold(src, rule, seen)
+    # 健康检查只认「真解析到了东西」：扫到 0 件不能证明这个源是好的（见 _source_ok）
+    stat["parsed"] = bool(seen) or parsed
     return stat
 
 
@@ -629,65 +636,111 @@ def stalled_for(now, beat, stall_min: int) -> int | None:
 
 
 # ------------------------------------------------------------------ 源健康告警
-# 源 key → {"since": 这一段连续失败从何时开始, "fails": 失败次数, "err": 最近一次的报错,
-#           "alerted": 上次告警时间或 None}。扫描成功就整条清掉。
-# 【只在内存里】只有拿着租约的那份实例在抓，换手或重启后从零计，最多晚一个阈值才报。
-_health: dict[str, dict] = {}
+# 失败按「规则 × 源」记：(源 key, 规则 id) → {"since": 这段连续失败从何时开始,
+#   "last": 最近一次失败, "fails": 次数, "err": 最近的报错}；扫描成功就清掉这一条。
+# 告警按源去重：源 key → {"at": 上次告警时间, "since": 那段故障从何时开始}。
+# 【为什么不按源记】一个源被好几条规则用着，失败却是按规则发生的。按源记的话，同源任何一条
+#   规则成功一次就把整段清零：一条规则持续坏着会被别的规则掩盖，或者 ⚠ / ✅ 来回刷。
+# 【只在内存里】只有拿着租约的那份实例在抓，重启从零计。待命、电脑睡眠、库连不上、
+#   配额用完这些「根本没在抓」的空档，靠两次失败之间的间隔识别（见 _gap_min），
+#   不会被算进「抓不到」的时长。
+_health: dict[tuple, dict] = {}
+_alerted: dict[str, dict] = {}
 
 
-def _source_failed(src, err: Exception, alert=None) -> None:
-    """某个源的在售扫描失败了一次。连续失败超过 source_alert_min 分钟就推送一条告警。
+def _gap_min(rule: dict, limit: int) -> int:
+    """两次失败隔了这么多分钟，就当中间没在抓（睡眠、待命、库连不上、配额用完），从头计。
+
+    要比这条规则正常的扫描间隔（quick_min，带 ±20% 抖动）宽得多，否则慢规则永远攒不够两次。
+    """
+    return max(2 * limit, 3 * int(rule.get("quick_min") or 0), 60)
+
+
+def _source_failed(src, rule: dict, err: Exception, alert=None) -> None:
+    """某条规则在某个源上的在售扫描失败了一次。持续失败超过 source_alert_min 分钟就推送告警。
 
     【为什么要这个】2026-10 ヤフオク 改版，解析器一件都认不出来，日志里只是一行行
     「在售84件 新增0」—— 看着一切正常，实际上这个源已经瞎了，却没有任何东西会主动告诉你。
-    【按时长不按次数】一个源被好几条规则用着，一轮里就能连败好几次；偶尔一次 403 / 网络抖动
-    下一轮就好了，不值得吵醒你。持续这么久都没有一次成功，才说明它真的抓不了了。
-    【和看门狗同一套节奏】每段故障只告警一次，持续不恢复每 6 小时再提醒；恢复时补一条「已恢复」。
+    【按时长、并且至少连败两次】偶尔一次 403 / 网络抖动下一轮就好了，不值得吵醒你。
+    【和看门狗同一套节奏】一段故障只告警一次，持续不恢复每 6 小时再提醒；恢复时补一条。
     alert 参数只是给测试注入用的；正常跑用 core.notify.post。
     """
+    # 数据库的问题不是源的问题：顶栏和看门狗管它。算进来的话会推一条「平台可能改了接口」误导人。
+    if type(err).__module__.startswith("pymysql"):
+        return
     now = config.now()
-    h = _health.setdefault(src.key, {"since": now, "fails": 0, "err": "", "alerted": None})
-    h["fails"] += 1
-    h["err"] = str(err)[:200]
     s = store.get_settings()
     limit = s.get("source_alert_min") or 0
+    key = (src.key, rule["id"])
+    h = _health.get(key)
+    if h is None or (limit > 0 and now - h["last"] > timedelta(minutes=_gap_min(rule, limit))):
+        h = _health[key] = {"since": now, "last": now, "fails": 0, "err": ""}
+    h["last"] = now
+    h["fails"] += 1
+    h["err"] = str(err)[:200]
     mins = int((now - h["since"]).total_seconds() // 60)
-    if not limit or mins < limit:
+    # 负数和 0 一样当「关」—— 否则 mins < -1 永远不成立，每次抖动都会推一对 ⚠ / ✅
+    if limit <= 0 or mins < limit or h["fails"] < 2:
         return
-    if h["alerted"] and (now - h["alerted"]) < timedelta(hours=6):
+    last = _alerted.get(src.key)
+    if last and (now - last["at"]) < timedelta(hours=6):
         return
     if isinstance(err, sources.SourceBroken):
-        why = "平台正常返回了页面，但我们解析不出商品 —— 多半是页面改版了，要改解析代码。"
+        why = "平台正常返回了页面，但解析不出商品 —— 多半是页面改版了，要改解析代码。"
     elif isinstance(err, sources.RateLimited):
         why = "一直被限流或拒绝（429 / 403 / 网络错误）—— 可能是被风控盯上了，先别调快抓取节奏。"
     else:
         why = "程序报错 —— 平台可能改了接口，详细的报错在日志里。"
-    text = (f"⚠ {src.name} 已经 {mins} 分钟抓不到东西（连续失败 {h['fails']} 次）\n"
+    others = sum(1 for (k, r), v in _health.items()
+                 if k == src.key and r != rule["id"]
+                 and now - v["last"] <= timedelta(minutes=_gap_min(rule, limit)))
+    text = (f"⚠ {src.name} 已经 {mins} 分钟抓不到东西（规则「{rule['name']}」连续失败 {h['fails']} 次"
+            + (f"，同源还有 {others} 条规则也在失败" if others else "") + "）\n"
             f"{why}\n最近一次：{h['err']}")
     log.error(text.replace("\n", " "))
-    _send_alert(s, text, alert)
-    h["alerted"] = now
+    if _send_alert(s, text, alert):
+        _alerted[src.key] = {"at": now, "since": last["since"] if last else h["since"]}
 
 
-def _source_ok(src, alert=None) -> None:
-    """某个源扫描成功了：清掉失败记录；之前告过警的话补一条「已恢复」。"""
-    h = _health.pop(src.key, None)
-    if not h or not h["alerted"]:
+def _source_ok(src, rule: dict, alert=None) -> None:
+    """某条规则在某个源上【真的】扫到了东西：清掉它的失败记录。
+
+    这个源之前告过警、而且同源已经没有别的规则还在失败，就补一条「已恢复」。
+    【扫到 0 件不算】调用方只在解析出了商品（或平台明确说 0 件）时才调这里 ——
+    冷门规则安静地返回空列表，正是解析坏了的样子，不能拿它去清别的规则攒下的失败。
+    """
+    _health.pop((src.key, rule["id"]), None)
+    last = _alerted.get(src.key)
+    if not last:
         return
-    mins = int((config.now() - h["since"]).total_seconds() // 60)
-    text = f"✅ {src.name} 恢复正常（之前连续失败 {h['fails']} 次、持续约 {mins} 分钟）"
+    now = config.now()
+    s = store.get_settings()
+    limit = s.get("source_alert_min") or 0
+    if any(k == src.key and now - v["last"] <= timedelta(minutes=_gap_min(rule, max(limit, 0)))
+           for (k, _r), v in _health.items()):
+        return                              # 同源还有规则在失败，先不报恢复
+    mins = int((now - last["since"]).total_seconds() // 60)
+    text = f"✅ {src.name} 恢复正常（这段故障持续约 {mins} 分钟）"
     log.info(text)
-    _send_alert(store.get_settings(), text, alert)
+    if _send_alert(s, text, alert):
+        _alerted.pop(src.key, None)         # 没发出去就留着，下次扫描成功时再补
 
 
-def _send_alert(s: dict, text: str, alert=None) -> None:
+def _send_alert(s: dict, text: str, alert=None) -> bool:
+    """发一条告警。返回 False 表示瞬时失败（429 / 5xx / 网络），调用方别把它算作已发出。
+
+    【瞬时失败要重试】和商品推送同一个约定：每段故障只有这一条告警，一次 503 不该把
+    「及时提醒」拖到 6 小时以后。地址为空、地址/模板本身错了（再试也一样）就当已处理。
+    """
     url = (s.get("notify_url") or "").strip()
     if not url:
-        return
+        return True
     try:
         (alert or notify.post)(url, s.get("notify_body") or "", text)
     except Exception as e:  # noqa: BLE001 - 告警发不出去不能把轮询带崩
         log.warning("告警推送失败：%s", e)
+        return not getattr(e, "transient", False)
+    return True
 
 
 def watchdog(stop_event, alert=None, interval: float = 60.0) -> None:
@@ -869,7 +922,8 @@ def _run_round(rules, stop_event) -> bool:
                     stat["details"] = fetch_details(src, rule)
                     worked = True
                     store.update_source_state(rid, src.key, last_error="")
-                    _source_ok(src)
+                    if stat["parsed"]:
+                        _source_ok(src, rule)
                     # 【常驻轮询也要留下这一行】这条汇总原先只写在 run_once 里，
                     # 而 run_once 只有面板的「立即跑一次」和 ./run.sh once 会走 ——
                     # 也就是说正常部署方式下，每轮扫了几页、拉了几个详情，
@@ -890,18 +944,18 @@ def _run_round(rules, stop_event) -> bool:
                                 src.key, rule["name"], e)
                     store.update_source_state(rid, src.key, last_error=str(e)[:255],
                                               last_scan_at=config.now())
-                    _source_failed(src, e)
+                    _source_failed(src, rule, e)
                 except sources.SourceBroken as e:
                     # 已知原因的故障，一行就说清了，不用整段 traceback 刷屏
                     log.error("[%s] 规则「%s」%s", src.key, rule["name"], e)
                     store.update_source_state(rid, src.key, last_error=str(e)[:255],
                                               last_scan_at=config.now())
-                    _source_failed(src, e)
+                    _source_failed(src, rule, e)
                 except Exception as e:  # noqa: BLE001 - 单个源出错不该拖垮整个轮询
                     log.exception("[%s] 规则「%s」出错", src.key, rule["name"])
                     store.update_source_state(rid, src.key, last_error=str(e)[:255],
                                               last_scan_at=config.now())
-                    _source_failed(src, e)
+                    _source_failed(src, rule, e)
 
         if worked:
             # 跨源的收尾：重判 + 捡漏 + 推送。只在真扫过东西时做，没动静就别空跑。

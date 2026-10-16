@@ -418,6 +418,12 @@ def update_rule(rule_id: int, data: dict) -> None:
     sets = ", ".join(f"{c} = %s" for c in cols) + ", updated_at = %s"
     execute(f"UPDATE watch_rule SET {sets} WHERE id = %s",
             [data[c] for c in cols] + [config.now(), rule_id])
+    # 【换了搜什么，就别拿旧的平台总数来比】轮询拿上一轮的 last_total 判「解析突然失效」
+    # （上一轮还有一堆、这一轮 0 件）。改了关键词、换了源、停用很久再启用时，旧的数对新情况
+    # 没有参考意义：把关键词改窄、新词在某个源上本来就 0 件，会被一直误判成改版、永远不对账。
+    # 面板保存只提交真正改过的字段，所以只有这几项变了才会清。
+    if {"keyword", "sources", "enabled"} & set(cols):
+        execute("UPDATE rule_source_state SET last_total = 0 WHERE rule_id = %s", (rule_id,))
 
 
 def delete_rule(rule_id: int) -> None:

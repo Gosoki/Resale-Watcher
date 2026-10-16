@@ -163,11 +163,27 @@ def _pages(src, rule: dict, *, sold: bool) -> tuple[list[dict], bool]:
     return pages, truncated
 
 
-def scan_on_sale(src, rule: dict) -> dict:
+# 上一轮平台还报着至少这么多件、这一轮却一件都没解析出来 → 当成解析坏了，不当成"全卖光了"。
+# 【为什么是 10】本项目的关键词每源每轮都是几十上百件；一个扫描间隔（几分钟到半小时）里
+# 从 10 件以上一下子掉到 0，现实中几乎不会发生，而解析器失效恰好就是这个样子。
+# 阈值太低（比如 1）会把冷门关键词真的卖空误报成故障。
+SUSPECT_DROP_FROM = 10
+
+
+def scan_on_sale(src, rule: dict, prev_total: int | None = None) -> dict:
+    """prev_total 是上一轮记下的平台总数（rule_source_state.last_total），用来识别解析突然失效。"""
     rid = rule["id"]
     seen: set[str] = set()
     stat = {"total": 0, "new": 0, "price_down": 0, "pages": 0}
     pages, truncated = _pages(src, rule, sold=False)
+    # 【三个源通用的"解析悄悄坏了"判定】源自己能认出改版时会直接抛 SourceBroken
+    # （ヤフオク 就是：页面说有 N 件却一件 ID 都拿不到）。但 JSON 接口换了字段名之类的情况，
+    # 源那一层常常只会安静地返回空列表。不在这里拦住，下面的售出对账就会把库里所有在售商品
+    # 当成失踪、每轮拉详情去核实 —— 2026-10 ヤフオク 改版时就是这样白烧了六成的请求。
+    if (prev_total or 0) >= SUSPECT_DROP_FROM and not any(p["items"] for p in pages):
+        raise sources.SourceBroken(
+            f"{src.name} 上一轮还有 {prev_total} 件，这一轮一件都没解析出来"
+            "（多半是平台改版或被拦截）—— 本轮不做售出对账")
     for page in pages:
         stat["total"] = page["total"]
         stat["pages"] += 1
@@ -582,7 +598,8 @@ def run_once(rule: dict) -> dict:
         # 【每个源单独 try】否则第一个源被限流就会放弃剩下所有源，
         # 连跨源的重判/捡漏都跑不到 —— 一个源的故障扩散成整条规则停摆。
         try:
-            stat = scan_on_sale(src, rule)
+            prev = store.get_source_state(rule["id"], src.key).get("last_total")
+            stat = scan_on_sale(src, rule, prev_total=prev)
             stat["details"] = fetch_details(src, rule)
         except Exception as e:              # noqa: BLE001 - 单源故障不该拖垮整条规则
             log.warning("[%s] 规则「%s」本轮失败：%s", src.key, rule["name"], e)
@@ -609,6 +626,68 @@ def stalled_for(now, beat, stall_min: int) -> int | None:
         return None
     mins = int((now - beat).total_seconds() // 60)
     return mins if mins >= stall_min else None
+
+
+# ------------------------------------------------------------------ 源健康告警
+# 源 key → {"since": 这一段连续失败从何时开始, "fails": 失败次数, "err": 最近一次的报错,
+#           "alerted": 上次告警时间或 None}。扫描成功就整条清掉。
+# 【只在内存里】只有拿着租约的那份实例在抓，换手或重启后从零计，最多晚一个阈值才报。
+_health: dict[str, dict] = {}
+
+
+def _source_failed(src, err: Exception, alert=None) -> None:
+    """某个源的在售扫描失败了一次。连续失败超过 source_alert_min 分钟就推送一条告警。
+
+    【为什么要这个】2026-10 ヤフオク 改版，解析器一件都认不出来，日志里只是一行行
+    「在售84件 新增0」—— 看着一切正常，实际上这个源已经瞎了，却没有任何东西会主动告诉你。
+    【按时长不按次数】一个源被好几条规则用着，一轮里就能连败好几次；偶尔一次 403 / 网络抖动
+    下一轮就好了，不值得吵醒你。持续这么久都没有一次成功，才说明它真的抓不了了。
+    【和看门狗同一套节奏】每段故障只告警一次，持续不恢复每 6 小时再提醒；恢复时补一条「已恢复」。
+    alert 参数只是给测试注入用的；正常跑用 core.notify.post。
+    """
+    now = config.now()
+    h = _health.setdefault(src.key, {"since": now, "fails": 0, "err": "", "alerted": None})
+    h["fails"] += 1
+    h["err"] = str(err)[:200]
+    s = store.get_settings()
+    limit = s.get("source_alert_min") or 0
+    mins = int((now - h["since"]).total_seconds() // 60)
+    if not limit or mins < limit:
+        return
+    if h["alerted"] and (now - h["alerted"]) < timedelta(hours=6):
+        return
+    if isinstance(err, sources.SourceBroken):
+        why = "平台正常返回了页面，但我们解析不出商品 —— 多半是页面改版了，要改解析代码。"
+    elif isinstance(err, sources.RateLimited):
+        why = "一直被限流或拒绝（429 / 403 / 网络错误）—— 可能是被风控盯上了，先别调快抓取节奏。"
+    else:
+        why = "程序报错 —— 平台可能改了接口，详细的报错在日志里。"
+    text = (f"⚠ {src.name} 已经 {mins} 分钟抓不到东西（连续失败 {h['fails']} 次）\n"
+            f"{why}\n最近一次：{h['err']}")
+    log.error(text.replace("\n", " "))
+    _send_alert(s, text, alert)
+    h["alerted"] = now
+
+
+def _source_ok(src, alert=None) -> None:
+    """某个源扫描成功了：清掉失败记录；之前告过警的话补一条「已恢复」。"""
+    h = _health.pop(src.key, None)
+    if not h or not h["alerted"]:
+        return
+    mins = int((config.now() - h["since"]).total_seconds() // 60)
+    text = f"✅ {src.name} 恢复正常（之前连续失败 {h['fails']} 次、持续约 {mins} 分钟）"
+    log.info(text)
+    _send_alert(store.get_settings(), text, alert)
+
+
+def _send_alert(s: dict, text: str, alert=None) -> None:
+    url = (s.get("notify_url") or "").strip()
+    if not url:
+        return
+    try:
+        (alert or notify.post)(url, s.get("notify_body") or "", text)
+    except Exception as e:  # noqa: BLE001 - 告警发不出去不能把轮询带崩
+        log.warning("告警推送失败：%s", e)
 
 
 def watchdog(stop_event, alert=None, interval: float = 60.0) -> None:
@@ -786,10 +865,11 @@ def _run_round(rules, stop_event) -> bool:
             # —— 在售扫描（主功能）——
             if _due(st["last_scan_at"], rule["quick_min"]):
                 try:
-                    stat = scan_on_sale(src, rule)
+                    stat = scan_on_sale(src, rule, prev_total=st.get("last_total"))
                     stat["details"] = fetch_details(src, rule)
                     worked = True
                     store.update_source_state(rid, src.key, last_error="")
+                    _source_ok(src)
                     # 【常驻轮询也要留下这一行】这条汇总原先只写在 run_once 里，
                     # 而 run_once 只有面板的「立即跑一次」和 ./run.sh once 会走 ——
                     # 也就是说正常部署方式下，每轮扫了几页、拉了几个详情，
@@ -810,10 +890,18 @@ def _run_round(rules, stop_event) -> bool:
                                 src.key, rule["name"], e)
                     store.update_source_state(rid, src.key, last_error=str(e)[:255],
                                               last_scan_at=config.now())
+                    _source_failed(src, e)
+                except sources.SourceBroken as e:
+                    # 已知原因的故障，一行就说清了，不用整段 traceback 刷屏
+                    log.error("[%s] 规则「%s」%s", src.key, rule["name"], e)
+                    store.update_source_state(rid, src.key, last_error=str(e)[:255],
+                                              last_scan_at=config.now())
+                    _source_failed(src, e)
                 except Exception as e:  # noqa: BLE001 - 单个源出错不该拖垮整个轮询
                     log.exception("[%s] 规则「%s」出错", src.key, rule["name"])
                     store.update_source_state(rid, src.key, last_error=str(e)[:255],
                                               last_scan_at=config.now())
+                    _source_failed(src, e)
 
         if worked:
             # 跨源的收尾：重判 + 捡漏 + 推送。只在真扫过东西时做，没动静就别空跑。

@@ -247,10 +247,15 @@ def seed_settings() -> None:
     否则每次重启都会把你在面板上改过的值冲回默认值。
     """
     now = config.now()
-    for k, (_typ, default, note) in config.SETTINGS_SPEC.items():
-        execute("INSERT INTO app_setting (k, v, note, updated_at) VALUES (%s, %s, %s, %s) "
-                "ON DUPLICATE KEY UPDATE note = VALUES(note)",
-                (k, str(default), note, now))
+    # 【一条语句写完，不要每项一条】这一步跑在启动路径上。原先二十多项各发一条 INSERT，
+    # 加上建表一共四十来个来回；2026-10-16 NAS 到数据库之间的网络（路由器硬件加速的 bug）
+    # 恰好会在一条连接连发十几条之后把连接掐死，服务就卡在这里起不来、反复重启 270 多次。
+    # 网络是根因，但启动时没必要连发这么多 —— 合成一条，语义完全一样（逐行 ON DUPLICATE）。
+    rows = [(k, str(default), note, now) for k, (_typ, default, note) in config.SETTINGS_SPEC.items()]
+    execute("INSERT INTO app_setting (k, v, note, updated_at) VALUES "
+            + ", ".join(["(%s, %s, %s, %s)"] * len(rows))
+            + " ON DUPLICATE KEY UPDATE note = VALUES(note)",
+            [a for r in rows for a in r])
     # 代码里删掉某个设置项后，表里会留下一行没人读的孤儿 —— 它还会显示在面板
     # 「设置」页上让你以为改了有用。跟着 SPEC 一起清掉。
     keys = list(config.SETTINGS_SPEC)

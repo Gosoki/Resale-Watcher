@@ -245,3 +245,120 @@ def test_商家一口价换算成税込_个人出品的不动():
     user = shop.replace('data-auction-id="s1"', 'data-auction-id="u1"').replace('isshoppingitem="1"', 'isshoppingitem=""')
     assert src._parse(shop)["buy_now_price"] == 1_000_000
     assert src._parse(user)["buy_now_price"] == 909_091
+
+
+# ---------------------------------------------------------------- 新版搜索页（2026-10 起）
+# 2026-10 Yahoo 把搜索页换成了 Next.js：一个 <li class="Product"> 都没有了，结果全在
+# __NEXT_DATA__ 里。旧解析器在新页面上一件都认不出来，却照常返回「0 件、已到底」——
+# 上层把库里所有在售商品当成失踪，每轮拉详情核实，9 小时白花 1595 个请求。
+# 下面的 fixture 保留新版 JSON 的【结构和字段名】，商品 ID / 卖家 ID 都是假的。
+import json  # noqa: E402
+
+import pytest  # noqa: E402
+
+from sources.base import SourceBroken  # noqa: E402
+from sources.yahoo_auction import PAGE_SIZE, _listing  # noqa: E402
+
+
+def _auc(iid, *, title="ZOTAC GeForce RTX 4090", price=300000, bids=3, flea=False,
+         shop=False, buynow=None, seller="FakeSellerUserId000000000001"):
+    return {"auctionId": iid, "title": title, "price": price, "bidCount": bids,
+            "endTime": "2026-10-18T19:45:14+09:00", "buyNowPrice": buynow,
+            "buyNowPriceNoTax": (buynow * 100 // 110) if (buynow and shop) else buynow,
+            "isShoppingItem": shop, "isFleamarketItem": flea,
+            "category": {"id": 2084019008, "name": "PCIエクスプレス"},
+            "seller": {"displayName": "********", "userId": seller},
+            "imageUrl": "https://example.invalid/img.jpg"}
+
+
+def _next_html(items, total=None, *, where=("props", "pageProps", "initialState", "search", "items"),
+               box_key="listing", featured=None):
+    box = {"isFetching": False, "items": items,
+           "totalResultsAvailable": len(items) if total is None else total}
+    node = {box_key: box,
+            "featuredListing": {"items": featured or [], "totalResultsAvailable": len(featured or [])}}
+    for k in reversed(where):
+        node = {k: node}
+    return ('<html><head><script id="__NEXT_DATA__" type="application/json">'
+            + json.dumps(node, ensure_ascii=False) + "</script></head><body>"
+            + "</body></html>")
+
+
+def _src_with(html):
+    src = YahooAuction()
+    src._call = lambda *a, **k: type("R", (), {"text": html, "status_code": 200})()
+    return src
+
+
+def test_新版_解析出完整的拍卖字段():
+    r = _src_with(_next_html([_auc("x0000000001")])).search("RTX 4090")
+    assert len(r["items"]) == 1
+    it = r["items"][0]
+    assert it["source"] == "yahoo_auction" and it["item_id"] == "x0000000001"
+    assert it["name"] == "ZOTAC GeForce RTX 4090" and it["price"] == 300000
+    assert it["status"] == "on_sale" and it["bid_count"] == 3
+    assert it["seller_id"] == "FakeSellerUserId000000000001", "和旧版 auc-seller-id 同值，拉黑列表靠它"
+    assert it["item_type"] == "user" and it["buy_now_price"] is None
+    assert it["category_id"] == 2084019008 and it["condition_id"] is None
+    # 带 +09:00 的 ISO → 库里统一的 naive JST
+    assert str(it["end_time"]) == "2026-10-18 19:45:14" and it["end_time"].tzinfo is None
+    assert r["total"] == 1 and r["next"] == ""
+
+
+def test_新版_商家一口价已是税込_不再乘1点1():
+    # 旧版块上商家品的 buynowprice 是税抜，要 ×110//100；新版 buyNowPrice 已经是税込
+    r = _src_with(_next_html([_auc("s0000000002", shop=True, buynow=37800)])).search("x")
+    it = r["items"][0]
+    assert it["item_type"] == "shop" and it["buy_now_price"] == 37800
+
+
+def test_新版_没人出价是0不是None():
+    it = _src_with(_next_html([_auc("x0000000003", bids=0)])).search("x")["items"][0]
+    assert it["bid_count"] == 0
+
+
+def test_新版_フリマ商品被滤掉_翻页按未过滤条数推进():
+    raw = [_auc(f"x{i:010d}", flea=(i % 3 == 0)) for i in range(PAGE_SIZE)]
+    r = _src_with(_next_html(raw, total=250)).search("x", page_token="1")
+    assert len(r["items"]) == PAGE_SIZE - len([i for i in range(PAGE_SIZE) if i % 3 == 0])
+    assert all(not it["item_id"] == f"x{0:010d}" for it in r["items"]), "isFleamarketItem 的要滤掉"
+    assert r["next"] == str(1 + PAGE_SIZE), "偏移量按过滤前的条数推进"
+
+
+def test_新版_推荐模块里的商品不算搜索结果():
+    html = _next_html([_auc("x0000000004")], featured=[_auc("f0000000005")])
+    ids = [it["item_id"] for it in _src_with(html).search("x")["items"]]
+    assert ids == ["x0000000004"]
+
+
+def test_新版_结果容器挪了位置也能按形状找到():
+    html = _next_html([_auc("x0000000006")], where=("props", "pageProps", "newLayout", "results"))
+    assert [it["item_id"] for it in _src_with(html).search("x")["items"]] == ["x0000000006"]
+    # 形状一样的容器有好几个时，认 listing 这个键，不认推荐模块
+    lst = _listing(_next_html([_auc("x0000000007")], where=("props", "a"),
+                              featured=[_auc("f1"), _auc("f2")]))
+    assert [x["auctionId"] for x in lst["items"]] == ["x0000000007"]
+
+
+def test_页面说有货却一件ID都拿不到_抛SourceBroken而不是返回空():
+    # 新版：容器在、总数 84、items 却是空的
+    with pytest.raises(SourceBroken):
+        _src_with(_next_html([], total=84)).search("x")
+    # 再改一次版：既没有 __NEXT_DATA__ 也没有 Product 块，只剩页面上的「84件」
+    with pytest.raises(SourceBroken):
+        _src_with("<html><div>検索結果 84件</div></html>").search("x")
+
+
+def test_真没货时正常返回空_不报错():
+    r = _src_with(_next_html([], total=0)).search("x")
+    assert r == {"items": [], "next": "", "total": 0}
+
+
+def test_总数正好整百时多翻的那一页是空的_不算改版():
+    r = _src_with(_next_html([], total=PAGE_SIZE)).search("x", page_token=str(PAGE_SIZE + 1))
+    assert r["items"] == [] and r["next"] == ""
+
+
+def test_一页全是フリマ商品_过滤后是0件_不算改版():
+    r = _src_with(_next_html([_auc(f"z{i}", flea=True) for i in range(5)])).search("x")
+    assert r["items"] == [] and r["total"] == 5

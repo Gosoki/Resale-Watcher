@@ -1,8 +1,21 @@
 """ヤフオク（Yahoo!オークション）。
 
-【这是三个源里唯一没有 JSON 接口的】只能解析 HTML。但没有想象中脆弱：
+【这是三个源里唯一没有 JSON 接口的】只能从网页里抠。
 
-  搜索页  每个商品是一个 `<li class="Product">`，块里带一整套 `data-auction-*` 属性
+  搜索页（2026-10 起的新版）  Next.js 页面，结果在 `__NEXT_DATA__` 那坨 JSON 的
+          props.pageProps.initialState.search.items.listing 里：
+          { items: [{auctionId, title, price, bidCount, endTime, buyNowPrice,
+                     isShoppingItem, isFleamarketItem, seller.userId, imageUrl, …}],
+            totalResultsAvailable }
+          【改版是悄无声息的】新页面上一个 `<li class="Product">` 都没有了，旧解析器
+          照常返回「0 件、已到底」—— 上层就把库里所有在售商品当成失踪，每轮拉详情核实，
+          9 小时白花 1595 个请求，新上架的一件没抓到。所以现在：
+            · 先按已知路径找，找不到再按「形状」找（带 totalResultsAvailable、
+              items 里是 auctionId 的那个容器），对方挪个位置不至于立刻瞎掉；
+            · 两种都找不到才退回下面的旧版块解析；
+            · 页面说有 N 件、我们却一件 ID 都拿不到 → 抛 SourceBroken，绝不当成"没货"。
+
+  搜索页（旧版，作兜底）  每个商品是一个 `<li class="Product">`，块里带一整套 `data-auction-*` 属性
           （id / title / price / startprice / buynowprice / endtime / category / img /
             seller-id / isfreeshipping / isshoppingitem）。这些是语义化属性，
           比按 CSS class 定位稳得多 —— Yahoo 的 class 是构建哈希（形如
@@ -15,13 +28,11 @@
           锚点是界面文案不是构建哈希，相对可靠，但仍然是全项目最可能哪天悄悄坏掉的一处 ——
           所以提取失败一律返回空描述，绝不返回 None（那会被上层当成「商品没了」）。
 
-【isflea=1 的要滤掉】ヤфオク 的搜索结果里混着 Yahoo!フリマ 的商品，块上带
-`data-auction-isflea="1"`。而 フリマ 我们有独立的源在抓 —— 不滤掉就是同一件商品
-进两个源：面板上出现两遍，成交样本也会被记两次把中位数带偏。
-实测当前默认排序（おすすめ順）恰好一件 フリマ 都不返回，所以今天滤不滤结果一样；
-但加上 `&s1=new&o1=d` 立刻就混进来（rtx 5090：47 件 → 91 件，多出来的 44 件
-全是 isflea=1）。也就是说今天的"干净"只靠 Yahoo 默认排序的一个隐含前提撑着，
-对方改个默认值我们就会静默开始重复计数。这一行是那个前提的保险。
+【フリマ 商品要滤掉】ヤフオク 的搜索结果里混着 Yahoo!フリマ 的商品（新版是
+`isFleamarketItem: true`，旧版块上是 `data-auction-isflea="1"`）。而 フリマ 我们有独立的源在抓
+—— 不滤掉就是同一件商品进两个源：面板上出现两遍，成交样本也会被记两次把中位数带偏。
+旧版默认排序恰好一件 フリマ 都不返回；2026-10 的新版默认就混着（rtx 4090：84 件里 35 件），
+当初加这道保险时担心的「对方改个默认值」已经发生了。
 
 【成交价不做】落札相場页（closedsearch）没有 data-auction-* 属性，只有构建哈希 class。
 为多一个市价样本源去扛一个每次发版就坏的解析器不划算 —— ヤフオク 的商品用
@@ -31,7 +42,7 @@ import json
 import re
 from urllib.parse import quote
 
-from sources.base import Source, pref_of
+from sources.base import Source, SourceBroken, pref_of
 
 SEARCH_URL = "https://auctions.yahoo.co.jp/search/search?p={kw}&n={n}&b={b}"
 ITEM_PAGE = "https://page.auctions.yahoo.co.jp/jp/auction/{}"
@@ -55,18 +66,33 @@ class YahooAuction(Source):
 
         begin = int(page_token or 1)
         html = self._call("GET", SEARCH_URL.format(kw=quote(keyword), n=PAGE_SIZE, b=begin)).text
-        blocks = _blocks(html)
-        items = [self._parse(blk) for blk in blocks if not _attr(blk, "isflea")]
-        items = [x for x in items if x["item_id"]]
+        listing = _listing(html)
+        if listing is not None:
+            raw = [x for x in listing.get("items") or [] if isinstance(x, dict)]
+            ids = [x for x in raw if x.get("auctionId")]
+            items = [self._from_json(x) for x in ids if not x.get("isFleamarketItem")]
+            total = _int(listing.get("totalResultsAvailable"))
+        else:
+            raw = _blocks(html)
+            ids = [b for b in raw if _attr(b, "id")]
+            items = [self._parse(b) for b in ids if not _attr(b, "isflea")]
+            # 旧版页面只能从文本里抠「N件」，只拿来显示和下面的改版判断，不拿来终止翻页
+            m = re.search(r"([\d,]+)件", html)
+            total = int(m.group(1).replace(",", "")) if m else len(items)
 
-        # 【翻页终止靠"本页有没有装满"，不靠页面上那个「N件」】
-        # 总数得从 HTML 文本里正则抠，而页面上任何一处「◯◯件」都可能先匹配上；
-        # 拿它算终止条件，一旦抠错就会漏页或死循环。装不满＝到底了，这个判断不会错。
-        # 【按未过滤的块数推进】b= 是"从第几件开始"的偏移量，按过滤后的件数推进
+        # 【页面说有货、我们一件 ID 都拿不到 ＝ 解析坏了，不是没货】
+        # 只在"这一页本该有东西"时判：总数正好是 100 的整数倍时会多翻一页空页，那不算。
+        # 判的是过滤【前】的 ID —— 一页全是 フリマ 商品时过滤后是 0 件，那是正常的。
+        if not ids and total >= begin:
+            raise SourceBroken(f"{self.name} 搜索页显示有 {total} 件，却一件都解析不出来"
+                               "（多半是页面改版了）")
+
+        # 【翻页终止靠"本页有没有装满"，不靠总数】旧版的总数是正则从文本里抠的，
+        # 页面上任何一处「◯◯件」都可能先匹配上；拿它算终止条件，抠错就会漏页或死循环。
+        # 装不满＝到底了，这个判断不会错。
+        # 【按未过滤的条数推进】b= 是"从第几件开始"的偏移量，按过滤后的件数推进
         # 会让下一页从已经看过的位置重新开始，越滤越退回去。
-        nxt = str(begin + len(blocks)) if len(blocks) >= PAGE_SIZE else ""
-        m = re.search(r"([\d,]+)件", html)
-        total = int(m.group(1).replace(",", "")) if m else len(items)
+        nxt = str(begin + len(raw)) if len(raw) >= PAGE_SIZE else ""
         return {"items": items, "next": nxt, "total": total}
 
     def detail(self, item_id: str) -> dict | None:
@@ -118,6 +144,41 @@ class YahooAuction(Source):
             "bid_count": bids if mapped else None,
         }
 
+    def _from_json(self, x: dict) -> dict:
+        """新版搜索页里的一件商品（listing.items 的一个元素）→ 和旧版 _parse 同口径的 snap。
+
+        【一口价不用再换算】旧版块上商家品的 buynowprice 给的是税抜、要 ×110//100；
+        新版的 buyNowPrice 已经是税込（另有 buyNowPriceNoTax）。实测同一件商家品：
+        buyNowPrice=37800、buyNowPriceNoTax=34364，和库里旧解析换算出来的 37800 一致。
+        price 是当前价，新旧版都是税込。
+        【卖家 ID 新旧一致】seller.userId 和旧版 data-auction-auc-seller-id 是同一个值
+        （实测库里 37 件逐一相等），拉黑列表不用迁移。
+        """
+        seller = x.get("seller") or {}
+        end = self.iso(x.get("endTime"))
+        bids = x.get("bidCount")
+        return {
+            "source": self.key,
+            "item_id": str(x.get("auctionId") or "")[:32],
+            "name": x.get("title") or "",
+            "price": _int(x.get("price")),
+            "status": "on_sale",
+            # 新版其实给了 itemCondition（NEW / USED10 / USED20 …），但还没接 ——
+            # 保持旧口径 None：品相白名单对本源不生效，不知道 ≠ 不符合
+            "condition_id": None,
+            "item_type": "shop" if x.get("isShoppingItem") else "user",
+            "category_id": _int((x.get("category") or {}).get("id")) or None,
+            "brand_name": "",
+            "seller_id": str(seller.get("userId") or "")[:32],
+            "thumb_url": (x.get("imageUrl") or "")[:255],
+            "listed_at": None,
+            "updated_at_src": end,
+            "end_time": end,
+            # 0 是「拍卖但还没人出价」，None 是「读不到」—— 两者不能混
+            "bid_count": _int(bids) if bids is not None else None,
+            "buy_now_price": _int(x.get("buyNowPrice")) or None,
+        }
+
     def _parse(self, blk: str) -> dict:
         buynow = _int(_attr(blk, "buynowprice"))
         item_type = "shop" if _attr(blk, "isshoppingitem") else "user"
@@ -150,6 +211,56 @@ class YahooAuction(Source):
             "bid_count": _bids(blk),
             "buy_now_price": buynow or None,
         }
+
+
+def _listing(html: str) -> dict | None:
+    """新版搜索页的结果容器 {items, totalResultsAvailable}；不是新版页面就返回 None。
+
+    先走已知路径；找不到再按形状找 —— 对方把它挪个位置、换个外层键名，
+    只要容器本身还是这个形状就照样能用，不至于一改版就全瞎。
+    【按形状找时优先认 "listing" 这个键】同一页里还有 featuredListing、newArrival
+    这类推荐模块，形状一样，但里面的商品不是这次搜索的结果。
+    """
+    m = _NEXT_DATA.search(html)
+    if not m:
+        return None
+    try:
+        blob = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    props = blob.get("props") or {}
+    for root in (props.get("pageProps") or {}, props):
+        lst = ((((root.get("initialState") or {}).get("search") or {})
+                .get("items") or {}).get("listing"))
+        if _is_result_box(lst):
+            return lst
+    found = list(_result_boxes(blob))
+    if not found:
+        return None
+    named = [box for key, box in found if key == "listing"]
+    if named:
+        return named[0]
+    return max((box for _, box in found), key=lambda b: _int(b.get("totalResultsAvailable")))
+
+
+def _is_result_box(o) -> bool:
+    if not isinstance(o, dict) or "totalResultsAvailable" not in o:
+        return False
+    items = o.get("items")
+    return isinstance(items, list) and (
+        not items or (isinstance(items[0], dict) and "auctionId" in items[0]))
+
+
+def _result_boxes(o, key: str = ""):
+    """递归找所有「搜索结果容器」形状的 dict，连同它在父级里的键名一起产出。"""
+    if isinstance(o, dict):
+        if _is_result_box(o):
+            yield key, o
+        for k, v in o.items():
+            yield from _result_boxes(v, k)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _result_boxes(v, key)
 
 
 def _blocks(html: str) -> list[str]:

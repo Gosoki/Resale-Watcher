@@ -77,3 +77,21 @@ def test_注释里的转义单引号能正确比对():
     d = "ccc INT NULL COMMENT '这是 '' 引号'"
     assert plan_schema_changes(want={("t", "ccc"): d},
                                have={("t", "ccc"): col("这是 ' 引号", "int")}) == ([], [])
+
+
+def test_写默认设置只发一条INSERT_外加清孤儿的一条DELETE(monkeypatch):
+    """启动路径上的来回越少越好：2026-10-16 NAS 到数据库的网络会在一条连接连发十几条之后
+    把连接掐死，服务卡在逐项 INSERT 的第 10 条上、反复重启 270 多次。根因在网络，
+    但这一步本来就没必要一项一条。语义不能变：v 只在首次插入时写，note 每次都覆盖。"""
+    import config
+    from db import store
+    calls = []
+    monkeypatch.setattr(store, "execute", lambda sql, args=(): calls.append((sql, list(args))))
+    store.seed_settings()
+    inserts = [c for c in calls if c[0].startswith("INSERT")]
+    assert len(inserts) == 1 and len(calls) == 2, [c[0][:40] for c in calls]
+    sql, args = inserts[0]
+    assert sql.count("(%s, %s, %s, %s)") == len(config.SETTINGS_SPEC)
+    assert sql.rstrip().endswith("ON DUPLICATE KEY UPDATE note = VALUES(note)"), "v 不能被覆盖"
+    assert args[0::4] == list(config.SETTINGS_SPEC), "每行的 k 按 SPEC 顺序"
+    assert calls[1][0].startswith("DELETE FROM app_setting WHERE k NOT IN")

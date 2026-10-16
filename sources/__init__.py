@@ -3,7 +3,7 @@
 加新源＝在 sources/ 下写一个 Source 子类，然后在这里登记一行。
 规则表的 sources 列填的就是这里的 key（留空＝全部源）。
 """
-from sources.base import DailyLimitReached, RateLimited, Source  # noqa: F401
+from sources.base import DailyLimitReached, RateLimited, Source, SourceBroken  # noqa: F401
 from sources.mercari import Mercari
 from sources.yahoo_auction import YahooAuction
 from sources.yahoo_flea import YahooFlea

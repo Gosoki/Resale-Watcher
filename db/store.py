@@ -41,6 +41,7 @@ SCHEMA_PATH = config.BASE_DIR / "db" / "schema.sql"
 
 IDLE_PING_SEC = 60                      # 闲置超过这么久，用之前先 ping
 _CONN_ERRORS = (pymysql.err.OperationalError, pymysql.err.InterfaceError)
+CONN_ERRORS = _CONN_ERRORS              # 给 main.py 的启动重试用：只有连接类错误才值得重试
 _local = threading.local()
 
 
@@ -135,9 +136,17 @@ def init_schema() -> None:
     # 所以按行剥注释 + 朴素切分是安全的。
     body = "\n".join(ln for ln in sql.splitlines() if not ln.strip().startswith("--"))
     stmts = [s.strip() for s in body.split(";") if s.strip()]
+    want = {m.group(1) for s in stmts if (m := re.match(r"CREATE TABLE IF NOT EXISTS (\w+)", s))}
     with conn(db=False) as c, c.cursor() as cur:
-        for s in stmts:
-            cur.execute(s)
+        # 【表都在就不重跑建表】这一步跑在启动路径上。表早就建好时，十几条
+        # CREATE ... IF NOT EXISTS 全是空跑，却是十几个来回 —— 2026-10-16 NAS 到数据库的
+        # 网络（路由器硬件转发的 bug）会在一条连接连发十几条之后把它掐死，服务就卡在启动、
+        # 反复重启 270 多次。先查一次有哪些表，缺了才建；缺的列交给下面的 sync_schema。
+        cur.execute("SELECT TABLE_NAME FROM information_schema.tables WHERE table_schema = %s",
+                    (config.DB["database"],))
+        if want - {r["TABLE_NAME"] for r in cur.fetchall()}:
+            for s in stmts:
+                cur.execute(s)
     sync_schema()
     seed_settings()
 

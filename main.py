@@ -10,6 +10,7 @@
 import logging
 import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 
 from nicegui import app, ui
@@ -46,11 +47,35 @@ def setup_logging(console: bool | None = None) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+STARTUP_RETRY_SEC = (5, 15, 30, 60)
+
+
+def init_db(log, sleep=time.sleep) -> None:
+    """建表 / 同步表结构 / 写默认设置。连接在启动时卡住或连不上，就换新连接重试几次。
+
+    【为什么不直接退出交给 systemd】原先是一出错进程就退、systemd 10 秒后再拉起来。
+    2026-10-16 NAS 到数据库的网络（路由器硬件转发的 bug）会把连发十几条查询的连接掐死，
+    服务就这么转了 270 多圈，日志里全是同一段 traceback，看不出它在等什么。
+    数据库那台机器重启的那几分钟也是一样。这里在进程内重试：每次都是新连接
+    （出错的连接已经在 store.conn() 里丢掉了），日志写明第几次、等多久。
+    【只重试连接类错误】SQL 写错、表结构冲突这类重试也没用的，照常直接抛出。
+    """
+    for i, wait in enumerate((*STARTUP_RETRY_SEC, None), 1):
+        try:
+            store.init_schema()
+            return
+        except store.CONN_ERRORS as e:
+            if wait is None:
+                raise
+            log.warning("启动时连数据库失败（第 %d 次）：%s —— %d 秒后换新连接重试", i, e, wait)
+            sleep(wait)
+
+
 def main() -> None:
     setup_logging()
     log = logging.getLogger("main")
 
-    store.init_schema()
+    init_db(log)
     if not store.get_rules():
         log.warning("一条规则都没有 —— 跑 `./run.sh seed` 写入两条起步规则，或到面板上新建。")
 

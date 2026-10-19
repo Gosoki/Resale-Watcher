@@ -108,3 +108,57 @@ def test_改了关键词_换了源_重新启用时_清掉旧的平台总数(monk
         store.update_rule(7, {k: 1 for k in changed})
         reset = [c for c in calls if c.startswith("UPDATE rule_source_state SET last_total = 0")]
         assert bool(reset) is expect_reset, (changed, calls)
+
+
+class _FakeCur:
+    def __init__(self, tables, log):
+        self.tables, self.log = tables, log
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, args=None):
+        self.log.append(sql.split("(")[0].strip()[:40])
+
+    def fetchall(self):
+        return [{"TABLE_NAME": t} for t in self.tables]
+
+
+def _run_init(monkeypatch, tables):
+    import contextlib
+    from db import store
+    log = []
+
+    @contextlib.contextmanager
+    def fake_conn(db=True):
+        yield type("C", (), {"cursor": lambda self: _FakeCur(tables, log)})()
+    monkeypatch.setattr(store, "conn", fake_conn)
+    monkeypatch.setattr(store, "sync_schema", lambda: log.append("sync_schema"))
+    monkeypatch.setattr(store, "seed_settings", lambda: log.append("seed_settings"))
+    store.init_schema()
+    return log
+
+
+def test_表都在时启动只查一次表_不重跑十几条建表语句(monkeypatch):
+    """启动路径上的来回越少越好：2026-10-16 NAS 到数据库的网络会把连发十几条的连接掐死。"""
+    import re
+    from db import store
+    sql = store.SCHEMA_PATH.read_text(encoding="utf-8")
+    tables = re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", sql)
+    log = _run_init(monkeypatch, tables)
+    assert log[0].startswith("SELECT TABLE_NAME"), log
+    assert not any(x.startswith("CREATE") for x in log), log
+    assert log[-2:] == ["sync_schema", "seed_settings"]
+
+
+def test_缺一张表时照常把建表语句全跑一遍(monkeypatch):
+    import re
+    from db import store
+    sql = store.SCHEMA_PATH.read_text(encoding="utf-8")
+    tables = re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", sql)
+    log = _run_init(monkeypatch, tables[:-1])
+    creates = [x for x in log if x.startswith("CREATE TABLE")]
+    assert len(creates) == len(tables) and any(x.startswith("CREATE DATABASE") for x in log)

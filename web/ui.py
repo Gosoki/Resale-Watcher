@@ -295,6 +295,14 @@ DARK_CSS = (
     "border:1px solid var(--rw-accent)}"
     ".q-field__native,.q-field__input{color:var(--rw-text)}"
     ".q-field__label,.q-field__prefix,.q-field__suffix{color:var(--rw-muted)}"
+    # 【筛选标签】没选中时和 .badge-label 同一个样子（描边、灰字）：它也是在说"这是哪一类"；
+    # 选中后用暗档强调色填满 —— 和激活的导航项、主按钮同一个填充色，一眼看出哪几个在生效。
+    # chip 不带 color（见 _deal_filter_bar），所以这里不用和 Quasar 的 .bg-primary 拼 important。
+    ".rw-filter .q-chip{background:transparent;color:var(--rw-muted);"
+    "border:1px solid var(--rw-line);margin:0}"
+    ".rw-filter .q-chip:hover{border-color:var(--rw-accent-dim)}"
+    ".rw-filter .q-chip--selected{background:var(--rw-accent-dim);color:#fff;"
+    "border-color:var(--rw-accent-dim)}"
     # 徽标取参考端 .pill 的形（L278：全圆角、12px），不是贴图上的 .badge（6px 圆角）——
     # 我们的徽标是跟在文字行里的，不压在缩略图上
     # 【不要在这里定 font-weight】参考端的 .pill(L278) 本来就不定字重；而且这段是
@@ -906,6 +914,83 @@ def toolbar(desc: str):
 
 # ------------------------------------------------------------------ 命中页
 
+# 【捡漏汇总的筛选：选中了哪些规则、哪些平台】放在模块级，理由同下面的 _OPEN：
+# 剔除、拉黑、存捡漏价都会让 hits_view 整页重建，筛选要跟着留下来，不然点一下就全复位。
+_DEAL_FILTER: dict[str, set] = {"rule": set(), "source": set()}
+
+
+def deal_visible(rule_id: int, source: str, sel: dict[str, set]) -> bool:
+    """筛选规则：同一组里是「或」（选两条规则＝两条的都看），两组之间是「且」，
+    一组一个都没选＝这一组不筛。"""
+    return ((not sel["rule"] or rule_id in sel["rule"])
+            and (not sel["source"] or source in sel["source"]))
+
+
+def _deal_filter_bar(rows: list[dict], by_id: dict, boxes: list) -> None:
+    """捡漏汇总顶上的筛选条：按规则、按平台各一组标签，可多选。
+
+    【只切显示，不重建行】点一下只给每一行的外框 set_visibility，不重查库、不重画 ——
+    重画的话 twins 里会留下指向已删元素的重画函数（同一件商品在规则组里还有一份，
+    两边的 ★ ⚑ 是靠 twins 联动的）。
+    【只有一个选项的组不出现】只有一个平台有捡漏时，那个「平台」组点了等于没点。
+    """
+    counts: dict[str, dict] = {"rule": {}, "source": {}}
+    for r in rows:
+        counts["rule"][r["rule_id"]] = counts["rule"].get(r["rule_id"], 0) + 1
+        counts["source"][r["source"]] = counts["source"].get(r["source"], 0) + 1
+    # 规则按规则页的顺序、平台按数据源注册顺序排，不按件数 —— 件数一变标签就换位置，
+    # 手要去找它
+    order = {"rule": [rid for rid in by_id if rid in counts["rule"]],
+             "source": [k for k in sources.all_sources() if k in counts["source"]]}
+    for k in _DEAL_FILTER:
+        # 选过、但现在已经没有捡漏的那一项：标签不显示了，筛选也不该还暗中生效
+        _DEAL_FILTER[k] &= set(order[k])
+    groups = [k for k in ("rule", "source") if len(order[k]) > 1]
+    if not groups:
+        for k in _DEAL_FILTER:
+            _DEAL_FILTER[k].clear()
+        return
+
+    def apply() -> None:
+        shown = 0
+        for box, rid, src in boxes:
+            on = deal_visible(rid, src, _DEAL_FILTER)
+            box.set_visibility(on)
+            shown += on
+        active = any(_DEAL_FILTER.values())
+        status.set_text(f"显示 {shown} / {len(boxes)} 件" if active else "")
+        clear.set_visibility(active)
+
+    def toggle(kind: str, val, on: bool) -> None:
+        (_DEAL_FILTER[kind].add if on else _DEAL_FILTER[kind].discard)(val)
+        apply()
+
+    def reset() -> None:
+        for k in _DEAL_FILTER:
+            _DEAL_FILTER[k].clear()
+        for chip in chips:
+            chip.selected = False
+        apply()
+
+    chips = []
+    names = {"rule": lambda rid: by_id[rid]["name"], "source": source_name}
+    # 【每组单独一块】组名和它的标签放在同一个块里一起换行。原先整条一个 flex-wrap，
+    # 手机上「平台」两个字会被挤到上一行行尾、它的标签却在下一行，看着像跟错了组。
+    with ui.row().classes("rw-filter items-center gap-x-5 gap-y-2 flex-wrap w-full mb-2"):
+        for kind in groups:
+            with ui.row().classes("items-center gap-2 flex-wrap"):
+                ui.label("规则" if kind == "rule" else "平台").classes("rw-desc")
+                for val in order[kind]:
+                    chips.append(ui.chip(
+                        f"{names[kind](val)} {counts[kind][val]}", color=None, selectable=True,
+                        selected=val in _DEAL_FILTER[kind],
+                        on_selection_change=lambda e, kind=kind, val=val: toggle(kind, val, e.value)))
+        with ui.row().classes("items-center gap-2"):
+            status = ui.label("").classes("rw-desc")
+            clear = ui.button("清除筛选", on_click=reset).props(BTN_QUIET)
+    apply()
+
+
 def _deals_summary(rules: list[dict], live: list[dict], cold: dict, marks: set, hidden: set,
                    prevs: dict, twins: dict,
                    fresh_hours: int, warn_h: float, hide_h: float) -> None:
@@ -950,11 +1035,19 @@ def _deals_summary(rules: list[dict], live: list[dict], cold: dict, marks: set, 
                         + "、".join(blind) + " —— 去下面的规则组里填个手动捡漏价")
             ui.label(msg).classes("text-gray-400 text-sm")
             return
+        boxes: list = []                     # (外框, rule_id, source)，给筛选条切显示用
+        filter_host = ui.element("div").classes("w-full")
         with ui.element("div").classes("grid grid-cols-1 xl:grid-cols-2 gap-x-6 w-full"):
             for r in rows:
                 rule = by_id[r["rule_id"]]
-                _hit_row(r, rule, marks, prevs, twins, fresh_hours, cold[rule["id"]],
-                         warn_h, hide_h, show_rule=True)
+                # 每行包一层外框：筛选只切这个外框的显示，行本身不动（理由见 _deal_filter_bar）
+                with ui.element("div").classes("min-w-0") as box:
+                    _hit_row(r, rule, marks, prevs, twins, fresh_hours, cold[rule["id"]],
+                             warn_h, hide_h, show_rule=True)
+                boxes.append((box, r["rule_id"], r["source"]))
+        # 筛选条要排在列表上面，但得等行都建完、拿到外框之后才能建 —— 所以先占个位
+        with filter_host:
+            _deal_filter_bar(rows, by_id, boxes)
 
 
 

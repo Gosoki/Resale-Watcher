@@ -88,6 +88,9 @@ class FakeSource:
     def can_detail(self, iid):
         return True
 
+    def foreign(self, iid):
+        return False
+
     def detail(self, item_id):
         self.detail_calls.append(item_id)
         return (self.detail_result(item_id) if callable(self.detail_result)
@@ -195,6 +198,159 @@ def test_核实预算用完后轮转到没核实过的那批(monkeypatch):
     poller.scan_on_sale(src, rule)
     second = src.detail_calls[2:]
     assert set(first) & set(second) == set(), "第二轮该轮到别的商品，不能卡在同一批"
+
+
+def test_超预算成交的也进市价样本_被排除词拦下的不进(monkeypatch):
+    """ヤフオク 没有成交搜索，跟到成交是它唯一的样本来源。只收 matched=1 的话，
+    拍到预算以上的一件都进不来、拍得便宜的全进来了 —— 中位数被系统性往下拽。"""
+    fs = FakeStore([_item("over", matched=0), _item("junk", matched=0), _item("ok")])
+    fs.items["over"]["reject_reason"] = "price_over"
+    fs.items["junk"]["reject_reason"] = "excluded_title"
+    samples = []
+    fs.add_sold_sample = lambda rid, source, iid, price, at, kind: samples.append((iid, kind))
+    src = FakeSource([], {"status": "sold_out", "price": 630000, "name": "", "description": None})
+    monkeypatch.setattr(poller, "store", fs)
+    poller.scan_on_sale(src, RULE)
+    assert sorted(samples) == [("ok", "tracked"), ("over", "tracked")]
+
+
+def test_拉不到详情的商品_消失超过撤下时间就记成已下架(monkeypatch):
+    """メルカリShops 核实不了，原先从搜索里消失之后就永远标着在售（实测 31 件、最老五周）。
+    不花请求、不占预算；没到撤下时间的、交易中的都不动。"""
+    rule = dict(RULE, stale_hide_hours=24)
+    fs = FakeStore([_item("old", seen_ago_min=25 * 60), _item("new", seen_ago_min=60),
+                    _item("trd", seen_ago_min=25 * 60, status="trading")])
+    src = FakeSource([], {"status": "on_sale", "price": 1, "name": "", "description": None})
+    src.can_detail = lambda iid: False
+    monkeypatch.setattr(poller, "store", fs)
+    poller.scan_on_sale(src, rule)
+    assert src.detail_calls == []
+    assert fs.status_calls == [("old", "gone")]
+
+
+def test_拉不到详情的商品_撤下设成0就不收尾(monkeypatch):
+    fs = FakeStore([_item("old", seen_ago_min=25 * 60)])
+    src = FakeSource([], None)
+    src.can_detail = lambda iid: False
+    monkeypatch.setattr(poller, "store", fs)
+    poller.scan_on_sale(src, dict(RULE, stale_hide_hours=0))
+    assert fs.status_calls == []
+
+
+# ---------------------------------------------------------------- 单件坏了不拖垮整个源
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _fresh_skip():
+    """「出过单件错误、宽限期内别再试」记在模块级字典里，用例之间要清掉。"""
+    poller._detail_skip.clear()
+    yield
+    poller._detail_skip.clear()
+
+
+def _limited(status=None, backed_off=False):
+    e = poller.sources.RateLimited(f"HTTP {status}" if status else "网络错误")
+    if status is not None:
+        e.status = status
+    if backed_off:
+        e.backed_off = True
+    return e
+
+
+def test_一件详情出错只跳过它_后面的照常核实(monkeypatch):
+    """原先一件抛错整轮中断，而它下一轮还排第一 —— 后面的商品永远轮不到核实（09-17 m32209355337）。"""
+    def detail(iid):
+        if iid == "bad":
+            raise _limited(400)
+        return {"status": "sold_out", "price": 500000, "name": "", "description": None}
+
+    fs, src = _run(monkeypatch, items=[_item("bad", seen_ago_min=90), _item("m2", seen_ago_min=60)],
+                   pages=[], detail_result=detail)
+    assert fs.items["m2"]["status"] == "sold_out"
+    assert fs.items["bad"]["status"] == "on_sale"
+    assert fs.items["bad"]["last_seen_at"] < config.now() - timedelta(minutes=80), \
+        "不能 touch：那等于说刚见过它，面板上它就永远不会失联"
+
+
+def test_出过单件错误的_宽限期内不再试(monkeypatch):
+    """不 touch 又不跳过的话，它每轮排在最前面、每轮白花一个请求。"""
+    def detail(iid):
+        raise _limited(400)
+
+    fs, src = _run(monkeypatch, items=[_item("bad")], pages=[], detail_result=detail)
+    poller.scan_on_sale(src, RULE)
+    assert src.detail_calls == ["bad"]
+
+
+def test_试了至少三件全失败_照常抛出去让告警看得见(monkeypatch):
+    def detail(iid):
+        raise _limited(400)
+
+    fs = FakeStore([_item("a"), _item("b"), _item("c")])
+    monkeypatch.setattr(poller, "store", fs)
+    with pytest.raises(poller.sources.RateLimited):
+        poller.scan_on_sale(FakeSource([], detail), RULE)
+
+
+def test_两件长期坏的碰巧同一轮_不让整个源这一轮作废(monkeypatch):
+    def detail(iid):
+        raise _limited(400)
+
+    fs = FakeStore([_item("a"), _item("b")])
+    monkeypatch.setattr(poller, "store", fs)
+    poller.scan_on_sale(FakeSource([], detail), RULE)
+
+
+@pytest.mark.parametrize("err", [
+    _limited(),                         # 网络错误：没有状态码
+    poller.sources.RateLimited("メルカリ HTTP 403（详情）"),   # メルカリ 详情的非删除 403
+    _limited(503), _limited(500),
+    _limited(429, backed_off=True),
+], ids=["网络", "メルカリ403", "503", "500", "429退避"])
+def test_整个源的问题_第一件就结束本轮_不去撞下一件(monkeypatch, err):
+    """被限流时换下一件只会再撞一次墙。原先只认 backed_off，一轮能连撞 10 次。"""
+    calls = []
+
+    def detail(iid):
+        calls.append(iid)
+        raise err
+
+    fs = FakeStore([_item("a", seen_ago_min=90), _item("b")])
+    monkeypatch.setattr(poller, "store", fs)
+    with pytest.raises(poller.sources.RateLimited):
+        poller.scan_on_sale(FakeSource([], detail), RULE)
+    assert calls == ["a"]
+
+
+def test_不归本源的旧行_对账见到就收尾_不发请求(monkeypatch):
+    """Yahoo!フリマ 搜索里混进来的 ヤフオク 商品：它在 ヤフオク 下有自己那一行。"""
+    fs = FakeStore([_item("c1244386335", seen_ago_min=30), _item("m1", seen_ago_min=30)])
+    src = FakeSource([], {"status": "on_sale", "price": 1, "name": "", "description": None})
+    src.foreign = lambda iid: iid.startswith("c")
+    monkeypatch.setattr(poller, "store", fs)
+    poller.scan_on_sale(src, RULE)
+    assert fs.status_calls == [("c1244386335", "gone")]
+    assert src.detail_calls == ["m1"]
+
+
+def test_读描述_拉不到详情的不发请求直接记没读到(monkeypatch):
+    saved = []
+
+    class Store:
+        def pending_detail(self, rid, source, limit):
+            return [{"item_id": "2JShop", "name": "x"}, {"item_id": "m1", "name": "y"}]
+
+        def save_detail(self, source, iid, rid, desc, warn, ship=""):
+            saved.append((iid, warn))
+
+    src = FakeSource([], {"status": "on_sale", "price": 1, "name": "", "description": "普通描述"})
+    src.can_detail = lambda iid: iid.startswith("m")
+    monkeypatch.setattr(poller, "store", Store())
+    poller.fetch_details(src, dict(RULE, check_desc=1, warn_desc="ジャンク"))
+    assert src.detail_calls == ["m1"]
+    assert saved == [("2JShop", poller.DESC_UNREAD), ("m1", "")]
 
 
 def test_没扫全时整个跳过售出对账(monkeypatch):

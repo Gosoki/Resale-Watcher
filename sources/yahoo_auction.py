@@ -23,11 +23,16 @@
           `gv-Heading--kAIOU7uq68gIXh6WMpSy`），前端发一版就变，绝不能依赖。
           出价数例外，只能从 `Product__bid` 取（这个 class 在搜索页是稳定的）。
 
-  详情页  状态/当前价/出价数/结束时间在 `__NEXT_DATA__` 的
-          props.pageProps.initialState.item.detail.item 里；
-          描述【不在】那坨 JSON 里，得从 HTML 里以「商品説明」这个标题文字为锚点切。
-          锚点是界面文案不是构建哈希，相对可靠，但仍然是全项目最可能哪天悄悄坏掉的一处 ——
-          所以提取失败一律返回空描述，绝不返回 None（那会被上层当成「商品没了」）。
+  详情页  状态/当前价/出价数/结束时间/描述全在 `__NEXT_DATA__` 的
+          props.pageProps.initialState.item.detail.item 里，描述原文是 descriptionHtml。
+          【别再从 HTML 里按「商品説明」切】那样切到的是页面上的【预览】：2026-10 实测
+          yahoo_auction 读过描述的 59 件里 30 件是 220 字上下、以「...」结尾的截断，
+          16 件ストア出品切到的是「…商品説明を確認するか、ストアに確認してください」
+          后面那段页面样板 —— 一件 Dospara 整机就因为样板里的「ジャンク品返品不可」
+          被打上了「描述含：ジャンク」推到手机上。这些行面板上全显示「✓ 描述已查」。
+          旧版页面（没有 __NEXT_DATA__）才退回按锚点切。
+          读不出描述时 description 返回 None，但整个结果仍是 dict —— 返回 None 会被
+          上层当成「商品没了」。
 
 【フリマ 商品要滤掉】ヤフオク 的搜索结果里混着 Yahoo!フリマ 的商品（新版是
 `isFleamarketItem: true`，旧版块上是 `data-auction-isflea="1"`）。而 フリマ 我们有独立的源在抓
@@ -41,6 +46,7 @@
 """
 import json
 import re
+from html import unescape
 from urllib.parse import quote
 
 from sources.base import Source, SourceBroken, pref_of
@@ -129,7 +135,10 @@ class YahooAuction(Source):
             mapped = ""
 
         return {
-            "description": _extract_desc(html),
+            "description": _item_desc(item, html, has_next_data=m is not None),
+            # 【截止时间也带回去】自動延長会把截止往后推，追踪刷新不写回的话，
+            # 一件正在延长的拍卖会在面板上显示「已结束」，要等下一轮关键词扫描才改过来
+            "end_time": self.iso(item.get("endTime")),
             # 【必须取 taxinPrice，不是 price】详情 JSON 里两个字段并存：
             #   price      = 318182  税抜
             #   taxinPrice = 350000  税込（taxRate=10）
@@ -301,6 +310,27 @@ def _bids(blk: str) -> int | None:
         return None
     m = _BID.search(blk[i:i + 400])
     return _int(m.group(1)) if m else None
+
+
+def _item_desc(item: dict, page: str, has_next_data: bool) -> str | None:
+    """详情的描述全文。新版页面取 JSON 里的 descriptionHtml；旧版页面才按锚点切 HTML。
+
+    【新版页面取不到就返回 None，不退回切 HTML】切出来的是预览或页面样板（见模块
+    说明），拿它当描述就是把「没读到」伪装成「读到了、很干净」。None 会被记成「描述未读到」。
+    【按有没有 __NEXT_DATA__ 分，不按 item 是不是空】有 __NEXT_DATA__ 但路径变了、
+    JSON 坏了，item 也是空的 —— 那是新版页面改了结构，不是旧版页面。
+    """
+    if not has_next_data:
+        return _extract_desc(page)
+    h = item.get("descriptionHtml")
+    return _html_text(h) if isinstance(h, str) else None
+
+
+def _html_text(h: str) -> str:
+    h = re.sub(r"<script.*?</script>", " ", h, flags=re.S | re.I)
+    h = re.sub(r"<style.*?</style>", " ", h, flags=re.S | re.I)
+    h = unescape(re.sub(r"<[^>]+>", " ", h))
+    return re.sub(r"\s+", " ", h).strip()[:20000]
 
 
 def _extract_desc(html: str) -> str | None:

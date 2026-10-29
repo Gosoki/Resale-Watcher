@@ -71,6 +71,15 @@ def _seller(raw: dict) -> str:
     return str((raw.get("shop") or {}).get("id") or "").strip()[:32]
 
 
+
+def _is_c2c(item_id: str) -> bool:
+    """个人出品的商品 ID：m + 数字（m62064211216）。メルカリShops 的是 22 位 base62。
+
+    【不能只看首字母是不是 m】Shops 的 ID 首字母随机（库里见过 2/A/d/E/i/J/o/t/v），
+    哪天来一个 m 开头的，就会被当成个人商品去打 /items/get —— 注定拿不到，还可能被标成下架。
+    """
+    return item_id[:1] == "m" and item_id[1:].isdigit()
+
 class Mercari(Source):
     key = "mercari"
     name = "メルカリ"
@@ -97,7 +106,7 @@ class Mercari(Source):
 
     def item_url(self, item_id: str) -> str:
         # Shops 的商品 ID 不是 mXXXX 格式，商品页路径也不一样
-        return (f"https://jp.mercari.com/item/{item_id}" if item_id.startswith("m")
+        return (f"https://jp.mercari.com/item/{item_id}" if _is_c2c(item_id)
                 else f"https://jp.mercari.com/shops/product/{item_id}")
 
     def search(self, keyword: str, *, sold: bool = False, page_token: str = "") -> dict:
@@ -138,7 +147,7 @@ class Mercari(Source):
 
     def can_detail(self, item_id: str) -> bool:
         # メルカリShops 的商品 ID 不是 m 开头，/items/get 拿不到它们（见下面 detail 的说明）
-        return item_id.startswith("m")
+        return _is_c2c(item_id)
 
     def detail(self, item_id: str) -> dict | None:
         # メルカリShops 的商品 ID 不是 mXXXX 格式，/items/get 拿不到它们 ——
@@ -147,7 +156,7 @@ class Mercari(Source):
         # 已下架：开了 allow_shops 的规则，Shops 商品会命中一轮就从命中页消失。
         # 返回 description=None 表示「我们读不到」，status="" 表示「状态未知」——
         # 上层会保持原状，和详情页解析失败走同一条路。
-        if not item_id.startswith("m"):
+        if not _is_c2c(item_id):
             return {"description": None, "price": 0, "name": "", "status": "", "ship_from": "", "bid_count": None}
         # include_auction=true 同理：不带的话返回里根本没有 auction_info 这一节。
         # 这个参数是从 メルカリ 网页版自己发的请求里抠出来的（抓了一次网络日志）。

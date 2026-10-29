@@ -22,7 +22,7 @@ import config
 import sources
 from core import notify as push          # 【必须改名】本文件里的 notify() 是弹提示的
 from core import poller
-from core.matcher import explain
+from core.matcher import explain, too_cheap
 from core.normalize import id_tokens
 from db import store
 
@@ -75,11 +75,13 @@ DARK_CSS = (
     # 那枚徽标会独自留在 Quasar 原色 #607d8b 的白字上，还漏掉下面那条深字规则。
     ".q-badge.bg-blue-grey{background:#60a5fa!important}"                    # 新发现
     ".q-badge.bg-red{background:#f87171!important}"                          # 已降 ¥xxx
+    # 【不用橙】「新上架」已经是橙，两个并排分不开，而语义正好相反（一个说快看，一个说先别信）
+    ".q-badge.bg-pink{background:#f472b6!important}"                         # 低得反常
     # 【这半条和上面是同一个决定】Quasar 的 .q-badge{color:#fff} 是写死的白字，
     # 而上面这批背景亮度在 70%~83% —— amber 上白字只有 1.7:1、green 2.2:1，全线看不清。
     # 亮底一律改配深色前景。
     ".q-badge.bg-green,.q-badge.bg-orange,.q-badge.bg-amber,.q-badge.bg-grey,"
-    ".q-badge.bg-blue-grey,.q-badge.bg-red,.q-badge.bg-purple{color:#18181b!important}"
+    ".q-badge.bg-blue-grey,.q-badge.bg-red,.q-badge.bg-purple,.q-badge.bg-pink{color:#18181b!important}"
     # 【来源是标签，不是信号】メルカリ/ヤフオク 这类徽标回答的是"它在哪"，
     # 而捡漏/已降/新上架回答的是"要不要点进去"。两者同样是实心色块的话，
     # 一行里五六个色块抢注意力，真正的信号反而沉下去了。
@@ -485,7 +487,13 @@ def deal_line(rule: dict, median) -> str:
     """这条规则【当前生效】的捡漏线，一句话。算不出就空串。
     手动价一填就盖过百分比 —— 和 core/matcher.is_deal 同一个口径，面板各处都用这一个函数。"""
     if rule.get("deal_price"):
-        return f"手动捡漏价 {yen(rule['deal_price'])}"
+        line = f"手动捡漏价 {yen(rule['deal_price'])}"
+        # 【手动价高过市价中位要说出来】那样一大半在售都会算「捡漏」、都会推到手机上。
+        # 2026-10 四条规则的手动价全在中位数上下，推出去的 87 条里 51 条按现价算不低于市价中位 ——
+        # 页面上只写「手动捡漏价 ¥X」的话看不出来。向上取整：高一点点也写 1%，不写成 0%。
+        if median and rule["deal_price"] > median:
+            line += f"（比市价中位还高 {-(-(rule['deal_price'] - median) * 100 // median)}%）"
+        return line
     if median and rule.get("deal_ratio"):
         return f"低于 {yen(median * rule['deal_ratio'] // 100)} 算捡漏"
     return ""
@@ -761,6 +769,10 @@ def split_stale(rows: list[dict], hide_h: float) -> tuple[list[dict], list[dict]
     切多了会静悄悄少几件（你以为这个价位真的没货），切少了等于没做
     （旧价格照常冒充在售）。而这两种都不会报错、不会进日志。
     """
+    # 【0＝不撤下】设置说明这么写的，对账那边也按这个收尾（poller.reconcile_sold）。
+    # 原先 0 会让每一件都「超过 0h 没见到」，命中页整页清空、捡漏汇总说「暂时没有」。
+    if hide_h <= 0:
+        return list(rows), []
     keep = [r for r in rows if stale_hours(r) <= hide_h]
     dark = [r for r in rows if stale_hours(r) > hide_h]
     return keep, dark
@@ -1321,14 +1333,17 @@ def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, twins: dict,
             # 没有任何徽标时整行不渲染，不留空档。
             dropped = r["price"] < r["first_price"]
             stale = stale_hours(r)
-            if (r["is_deal"] or fresh or r["desc_warn"]
+            lost = warn_h > 0 and stale > warn_h        # 0＝不标失联，否则每一件都是「失联 0h」
+            # 设置走 10 秒缓存，hits_view 开头刚读过，这里不会多查库
+            odd = too_cheap(r, store.get_settings().get("suspect_low_pct") or 0)
+            if (r["is_deal"] or odd or fresh or r["desc_warn"]
                     or r["ship_from"] == TOKYO or dropped
-                    or stale > warn_h):
+                    or lost):
                 with ui.row().classes("items-center gap-2 flex-wrap mb-1"):
                     # 【失联排在最前面】它一旦成立，下面那些
                     # 「捡漏」「已降」全都是基于旧价算的，
                     # 先看到它才知道后面几个徽标都不能全信。
-                    if stale > warn_h:
+                    if lost:
                         # 【用灰不用橙】橙色是「新上架」，两个并排时
                         # 分不开，而它们语义正好相反：一个说"快看"，
                         # 一个说"别信"。失联和「描述未读到」是同一类
@@ -1340,6 +1355,13 @@ def _hit_row(r: dict, rule: dict, marks: set, prevs: dict, twins: dict,
                             "判不出它是卖掉了还是还挂着 —— "
                             f"下面的价格是 {stale:.0f} 小时前的，别当真。"
                             f"超过 {hide_h}h 会直接从这一页撤下")
+                    if odd:
+                        # 【排在捡漏前面】和失联一样是「后面那个绿标先别全信」的意思
+                        ui.badge("低得反常", color="pink").tooltip(
+                            f"一口价只有市价的 {r['deal_pct']}%。2026-10 库里低于市价 75% 的"
+                            "一口价「捡漏」一件正常单卡都没有：外接显卡坞、标题里堆关键词的"
+                            "别的型号、中国特供版、動作未確認品、游戏本。点进去先确认是不是你要的东西。"
+                            "只是提示，不影响命中和推送；阈值在设置页「推送」里")
                     if r["is_deal"]:
                         # 【手动价判出来的要说清】它的「市价的 114%」就在右边，
                         # 不解释的话"捡漏"和"贵了一成"并排，像自相矛盾。
@@ -2010,6 +2032,8 @@ def rule_dialog(rule: dict | None, host=None) -> None:
         def save() -> None:
             chosen = [k for k, v in picked.items() if v]
             data["sources"] = "" if len(chosen) == len(all_keys) else ",".join(chosen)
+            data["name"] = (data.get("name") or "").strip()
+            data["keyword"] = (data.get("keyword") or "").strip()
             if not data["name"] or not data["keyword"]:
                 notify("规则名和搜索词不能为空", type="warning")
                 return
@@ -2028,10 +2052,27 @@ def rule_dialog(rule: dict | None, host=None) -> None:
                        "几小时就会烧穿当天的请求配额）", type="warning")
                 return
             data["quick_min"] = qm
-            # 这三个清空＝按各自的「不限 / 关闭」语义走，是合法的
+            # 【原来有值、现在读不出数字的，不能悄悄当成 0】ui.number 读不出数字时给 None ——
+            # 框被清空是这样；有的浏览器里敲「1,200,000」这种带逗号的写法也可能是这样，
+            # 而那时框里还显示着那串数字。悄悄落成 0 就是「不限上限」「不用手动价」，
+            # 超预算的货一下子全涌进命中页，提示却是「已保存」。要取消就明确填 0。
+            names = {"price_min": "价格下限", "price_max": "价格上限",
+                     "deal_ratio": "捡漏线百分比", "deal_price": "手动捡漏价"}
+            lost = [names[k] for k in names if data.get(k) is None and rule and rule.get(k)]
+            if lost:
+                notify(f"{'、'.join(lost)} 读不出数字（是不是带了逗号或单位？）—— "
+                       "要取消就明确填 0", type="warning")
+                return
+            # 这几个清空＝按各自的「不限 / 关闭」语义走，是合法的
             for k in ("price_min", "price_max", "deal_ratio", "deal_price"):
                 if data.get(k) is None:
                     data[k] = 0
+            # 【上下限颠倒就别存】上限少打一个 0 的话，这条规则下所有商品都会被判成
+            # 超预算或低于下限，命中页清空，而提示是「已保存」
+            if data["price_max"] and data["price_min"] > data["price_max"]:
+                notify(f"价格下限 {yen(int(data['price_min']))} 比上限 "
+                       f"{yen(int(data['price_max']))} 还高，没有保存", type="warning")
+                return
             # ui.number 被清空时 value 是 None，而这些列都是 NOT NULL；
             # ui.switch 给的是 bool，ui.number 给的是 float —— 统一收成 int。
             def clean(v):
@@ -2051,12 +2092,24 @@ def rule_dialog(rule: dict | None, host=None) -> None:
                 # 人只会觉得「改了不生效」。（这个竞态原先是靠拉黑卖家踩出来的，
                 # 拉黑现在走独立表、不再经 update_rule，但竞态本身还活着。）
                 before = {k: clean(v) for k, v in rule.items() if k in store.RULE_FIELDS}
+                # 上面把名称、搜索词 strip 过了，旧值也得 strip 了再比 —— 不然库里带首尾空格的
+                # 旧搜索词会被当成「改了搜索词」，什么都没动点一下保存，整条规则的在售就被收起来
+                for k in ("name", "keyword"):
+                    if isinstance(before.get(k), str):
+                        before[k] = before[k].strip()
                 payload = {k: v for k, v in payload.items() if v != before.get(k)}
                 if not payload:
                     close()
                     notify("没有任何改动")
                     return
-                store.update_rule(rule["id"], payload)
+                # 【写库失败要说出来】面板没有全局异常提示，原先这里一抛，按钮就像没点上：
+                # 对话框不关、什么提示都没有，人点「取消」之后整段编辑就丢了。
+                # 词表是 VARCHAR(1024)、备注 VARCHAR(255)，越加越长迟早撞上 Data too long。
+                try:
+                    store.update_rule(rule["id"], payload)
+                except Exception as e:          # noqa: BLE001 - 弹出来，对话框留着让人改
+                    notify(f"保存失败（对话框里的内容还在，改完再点保存）：{e}", type="negative")
+                    return
                 # 【立刻重判、重算捡漏】和拉黑卖家、存捡漏价一个路子：都是纯 CPU、
                 # 不发请求。不重判的话命中页会刷出「新摘要 + 旧徽标」——摘要按新规则算，
                 # 每一行的捡漏/命中还是旧的，要等下一轮扫描才对得上。
@@ -2064,7 +2117,11 @@ def rule_dialog(rule: dict | None, host=None) -> None:
                 poller.revalidate(fresh)
                 poller.mark_deals(fresh)
             else:
-                store.insert_rule(payload)
+                try:
+                    store.insert_rule(payload)
+                except Exception as e:          # noqa: BLE001 - 理由同上
+                    notify(f"保存失败（对话框里的内容还在，改完再点保存）：{e}", type="negative")
+                    return
             close()
             rules_view.refresh()
             hits_view.refresh()
@@ -2137,7 +2194,8 @@ def rules_view(host=None) -> None:
                 ui.badge("启用" if rule["enabled"] else "停用",
                          color="green" if rule["enabled"] else "grey")
                 ui.label(f'搜「{rule["keyword"]}」').classes("text-sm")
-                ui.label(f"{yen(rule['price_min'])}〜{yen(rule['price_max'])}").classes("text-sm")
+                # 上限 0 是「不限」，不是 ¥0 —— 和命中页摘要走同一个函数
+                ui.label(budget_text(rule)).classes("text-sm")
                 ui.space()
                 ui.label(f"入库 {total} · 在售命中 {hit}").classes("text-sm text-gray-400")
             ui.label(f"市价中位 {yen(st['median_price'])}"
@@ -2196,6 +2254,7 @@ async def fetch_all() -> None:
         notify(f"开始抓 {len(rules)} 条规则 × {len(sources.all_sources())} 个源，"
                f"每个请求间隔 {st['req_delay_min']:g}〜{st['req_delay_max']:g} 秒，要几分钟…")
         new = matched = 0
+        busy = False
         for r in rules:
             try:
                 # 【每条规则单独 try】一条失败不该让后面几条一起放弃
@@ -2206,12 +2265,16 @@ async def fetch_all() -> None:
             except poller.ScanBusy as e:
                 with client:
                     notify(str(e), type="warning")
+                busy = True
                 break
             except Exception as e:          # noqa: BLE001 - 手动抓取失败只弹提示
                 with client:
                     notify(f"「{r['name']}」失败：{e}", type="negative")
-        with client:
-            notify(f"抓完：新增 {new} 件，当前命中 {matched} 件", type="positive")
+        # 【没拿到扫描闸就别再报「抓完」】原先黄色「后台正在扫描」后面紧跟一条绿色
+        # 「抓完：新增 0 件，当前命中 0 件」，两句自相矛盾，后一句还像是真没货了
+        if not busy:
+            with client:
+                notify(f"抓完：新增 {new} 件，当前命中 {matched} 件", type="positive")
     finally:
         # 【必须在 finally】中途抛异常而不解锁的话，这个按钮就永久点不动了，
         # 而且没有任何办法恢复，只能重启进程。
@@ -2400,12 +2463,16 @@ def settings_view() -> None:
     #   detail_budget=0    永远不核实、不读描述
     #   median_window_days=0  prune 会把整张 sold_sample 删空，tracked 样本再也抓不回来
     #   fresh_hours=0      两个「新」徽标永远不出现
+    #   track_min=0        追踪中的每一轮（约 30 秒）各拉一遍详情，追 10 件一天上万次，
+    #                      当天配额烧穿、所有规则所有源一起停
+    #   track_budget=0     追踪页上的东西一件都不再刷新，页面上看不出来
     MUST_BE_POSITIVE = ("sold_scan_hours", "max_pages", "detail_budget",
                         "median_window_days", "fresh_hours", "daily_request_limit",
-                        "missing_grace_min", "req_delay_min", "req_delay_max")
+                        "missing_grace_min", "req_delay_min", "req_delay_max",
+                        "track_min", "track_budget")
 
     def save() -> None:
-        bad, bad_zero = [], []
+        bad, bad_zero, negative = [], [], []
         for k, (comp, it) in fields.items():
             val = comp.value
             # 【字符串项的空值是合法的】notify_url 留空就是"关掉推送"，
@@ -2420,6 +2487,14 @@ def settings_view() -> None:
                         continue
                 except (TypeError, ValueError):
                     pass
+            # 【其余数字项 0 是「关」，但负数没有任何一项是合法的】租约填 -1 就永远过期，
+            # 交易中的核实间隔填负数就每轮都拉一遍详情
+            try:
+                if val is not None and float(val) < 0:
+                    negative.append(k)
+                    continue
+            except (TypeError, ValueError):
+                pass
             if val is None:
                 bad.append(k)                  # 空值会让该项回落默认，多半是误删，拦一下
                 continue
@@ -2428,6 +2503,9 @@ def settings_view() -> None:
         if bad_zero:
             notify(f"{'、'.join(bad_zero)} 不能填 0 或负数（这几项的 0 不是「关闭」，"
                    f"而是会让轮询退化或把成交样本删空），已跳过未保存", type="negative")
+        if negative:
+            notify(f"{'、'.join(negative)} 不能填负数（要关掉的话填 0），已跳过未保存",
+                   type="negative")
         if bad:
             # 【原来写的是「会按默认值走」，和事实正好相反】代码是 continue 跳过不写，
             # 库里的旧值继续生效。照着错提示操作的人会以为自己成功恢复了默认值。

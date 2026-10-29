@@ -382,3 +382,44 @@ def test_总数正好整百时多翻的那一页是空的_不算改版():
 def test_一页全是フリマ商品_过滤后是0件_不算改版():
     r = _src_with(_next_html([_auc(f"z{i}", flea=True) for i in range(5)])).search("x")
     assert r["items"] == [] and r["total"] == 5
+
+
+# ---------------------------------------------------------------- 新版详情页的描述
+
+def _next_page(item: dict, extra_html: str = "") -> str:
+    blob = {"props": {"pageProps": {"initialState": {"item": {"detail": {"item": item}}}}}}
+    return (f'<script id="__NEXT_DATA__" type="application/json">{json.dumps(blob, ensure_ascii=False)}'
+            f"</script>{extra_html}")
+
+
+def test_新版详情页取_descriptionHtml_全文_不切页面上的预览():
+    """2026-10 实测：按「商品説明」切 HTML 切到的是 220 字的预览（以「...」结尾），
+    ストア出品切到的是页面样板 —— 一件整机因样板里的「ジャンク品返品不可」被标了ジャンク。"""
+    preview = "<h2>商品説明</h2><div>商品名：RTX 5090 ...</div><h2>支払い</h2>"
+    item = {"status": "open", "bids": 0, "taxinPrice": 990000,
+            "endTime": "2026-11-01T22:37:36+09:00",
+            "descriptionHtml": "<CENTER><B>RTX 5090</B><BR>マイニング使用なし&amp;動作良好</CENTER>"}
+    src = YahooAuction()
+    src._call = lambda *a, **k: type("R", (), {"text": _next_page(item, preview), "status_code": 200})()
+    d = src.detail("s1250109810")
+    assert d["description"] == "RTX 5090 マイニング使用なし&動作良好"
+    assert str(d["end_time"]) == "2026-11-01 22:37:36", "自動延長会推后截止，追踪刷新要能写回"
+
+
+def test_新版详情页没给描述字段时记成没读到_不拿预览冒充():
+    item = {"status": "open", "bids": 0, "taxinPrice": 525250}
+    page = _next_page(item, "<p>…商品説明を確認するか、ストアに確認してください その他の情報 ジャンク品返品不可</p>")
+    src = YahooAuction()
+    src._call = lambda *a, **k: type("R", (), {"text": page, "status_code": 200})()
+    assert src.detail("j1249948055")["description"] is None
+
+
+def test_新版页面改了结构_也不退回去切页面上的预览():
+    """有 __NEXT_DATA__、但路径变了：那是新版页面改了结构，不是旧版页面。退回切 HTML
+    切到的是预览或样板，会被当成真描述永久存下（desc_checked=1 之后不再重拉）。"""
+    blob = {"props": {"pageProps": {"initialState": {"itemV2": {"detail": {}}}}}}
+    page = (f'<script id="__NEXT_DATA__" type="application/json">{json.dumps(blob)}</script>'
+            "<h2>商品説明</h2><div>商品名：RTX 5090 ...</div><h2>支払い</h2>")
+    src = YahooAuction()
+    src._call = lambda *a, **k: type("R", (), {"text": page, "status_code": 200})()
+    assert src.detail("s1250109810")["description"] is None

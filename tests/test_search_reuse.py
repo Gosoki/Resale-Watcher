@@ -153,6 +153,7 @@ def test_交易中的按更长的间隔核实():
     class Src2:
         key = "mercari"
         def can_detail(self, iid): return True
+        def foreign(self, iid): return False
         def detail(self, iid):
             calls.append(iid); return {"status": "on_sale", "price": 1, "bid_count": None, "ship_from": ""}
 

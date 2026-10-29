@@ -38,11 +38,12 @@ class FakeStore:
     def get_settings(self):
         return self.settings
 
-    def pending_notify(self, rule_id, only_deal, redrop_pct=0):
+    def pending_notify(self, rule_id, only_deal, redrop_pct=0, fresh_hours=0):
         self.redrop_asked = redrop_pct
+        self.fresh_asked = fresh_hours
         return [r for r in self.rows if r["is_deal"]] if only_deal else list(self.rows)
 
-    def pending_final(self, rule_id, minutes):
+    def pending_final(self, rule_id, minutes, fresh_hours=0):
         self.final_asked.append(minutes)
         return list(self.final)
 
@@ -190,6 +191,61 @@ def test_拍卖没给截止时间时不留半截括号():
 def test_非拍卖商品不写截止时间():
     """普通商品没有"到点就没了"这回事，多一行只会稀释前两行。"""
     assert "截止" not in notify.compose(RULE, item(), 820000)
+
+
+# ---------------------------------------------------------------- 要人核实的提示
+
+def test_描述警示词紧跟在标题后面():
+    """面板上是黄色徽标，推送原先一个字都不带 —— 2026-10 推出去的 87 条里 27 条有这个。"""
+    lines = notify.compose(RULE, item(desc_warn="マイニング,異音"), 820000).splitlines()
+    assert lines[2] == "⚠ 描述含：マイニング,異音"
+
+
+def test_描述没读到要说清楚警示没生效():
+    """不能和「描述干净」混为一谈：没读到＝警示层对这件商品整个失效。"""
+    text = notify.compose(RULE, item(desc_warn="(描述未读到)"), 820000)
+    assert "描述没读到" in text and "描述含" not in text
+
+
+def test_低得反常的一口价要提示先核实():
+    """2026-10 低于市价 75% 的一口价「捡漏」全是别的东西：外接显卡坞、5080、5090D、游戏本。"""
+    lines = notify.compose(RULE, item(price=666_666, deal_pct=61), 1_078_000,
+                           suspect_pct=75).splitlines()
+    assert lines[2].startswith("⚠ 只有市价的 61%，低得反常")
+    # 只是多一句话：头一行照样是捡漏
+    assert lines[0].startswith("🟢 捡漏 ¥666,666")
+
+
+def test_低价提示_拍卖不算_关掉不算_没过线不算():
+    auction = item(price=500_000, deal_pct=46, bid_count=3, source="yahoo_auction", item_id="z1")
+    assert "低得反常" not in notify.compose(RULE, auction, 1_078_000, suspect_pct=75), \
+        "拍卖的当前价本来就低、还会涨"
+    assert "低得反常" not in notify.compose(RULE, item(deal_pct=61), 1_078_000, suspect_pct=0)
+    assert "低得反常" not in notify.compose(RULE, item(deal_pct=75), 1_078_000, suspect_pct=75)
+    assert "低得反常" not in notify.compose(RULE, item(deal_pct=None), None, suspect_pct=75), \
+        "没有中位数就无从比较"
+
+
+def test_push_new把低价提示阈值传进了正文():
+    sent, _, _ = run({}, {"notify_url": "u", "notify_on": "deal", "notify_max_per_round": 5,
+                          "suspect_low_pct": 75}, [item(deal_pct=61)])
+    assert "低得反常" in sent[0][2]
+
+
+def test_描述还没读要说出来_不能读起来像干净():
+    """读描述的预算用完、或者那个源的详情这轮出错时推送照样会发；不写这句就和「查过、没问题」一样。"""
+    rule = {**RULE, "check_desc": 1}
+    assert "描述还没读" in notify.compose(rule, item(desc_checked=0), 820000)
+    assert "描述还没读" not in notify.compose(rule, item(desc_checked=1, desc_warn=""), 820000)
+    assert "描述还没读" not in notify.compose({**RULE, "check_desc": 0}, item(desc_checked=0), 820000), \
+        "规则关了读描述，就没有「还没读」一说"
+
+
+def test_待推查询带上了描述警示列():
+    from db import store
+
+    assert "desc_warn" in store.NOTIFY_COLS, "少了它推送里就永远没有描述警示"
+    assert "desc_checked" in store.NOTIFY_COLS, "少了它分不出「描述还没读」和「描述干净」"
 
 
 # ---------------------------------------------------------------- 开关与阈值
@@ -461,13 +517,33 @@ def test_快结束窗口的三个时间量必须算对():
     sql, params = capture(store.pending_final, 7, 60)
     after = config.now()
 
-    rid, lo, hi, mins = params
+    rid, lo, hi, mins, since, since2 = params
+    assert since is None and since2 is None, "没传 fresh_hours 就不该限新鲜度"
     assert rid == 7
     assert before <= lo <= after, "窗口下界不是「现在」—— 多半是两个边界传反了"
     assert hi - lo == timedelta(minutes=60), f"窗口不是 60 分钟，是 {hi - lo}"
     assert mins == 60, "DATE_SUB 用的分钟数和窗口对不上"
     # 参数是按位置填进去的：SQL 里下界必须排在上界前面，否则上面那两个值会填反
     assert sql.index("end_time > %s") < sql.index("end_time <= %s")
+
+
+def test_太久没见到的不推_和命中页撤下同一个口径():
+    """10-16 改完规则那一轮，两件 09-22 之后再没出现过的 Shops 商品被当场推到手机上，晚了 24 天。"""
+    from db import store
+
+    before = config.now()
+    sql, params = capture(store.pending_notify, 7, True, 5, 24)
+    assert "last_seen_at >= %s" in sql
+    assert params[:3] == (7, 5, 5)
+    assert before - timedelta(hours=24) - timedelta(seconds=5) <= params[3] <= before - timedelta(hours=23)
+    sql2, params2 = capture(store.pending_final, 7, 60, 24)
+    assert "last_seen_at >= %s" in sql2 and params2[4] == params2[5] is not None
+
+
+def test_push_new把撤下时间传给了两条待推查询():
+    _, fake, _ = run({}, {"notify_url": "u", "notify_on": "deal", "notify_max_per_round": 5,
+                          "stale_hide_hours": 24}, [item()])
+    assert fake.fresh_asked == 24
 
 
 def test_两个推送时间戳各自写各自的列():

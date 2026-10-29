@@ -52,6 +52,15 @@ class FakeStore:
     def set_status(self, *a):
         pass
 
+    def get_rule(self, rid):         # 刷完要重算捡漏（mark_deals 走下面两个，这里没有在售行）
+        return {"id": rid, "deal_ratio": 90, "deal_price": 0}
+
+    def get_state(self, rid):
+        return {"median_price": None}
+
+    def query(self, sql, args=()):
+        return []
+
 
 class FakeSources:
     DailyLimitReached = real_sources.DailyLimitReached
@@ -93,3 +102,11 @@ def test_常驻轮询照旧受两道闸管着():
 def test_一件都没追时不发请求():
     done, fake = run(0, force=True)
     assert done == 0 and fake.due_args == (0, 0)
+
+
+def test_刷完要把涉及的规则重算捡漏(monkeypatch):
+    """价格刷新了，捡漏标和「市价的 X%」也得跟上 —— 不然新价格旁边挂着按旧价算的绿色「捡漏」。"""
+    ran = []
+    monkeypatch.setattr(poller, "mark_deals", lambda rule: ran.append(rule["id"]))
+    run(2, force=True)
+    assert ran == [1]

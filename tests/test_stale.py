@@ -61,3 +61,10 @@ def test_阈值设很大时一件都不撤():
     rows = [item(h) for h in (1, 50, 500)]
     keep, dark = split_stale(rows, 10_000)
     assert len(keep) == 3 and not dark
+
+
+def test_撤下时间填0是不撤下_不是全部撤下():
+    """设置说明写的是「0＝不撤下」，对账那边也按这个收尾。原先 0 会让每一件都「超过 0h 没见到」，
+    命中页整页清空、捡漏汇总说「暂时没有」。"""
+    keep, dark = split_stale([item(0.1), item(30)], 0)
+    assert len(keep) == 2 and dark == []

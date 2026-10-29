@@ -74,6 +74,7 @@ class ReconcileSrc:
     key = "mercari"
     def __init__(self): self.asked = []
     def can_detail(self, iid): return iid.startswith("m")
+    def foreign(self, iid): return False
     def detail(self, iid):
         self.asked.append(iid)
         return {"status": "on_sale", "price": 1, "description": ""}
@@ -118,6 +119,7 @@ class TrackStore:
     def touch_seen(self, *k): self.touched.append(k[1])
     def update_tracked(self, *a): ...
     def set_status(self, *a, **k): ...
+    def get_rule(self, rid): return None      # 刷完要重算捡漏，规则查不到就跳过
     TERMINAL = ("sold_out", "gone")
 
 

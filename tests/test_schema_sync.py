@@ -110,6 +110,20 @@ def test_改了关键词_换了源_重新启用时_清掉旧的平台总数(monk
         assert bool(reset) is expect_reset, (changed, calls)
 
 
+def test_改了关键词_旧词扫进来的在售商品先收起来_追踪中的不动(monkeypatch):
+    """不收的话它们不会再出现在新词的结果里，对账每轮拿它们拉详情、核实到还在卖、下轮再来 ——
+    几百件就能把 detail_budget 吃满，一天多出几千次请求，撞线后所有规则所有源一起停。"""
+    from db import store
+    for changed, expect in ((["keyword"], True), (["sources"], False), (["price_max"], False)):
+        calls = []
+        monkeypatch.setattr(store, "execute", lambda sql, args=(): calls.append(sql))
+        store.update_rule(7, {k: 1 for k in changed})
+        park = [c for c in calls if c.startswith("UPDATE item SET status = 'gone'")]
+        assert bool(park) is expect, (changed, calls)
+        if park:
+            assert "status = 'on_sale'" in park[0] and "tracked_at IS NULL" in park[0]
+
+
 class _FakeCur:
     def __init__(self, tables, log):
         self.tables, self.log = tables, log

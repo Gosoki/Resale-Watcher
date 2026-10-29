@@ -94,6 +94,9 @@ class FakeSrc:
     def __init__(self, detail):
         self._detail = detail
 
+    def foreign(self, iid):
+        return False
+
     def can_detail(self, iid):
         return True
 
@@ -133,20 +136,25 @@ def test_价格正常时照常进样本_并写回商品():
 def test_set_status带价时写价_价为0时不动价():
     from db import store
 
-    def capture(fn, *a, **kw):                     # 截 store.execute 真正发出去的 (SQL, 参数)
-        got = {}
-        saved = store.execute
-        store.execute = lambda sql, params=None: got.update(sql=sql, params=params)
+    def capture(fn, *a, **kw):                     # 截 store 真正发出去的每一条 (SQL, 参数)，不连库
+        got = []
+        saved = store.execute, store.one
+        store.execute = lambda sql, params=None: got.append((sql, params))
+        store.one = lambda sql, params=None: None    # add_price_log 先查最后一笔：当作没有
         try:
             fn(*a, **kw)
         finally:
-            store.execute = saved
-        return got["sql"], got["params"]
+            store.execute, store.one = saved
+        return got
 
-    sql, params = capture(store.set_status, "s", "i", 1, "sold_out", sold_at=T_NOW, price=890000)
+    calls = capture(store.set_status, "s", "i", 1, "sold_out", sold_at=T_NOW, price=890000)
+    sql, params = calls[0]
     assert "price = %s" in sql and 890000 in params
-    sql0, _ = capture(store.set_status, "s", "i", 1, "sold_out", sold_at=T_NOW, price=0)
-    assert "price = %s" not in sql0, "价读不到（0）时不许把 0 写进去"
+    assert "min_price = LEAST(min_price, %s)" in sql, "成交价常比最后挂牌价低，min_price 要跟上"
+    assert calls[1][0].startswith("INSERT INTO price_log") and 890000 in calls[1][1], \
+        "成交价要进价格历史，不然「上次 → 现在」少了最后一笔"
+    calls0 = capture(store.set_status, "s", "i", 1, "sold_out", sold_at=T_NOW, price=0)
+    assert len(calls0) == 1 and "price = %s" not in calls0[0][0], "价读不到（0）时不许把 0 写进去"
 
 
 # ---------------------------------------------------------------- C

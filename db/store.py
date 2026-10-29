@@ -284,7 +284,17 @@ def get_settings(force: bool = False) -> dict:
         return _settings_cache["data"]
     try:
         raw = {r["k"]: r["v"] for r in query("SELECT k, v FROM app_setting")}
-    except Exception:                      # noqa: BLE001 - 库抽风时用默认值顶着，别让判定逻辑崩掉
+    except Exception:                      # noqa: BLE001 - 库抽风时别让判定逻辑崩掉
+        # 【有上一份就整份沿用，不回落成默认值】和下面拉黑列表同一个理由，只是代价换成了
+        # 「你改过的设置被代码里的默认值顶掉 10 秒」：每日上限 6500 变回 3000（每天实际
+        # 用 2900 上下，一越线就误判配额耗尽、全部停抓 10 分钟），中位数窗口 15 天变回 30
+        # （这 10 秒里跑的 refresh_median 会把 30 天口径的中位数写进库，一直留到下次重算）。
+        # 断库期间看门狗每分钟读一次，库一恢复，缓存里很可能正是这份默认值。
+        # 只有进程刚启动、手上还什么都没有时，才只能拿默认值顶着。
+        if _settings_cache["data"]:
+            log.warning("读设置失败，沿用上一份")
+            _settings_cache["at"] = now
+            return _settings_cache["data"]
         raw = {}
     try:
         blocked = frozenset(
@@ -433,6 +443,15 @@ def update_rule(rule_id: int, data: dict) -> None:
     # 面板保存只提交真正改过的字段，所以只有这几项变了才会清。
     if {"keyword", "sources", "enabled"} & set(cols):
         execute("UPDATE rule_source_state SET last_total = 0 WHERE rule_id = %s", (rule_id,))
+    # 【换了搜索词，旧词扫进来的在售商品先全部收起来】它们不会再出现在新词的结果里，
+    # 售出对账就会每轮拿它们去拉详情：核实到还在卖 → touch → 宽限期一过再来。几百件旧商品
+    # 能把每轮的 detail_budget 吃满，三个源一天多出好几千次请求，撞上 daily_request_limit
+    # 就是【所有规则所有源】一起停。新词照样搜得到的那些，下一轮 upsert_item 会把状态写回
+    # 在售，推送记录（notified_at）还在，不会重推。你在追踪的不动 —— 那是你亲手挑的，
+    # 追踪刷新会单独拉它们的详情。
+    if "keyword" in cols:
+        execute("UPDATE item SET status = 'gone' WHERE rule_id = %s AND status = 'on_sale' "
+                "AND tracked_at IS NULL", (rule_id,))
 
 
 def delete_rule(rule_id: int) -> None:
@@ -889,10 +908,15 @@ def set_status(source: str, item_id: str, rule_id: int, status: str, sold_at=Non
     if sold_at is not None:
         sets.append("sold_at = %s"); args.append(sold_at)
     if price:
-        sets.append("price = %s"); args.append(int(price))
+        # 【min_price 和价格历史一起跟上】成交价常常比最后一次看到的挂牌价低（两次扫描之间
+        # 降了价、或者接受了还价）—— 实测 38 行 min_price 比成交价还高、82 行价格历史少了最后一笔
+        sets += ["price = %s", "min_price = LEAST(min_price, %s)"]
+        args += [int(price), int(price)]
     execute(f"UPDATE item SET {', '.join(sets)} "
             "WHERE source = %s AND item_id = %s AND rule_id = %s",
             (*args, source, item_id, rule_id))
+    if price:
+        add_price_log(source, item_id, int(price), config.now())
 
 
 def set_tracked(source: str, item_id: str, rule_id: int, on: bool) -> None:
@@ -932,7 +956,7 @@ def tracked_due(track_min: int, limit: int, trading_min: int | None = None) -> l
     """
     # 【交易中的按 trading_min 算】它的详情几天都不会变，按 track_min 每 5 分钟拉一次是白烧
     now = config.now()
-    return query("SELECT source, item_id, rule_id, price, name, matched FROM item "
+    return query("SELECT source, item_id, rule_id, price, name, matched, reject_reason FROM item "
                  f"WHERE tracked_at IS NOT NULL AND status IN {LIVE} "
                  "AND last_seen_at < CASE WHEN status = 'trading' THEN %s ELSE %s END "
                  "ORDER BY last_seen_at ASC LIMIT %s",
@@ -959,6 +983,9 @@ def update_tracked(source: str, item_id: str, rule_id: int, d: dict, old_price: 
             sets.append("sold_at = %s"); args.append(now)
     if d.get("bid_count") is not None:
         sets.append("bid_count = %s"); args.append(d["bid_count"])
+    # 【拍卖的截止会往后推】ヤフオク 的自動延長：不写回的话正在延长的拍卖显示「已结束」
+    if d.get("end_time"):
+        sets.append("end_time = %s"); args.append(d["end_time"])
     if d.get("ship_from"):
         sets.append("ship_from = %s"); args.append(d["ship_from"])
     if not sets:
@@ -974,8 +1001,9 @@ def update_tracked(source: str, item_id: str, rule_id: int, d: dict, old_price: 
 # 加一列只加在一边，另一边推出去的消息就悄悄少一块 —— 不报错、不进日志。
 #   thumb_url 缺 → 每条都走兜底，图永远出不来（Slack 对空 image_url 回 400）
 #   end_time  缺 → 拍卖推送里没有截止时间，而那正是拍卖最要紧的一个数
+#   desc_warn / desc_checked 缺 → 推送里没有「描述含：マイニング」「描述还没读」这类要你核实的提示
 NOTIFY_COLS = ("source, item_id, rule_id, name, price, is_deal, deal_pct, bid_count, "
-               "end_time, thumb_url, notified_at, notified_price")
+               "end_time, thumb_url, notified_at, notified_price, desc_warn, desc_checked")
 # 【剔除的不推】用户剔掉一件，意思就是"别再拿它烦我"——命中页不显示了、手机上却
 # 还在响，会被当成 bug。两条待推查询都带上这一句。
 NOT_HIDDEN = ("AND NOT EXISTS (SELECT 1 FROM hidden_item h "
@@ -991,7 +1019,8 @@ NOT_BLOCKED = ("AND NOT EXISTS (SELECT 1 FROM blocked_seller b "
                "WHERE item.seller_id <> '' AND b.seller_id = item.seller_id) ")
 
 
-def pending_notify(rule_id: int, only_deal: bool, redrop_pct: int = 0) -> list[dict]:
+def pending_notify(rule_id: int, only_deal: bool, redrop_pct: int = 0,
+                   fresh_hours: int = 0) -> list[dict]:
     """该推的在售命中商品：还没推过的，以及（开了 redrop_pct 时）推过之后又跌够了的。
 
     【条件里的 status = 'on_sale' 不能省】商品卖掉之后 matched 仍然是 1
@@ -1001,18 +1030,26 @@ def pending_notify(rule_id: int, only_deal: bool, redrop_pct: int = 0) -> list[d
     【再跌 N% 重推】原先一件商品终身只推一次 —— 库里 26 条已推里有 5 条推完又降过价，
     你一条都不知道。比的是「上次推送时的价格」（notified_price），不是首见价：
     每推一次基线刷新一次，掉几百块不会反复轰炸。N=0 关闭，也就是老行为。
+
+    【fresh_hours：太久没见到的不推】传 stale_hide_hours，和命中页「撤下」同一个口径。
+    原先不看这个：10-16 改完规则那一轮，两件 09-22 之后再没出现过的 メルカリShops 商品
+    （拉不到详情，一直标着在售）被重算成捡漏、当场推到了手机上 —— 晚了 24 天。
+    命中页早就不显示它们了，推送却照推。0＝不限。
     """
     sql = (f"SELECT {NOTIFY_COLS} FROM item WHERE rule_id = %s AND matched = 1 "
            "AND status = 'on_sale' " + NOT_HIDDEN + NOT_BLOCKED +
            "AND (notified_at IS NULL OR (%s > 0 AND notified_price IS NOT NULL "
            "     AND price * 100 <= notified_price * (100 - %s)))")
+    args = [rule_id, redrop_pct, redrop_pct]
     if only_deal:
         sql += " AND is_deal = 1"
+    if fresh_hours:
+        sql += " AND last_seen_at >= %s"
+        args.append(config.now() - timedelta(hours=fresh_hours))
     # 和面板同一个排序：最划算的排最前，万一撞上限被整批跳过也是先看到好的
-    return query(sql + " ORDER BY COALESCE(deal_pct, 999), price",
-                 (rule_id, redrop_pct, redrop_pct))
+    return query(sql + " ORDER BY COALESCE(deal_pct, 999), price", tuple(args))
 
-def pending_final(rule_id: int, minutes: int) -> list[dict]:
+def pending_final(rule_id: int, minutes: int, fresh_hours: int = 0) -> list[dict]:
     """快到点的拍卖里，价格还在捡漏线内、而且还没提醒过的那些。
 
     【为什么要第二条】第一条是它刚变成捡漏那一刻发的 —— 那时可能还剩两天。
@@ -1027,8 +1064,11 @@ def pending_final(rule_id: int, minutes: int) -> list[dict]:
     【notified_at 必须早于进入这个窗口的那一刻】少了最后这一句，一件在最后
     半小时里才第一次变成捡漏的商品会被推两遍：先是第一条（它刚够格），
     几分钟后又来一条"快结束"—— 你看到的是同一件东西，只隔了五分钟。
+
+    fresh_hours 同 pending_notify：太久没见到的，价格和"还在不在"都不可信，不催你去出价。
     """
     now = config.now()
+    since = now - timedelta(hours=fresh_hours) if fresh_hours else None
     return query(
         f"SELECT {NOTIFY_COLS} FROM item "
         "WHERE rule_id = %s AND matched = 1 AND status = 'on_sale' AND is_deal = 1 "
@@ -1037,8 +1077,9 @@ def pending_final(rule_id: int, minutes: int) -> list[dict]:
         "AND final_notified_at IS NULL "
         "AND notified_at IS NOT NULL "
         "AND notified_at < DATE_SUB(end_time, INTERVAL %s MINUTE) "
+        "AND (%s IS NULL OR last_seen_at >= %s) "
         "ORDER BY end_time",
-        (rule_id, now, now + timedelta(minutes=minutes), minutes))
+        (rule_id, now, now + timedelta(minutes=minutes), minutes, since, since))
 
 
 def _mark_pushed(rows: list[dict], col: str, extra_set: str = "") -> None:
@@ -1086,7 +1127,7 @@ def on_sale_items(rule_id: int, source: str) -> list[dict]:
     # 成交后才变 sold_out。只捞 on_sale 的话，一件商品被标成 trading 之后就
     # 再也不会被对账碰到，永远推进不到 sold_out —— tracked 成交样本（最准的那种）
     # 就此断流，而 trading 恰恰是最接近成交的状态。
-    return query("SELECT item_id, price, matched, last_seen_at, status FROM item "
+    return query("SELECT item_id, price, matched, reject_reason, last_seen_at, status FROM item "
                  "WHERE rule_id = %s AND source = %s AND status IN ('on_sale', 'trading') "
                  "ORDER BY last_seen_at ASC", (rule_id, source))
 

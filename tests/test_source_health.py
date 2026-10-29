@@ -68,6 +68,9 @@ class PageSource:
     def search(self, keyword, *, sold=False, page_token=""):
         return dict(self.page)
 
+    def foreign(self, iid):
+        return False
+
     def can_detail(self, iid):
         return True
 

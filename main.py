@@ -11,6 +11,7 @@ import logging
 import sys
 import threading
 import time
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 from nicegui import app, ui
@@ -26,6 +27,9 @@ def setup_logging(console: bool | None = None) -> None:
     """console=None：有终端才往屏幕打（守护进程用）。True：强制打屏幕（前台命令用）。"""
     config.LOG_DIR.mkdir(exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+    # 【日志时间也按 JST 写】默认跟着机器时区走，而 NAS 的容器是 UTC —— 日志比库里、面板上的
+    # 时间整整慢 9 小时，对着「10-27 03:00 推了一条」去翻日志，翻到的是 9 小时前的事。
+    fmt.converter = lambda t: datetime.fromtimestamp(t, config.JST).timetuple()
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     # 【只在真有终端时才往屏幕打】后台启动时 run.sh 把 stdout/stderr 也重定向进了

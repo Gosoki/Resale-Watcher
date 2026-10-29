@@ -229,6 +229,29 @@ def test_读列表失败时沿用上一份而不是清空():
         store._settings_cache.update(saved_cache)
 
 
+def test_读设置失败时也沿用上一份而不是回落成默认值():
+    """回落成默认值的代价：每日上限 6500 变回 3000（每天实际用 2900 上下，越线就全部停抓），
+    中位数窗口 15 天变回 30 —— 断库刚恢复的那 10 秒里正好会读到这一份。"""
+    saved_q, saved_cache = store.query, dict(store._settings_cache)
+    try:
+        store.query = lambda sql, args=(): (
+            [{"k": "daily_request_limit", "v": "6500"}] if "app_setting" in sql
+            else [{"seller_id": "abc"}])
+        assert store.get_settings(force=True)["daily_request_limit"] == 6500
+
+        def boom(sql, args=()):
+            raise RuntimeError("Can't connect to MySQL server")
+
+        store.query = boom
+        s = store.get_settings(force=True)
+        assert s["daily_request_limit"] == 6500, "读失败时回落成了代码里的默认值"
+        assert s["blocked_sellers"] == frozenset({"abc"})
+    finally:
+        store.query = saved_q
+        store._settings_cache.clear()
+        store._settings_cache.update(saved_cache)
+
+
 def test_写完库要让缓存立刻失效():
     """不失效的话，面板点完拉黑、紧接着的同步重判读到的还是旧列表：
     提示写着「已拉黑」而一件都没改判，商品原地不动，人只会再点一次。"""

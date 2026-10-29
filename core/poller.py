@@ -25,13 +25,10 @@ from datetime import timedelta
 import config
 import sources
 from core import notify
-from core.matcher import flag_desc, is_deal, judge_snap
+from core.matcher import DESC_UNREAD, flag_desc, is_deal, judge_snap
 from db import store
 
 log = logging.getLogger("poller")
-
-# 描述没读到时写进 desc_warn 的标记。和真实的警示词区分开，面板上单独显示。
-DESC_UNREAD = "(描述未读到)"
 
 # 轮询心跳。面板靠它判断「采集是不是还活着」——
 # 没有它的话，线程静默死掉后进程照常在跑、面板照常打开、旧数据照常显示，
@@ -224,6 +221,19 @@ def scan_on_sale(src, rule: dict, prev_total: int | None = None) -> dict:
     return stat
 
 
+def sample_worthy(row: dict) -> bool:
+    """跟到成交的商品能不能进市价样本：过了规则，或者【只是】超了预算上限。
+
+    【price_over 也要收】和成交轮去掉 price_max 是同一个理由：预算是你愿意出多少，
+    不是这东西值多少，拿它裁样本就是循环论证。原先只收 matched = 1 的，ヤフオク 又没有
+    成交搜索、跟到成交是它唯一的样本来源 —— 于是拍到预算以上的拍卖一件都进不来，
+    拍得便宜的全进来了：规则 2 的 ヤフオク 样本最高恰好等于上限 ¥500,000，
+    同期 ¥508,000、¥630,000 成交的两件被挡在外面，中位数被系统性地往下拽。
+    price_over 排在 reject_reason 的最后一位，判到它说明前面的排除词、拉黑、品相全都过了。
+    """
+    return bool(row.get("matched")) or row.get("reject_reason") == "price_over"
+
+
 def reconcile_sold(src, rule: dict, seen: set[str]) -> None:
     """库里还标在售、这轮却没扫到的商品：卖了？下架了？还是只是漏翻了一页？"""
     rid = rule["id"]
@@ -236,18 +246,45 @@ def reconcile_sold(src, rule: dict, seen: set[str]) -> None:
                if it["item_id"] not in seen
                and it["last_seen_at"] < (trade if it.get("status") == "trading" else grace)]
 
+    # 【拉不到详情的只能按时间收尾】メルカリShops 的商品详情接口不支持，核实不了；原先它们
+    # 从搜索里消失之后就永远标着在售 —— 实测库里 31 件，最老的从 09-22 起五周没再出现过，
+    # 其中 2 件还挂着「捡漏」，命中页摘要天天写「另有 2 件超过 24h 没见到，已撤下」。
+    # 搜索是扫全了的（没扫全根本走不到这里），在 stale_hide_hours 这么久里一次都没出现
+    # = 面板早就当它不在了，这里把库里的状态也对上。【判错了会自己改回来】它哪天重新出现在
+    # 搜索结果里，upsert_item 会把状态写回在售。stale_hide_hours=0（不撤下）时也不收尾。
+    dark_h = rule.get("stale_hide_hours") or 0
+    dark = config.now() - timedelta(hours=dark_h)
     budget = rule["detail_budget"]
-    checked = 0
+    checked = closed = 0
+    fails: list[Exception] = []
     for it in missing:
         if budget <= 0:
             break
         iid = it["item_id"]
+        if src.foreign(iid):
+            # 别的平台混进来的旧行（见 Source.foreign）：它在自己那个源下另有一行，这里直接收尾
+            store.set_status(src.key, iid, rid, "gone")
+            closed += 1
+            continue
+        if _skipped(src, iid):
+            continue                        # 刚出过单件错误，宽限期内不再试
         # 【拉不到详情的不占预算、不 touch】理由见 Source.can_detail
         if not src.can_detail(iid):
+            if dark_h and it.get("status") == "on_sale" and it["last_seen_at"] < dark:
+                store.set_status(src.key, iid, rid, "gone")
+                closed += 1
             continue
         budget -= 1
         checked += 1
-        d = src.detail(iid)
+        try:
+            d = src.detail(iid)
+        except Exception as e:              # noqa: BLE001 - 分清是这一件坏了还是整个源坏了
+            if not _one_item_only(e):
+                raise
+            fails.append(e)
+            _skip(src, iid, rule)
+            log.warning("[%s] 对账核实 %s 失败，只跳过这一件：%s", src.key, iid, e)
+            continue
         if d is None:
             store.set_status(src.key, iid, rid, "gone")          # 已删除
             continue
@@ -267,7 +304,7 @@ def reconcile_sold(src, rule: dict, seen: set[str]) -> None:
             # 【价格读不到就别进样本】0 进了 sold_sample 会把中位数往下拽，而中位数是
             # 捡漏线的全部依据。状态和价格来自两条不同的解析路径（フリマ 的已售出页
             # 只剩 schema.org 块），能读到"卖掉了"不代表能读到"多少钱卖的"。
-            if it["matched"] and d["price"] > 0:
+            if sample_worthy(it) and d["price"] > 0:
                 # 我们一路跟到成交的商品：拉过详情、过了完整规则，是最可信的市价样本
                 store.add_sold_sample(rid, src.key, iid, d["price"], now, "tracked")
                 store.refresh_median(rid)     # 别等 24 小时后的成交轮，最准的样本进来了就算
@@ -296,6 +333,10 @@ def reconcile_sold(src, rule: dict, seen: set[str]) -> None:
     if checked:
         log.info("[%s] 规则「%s」对账核实 %d 件（失踪 %d 件，预算 %d）",
                  src.key, rule["name"], checked, len(missing), rule["detail_budget"])
+    if closed:
+        log.info("[%s] 规则「%s」%d 件拉不到详情或不归本源的商品已记为已下架",
+                 src.key, rule["name"], closed)
+    _raise_if_all_failed(fails, checked)
 
 
 # ------------------------------------------------------------------ 3. 补详情
@@ -308,10 +349,27 @@ def fetch_details(src, rule: dict) -> int:
     if not rule.get("check_desc"):
         return 0
     rid = rule["id"]
-    done = 0
+    done = tried = 0
+    fails: list[Exception] = []
     for it in store.pending_detail(rid, src.key, rule["detail_budget"]):
         iid = it["item_id"]
-        d = src.detail(iid)
+        if not src.can_detail(iid):
+            # メルカリShops 之类拉不到详情的：不发请求，直接记「描述未读到」。不记的话它们按
+            # 首见时间一直排在 pending_detail 的最前面，攒够 detail_budget 件就把别的全挡住
+            store.save_detail(src.key, iid, rid, "", DESC_UNREAD, "")
+            continue
+        if _skipped(src, iid):
+            continue
+        tried += 1
+        try:
+            d = src.detail(iid)
+        except Exception as e:              # noqa: BLE001 - 理由同 reconcile_sold
+            if not _one_item_only(e):
+                raise
+            fails.append(e)
+            _skip(src, iid, rule)
+            log.warning("[%s] 读描述 %s 失败，只跳过这一件：%s", src.key, iid, e)
+            continue
         if d is None:
             store.set_status(src.key, iid, rid, "gone")
             continue
@@ -329,7 +387,58 @@ def fetch_details(src, rule: dict) -> int:
         done += 1
         if warn:
             log.info("[%s] 描述警示 %s [%s] %s", src.key, iid, warn, it["name"][:40])
+    _raise_if_all_failed(fails, tried)
     return done
+
+
+def _one_item_only(e: Exception) -> bool:
+    """详情请求抛的这个异常，是不是【只关这一件商品】。拿不准的一律当整个源的事。
+
+    【单件的坏不能拖垮整个源】原先对账和补描述里一件商品的详情一抛（某件回 400、
+    页面里一个解析不了的块），整个「规则 × 源」这一轮就中断了。而对账按 last_seen_at
+    升序取、补描述按首见时间取，坏的那件下一轮还排第一 —— 后面的商品永远轮不到核实，
+    每轮记一次源失败，30 分钟后还推一条「一直被限流」的误导告警。09-17 的 m32209355337
+    就是这么卡住的，当时只修了那一种形状。
+    【只认两种单件错误】解析这一件的页面时出的错（缺字段、格式怪），以及平台对这一件回的
+    4xx（403 / 429 除外）。网络错误、5xx、403/429、メルカリ 详情的非删除 403（都不带
+    或带着限流的状态码）、配额用完、库出错，都是整个源的事 —— 换下一件只会再撞一次墙，
+    被限流时一轮就多撞十次。
+    """
+    if isinstance(e, (sources.RateLimited, sources.DailyLimitReached)):
+        status = getattr(e, "status", None)
+        return status is not None and 400 <= status < 500 and status not in (403, 429)
+    return not type(e).__module__.startswith("pymysql")
+
+
+# 出过单件错误的商品：(源, 商品ID) → 这个时间之前别再试。只在内存里，重启从零。
+# 【不 touch 它】touch 等于说「刚见过它」，面板上它就永远不会失联、不会撤下，
+# 而它其实已经不在搜索结果里了。也不能什么都不做：它会每轮排在最前面、每轮白花一个请求。
+_detail_skip: dict[tuple[str, str], object] = {}
+
+
+def _skip(src, iid: str, rule: dict) -> None:
+    _detail_skip[(src.key, iid)] = config.now() + timedelta(minutes=rule["missing_grace_min"])
+
+
+def _skipped(src, iid: str) -> bool:
+    until = _detail_skip.get((src.key, iid))
+    if until is None:
+        return False
+    if until > config.now():
+        return True
+    del _detail_skip[(src.key, iid)]
+    return False
+
+
+def _raise_if_all_failed(fails: list[Exception], tried: int) -> None:
+    """试了至少 3 件、一件都没成：不是某几件商品的问题，是详情这条路整个坏了。
+
+    照常抛出去，让源健康告警（_source_failed）看得见 —— 逐件吞掉的话，平台改版导致
+    详情页全挂，日志里只剩一排 warning，「已经 N 分钟抓不到东西」永远不会响。
+    【门槛是 3 不是 2】两件长期坏掉的商品碰巧同一轮被试到，不该让整个源这一轮作废。
+    """
+    if len(fails) >= 3 and len(fails) == tried:
+        raise fails[-1]
 
 
 # ------------------------------------------------------------------ 4. 重判（跨源）
@@ -391,20 +500,39 @@ def revalidate_all() -> int:
     而且会随规则条数线性涨 —— 规则涨到十几条时要改成 run.io_bound，现在不值得
     为它引入 async。
     """
-    return sum(revalidate(r) for r in store.get_rules())
+    # 【改判之后紧跟着重算捡漏】mark_deals 会把不合适的在售商品摘掉捡漏标，所以解除拉黑
+    # 之后，回来的那几件要再算一遍才会重新出现在捡漏汇总里 —— 不然得等下一轮扫描。
+    n = 0
+    for r in store.get_rules():
+        n += revalidate(r)
+        mark_deals(r)
+    return n
 
 
 # ------------------------------------------------------------------ 5. 捡漏（跨源）
 
 def mark_deals(rule: dict) -> None:
-    """用跨源合并的成交中位数给命中商品打百分比。不发请求。"""
+    """用跨源合并的成交中位数给在售商品打百分比，命中的才可能是捡漏。不发请求。
+
+    【不合适的在售商品也要过一遍】原先只挑 matched = 1 的，于是一件捡漏涨价超过上限、
+    或者卖家被拉黑之后，它的 is_deal 永远停在 1 —— 实测库里 8 行「price_over / seller
+    却还是捡漏」，追踪页上一件 ¥129 万的照样挂着绿色「捡漏」。
+    【值没变就不写】一条规则在售一两百件，逐行 UPDATE 就是一两百个来回，而每轮真变的
+    通常是 0 件 —— NAS 到库的网络连发几十条就出过事（见 store.init_schema）。
+    """
     rid = rule["id"]
     median = store.get_state(rid)["median_price"]
     for it in store.query(
-            "SELECT source, item_id, price FROM item WHERE rule_id = %s AND matched = 1 "
-            "AND status = 'on_sale'", (rid,)):
+            "SELECT source, item_id, price, matched, is_deal, deal_pct FROM item "
+            "WHERE rule_id = %s AND status = 'on_sale'", (rid,)):
         deal, pct = is_deal(it["price"], median, rule["deal_ratio"], rule.get("deal_price") or 0)
-        store.set_deal(it["source"], it["item_id"], rid, deal, pct)
+        if not it["matched"]:
+            # 不合适的只在要摘掉捡漏标时才写（顺手把百分比按现价改对）。它们的 deal_pct
+            # 别处不看，每次中位数一变就把一两百行逐条重写一遍不值当
+            if it["is_deal"]:
+                store.set_deal(it["source"], it["item_id"], rid, 0, pct)
+        elif (deal, pct) != (it["is_deal"], it["deal_pct"]):
+            store.set_deal(it["source"], it["item_id"], rid, deal, pct)
 
 
 # ------------------------------------------------------------------ 成交轮
@@ -501,6 +629,7 @@ def refresh_tracked(force: bool = False) -> int:
     if not rows:
         return 0
     done = 0
+    touched: set[int] = set()           # 真拿到了新数据的规则，最后要重算捡漏
     cooled: set[str] = set()            # 本轮已经被限流的源，剩下的件留到下一轮
     left: dict[str, int] = {}
     for r in rows:
@@ -527,6 +656,7 @@ def refresh_tracked(force: bool = False) -> int:
             log.warning("[%s] 追踪刷新 %s 失败：%s", r["source"], r["item_id"], e)
             continue
         done += 1
+        touched.add(r["rule_id"])
         if d is None:                   # 404，商品被删了
             store.set_status(r["source"], r["item_id"], r["rule_id"], "gone")
             log.info("[%s] 追踪中的 %s 已下架", r["source"], r["item_id"])
@@ -543,7 +673,7 @@ def refresh_tracked(force: bool = False) -> int:
             # 【追踪确认的成交是最准的样本】拉过详情、过了完整规则、价格是接口给的最终价。
             # 对账那边（reconcile_sold）一直在记，这里原先漏了 —— 你亲手盯到成交的
             # 那几件反而没进中位数。价格读不到的不记，理由同对账。
-            if d["status"] == "sold_out" and r.get("matched") and d["price"] > 0:
+            if d["status"] == "sold_out" and sample_worthy(r) and d["price"] > 0:
                 store.add_sold_sample(r["rule_id"], r["source"], r["item_id"],
                                       d["price"], config.now(), "tracked")
                 store.refresh_median(r["rule_id"])
@@ -552,6 +682,14 @@ def refresh_tracked(force: bool = False) -> int:
     if done:
         log.info("追踪刷新 %d 件（追踪中共 %d 件，每轮上限 %d）",
                  done, len(store.tracked_items()), s["track_budget"])
+    # 【价格刷新了，捡漏标和「市价的 X%」也得跟上】不然一件拍卖被抬过捡漏线之后，
+    # 点「一键拉取」看到的是新价格旁边还挂着绿色「捡漏」、写着按旧价算的百分比，
+    # 要等这条规则下一轮扫描的 finalize 才改过来（7〜30 分钟，源一直失败就更久）。
+    # mark_deals 值没变就不写库，这里多跑一遍几乎不花什么。
+    for rid in touched:
+        rule = store.get_rule(rid)
+        if rule:
+            mark_deals(rule)
     return done
 
 

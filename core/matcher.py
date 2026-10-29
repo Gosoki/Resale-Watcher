@@ -15,6 +15,11 @@ reject_reason 的先后顺序是有讲究的：把「永远不会翻身」的原
 """
 from core.normalize import norm, word_pairs, words
 
+# 描述没读到时写进 desc_warn 的标记。和真实的警示词区分开，面板和推送上都单独说明。
+# 【放在这里不放 poller】推送（core/notify）也要认它，而 poller 已经 import 了 notify。
+DESC_UNREAD = "(描述未读到)"
+
+
 def judge_snap(rule: dict, snap: dict) -> dict:
     """用搜索结果里的信息做初筛（不含商品描述 —— 那要另发一次详情请求）。
 
@@ -139,7 +144,7 @@ def explain(rule: dict, row: dict) -> str:
         if bids:
             return f"🔨 竞价中，已 {bids} 次出价（当前价会涨）"
         warn = row.get("desc_warn") or ""
-        if warn == "(描述未读到)":
+        if warn == DESC_UNREAD:
             return "⚠ 描述没解析出来（页面结构可能变了，警示层对它无效）"
         if warn:
             return f"⚠ 描述含：{warn}"
@@ -177,3 +182,14 @@ def is_deal(price: int, median: int | None, deal_ratio: int,
     if not median or not deal_ratio:
         return 0, pct          # 没中位数、或关掉百分比判定时仍给 pct，纯做参考
     return (1 if price * 100 < median * deal_ratio else 0), pct
+
+
+def too_cheap(row: dict, limit: int) -> bool:
+    """一口价商品便宜得反常：不到市价中位数的 limit%。
+
+    【只提示人去核实，不参与任何判定】推送和命中页各加一句话，商品照样命中、照样推。
+    做成硬过滤的话，哪天真有一件白菜价的正品就被它静默吞掉 —— 违「宁可漏筛不可误杀」。
+    【拍卖不算】bid_count 不是 NULL 就是拍卖，当前价本来就低、还会涨。
+    """
+    pct = row.get("deal_pct")
+    return bool(limit) and pct is not None and row.get("bid_count") is None and pct < limit

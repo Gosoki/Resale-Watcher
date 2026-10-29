@@ -41,13 +41,23 @@ def _from_ld_json(html: str) -> dict | None:
             d = json.loads(blob)
         except json.JSONDecodeError:
             continue
-        if d.get("@type") != "Product":
+        # 【块是数组就跳过（不支持，只是不再抛）、价格可能是 "1280000.00"】原先直接 .get /
+        # int() 会抛，而这一抛就把这件商品的核实打断（见 poller._one_item_only）
+        if not isinstance(d, dict) or d.get("@type") != "Product":
             continue
         offers = d.get("offers") or {}
+        if not isinstance(offers, dict):
+            offers = {}
+        try:
+            price = int(float(offers.get("price") or 0))
+        except (TypeError, ValueError):
+            price = 0
         avail = str(offers.get("availability") or "").rsplit("/", 1)[-1]
         return {
-            "description": d.get("description") or "",
-            "price": int(offers.get("price") or 0),
+            # 【没有就是 None，不是 ""】""＝读到了、确实是空的；没给这个字段＝我们没读到。
+            # 混成 "" 的话面板会显示「✓ 描述已查，干净」
+            "description": d.get("description"),
+            "price": price,
             "name": d.get("name") or "",
             "status": _AVAIL.get(avail, ""),
             "ship_from": "",                # schema.org 里没有发货地；空串＝未知
@@ -64,15 +74,39 @@ class YahooFlea(Source):
     def item_url(self, item_id: str) -> str:
         return ITEM_PAGE.format(item_id)
 
+    def foreign(self, item_id: str) -> bool:
+        # ヤフオク 的商品不归这个源管（见 search）。库里 2026-10-29 之前混进来的那些旧行，
+        # 对账见到就直接收尾 —— 它们在 ヤフオク 那边有自己的一行
+        return _is_auction_id(item_id)
+
+    def can_detail(self, item_id: str) -> bool:
+        # 同上：别拿 フリマ 的详情页去核实 ヤフオク 的商品（每个宽限期都会核实成「还在售」）
+        return not _is_auction_id(item_id)
+
     def search(self, keyword: str, *, sold: bool = False, page_token: str = "") -> dict:
         offset = int(page_token or 0)
         params = {"query": keyword, "results": PAGE_SIZE, "offset": offset,
                   "itemStatus": "sold" if sold else "open"}
         data = self._call("GET", SEARCH_URL, params=params).json()
-        items = [self._parse(x) for x in (data.get("items") or [])]
+        raw = data.get("items") or []
+        # 【ヤフオク 的拍卖会混进来，这里滤掉】ヤフオク 的商品（勾了「也在フリマ卖」的）在这个
+        # 接口里照样出现，ID 和 ヤフオク 那边一模一样 —— 实测「RTX 4090」第一页 100 件里 41 件。
+        # 它们以 yahoo_flea 入库，就和 yahoo_auction 那一行成了同一件商品的两行：
+        #   卖家 ID 两边不同（这里给 p+数字，ヤフオク 给 29 位），拉黑了 ヤフオク 那边的人，
+        #   这一行照样命中、照样推送；这里没有出价数，起拍价被当成一口价算捡漏；
+        #   两边各拉一遍详情；同一笔成交还可能以两个 source 各进一次中位数。
+        # 接口里没有标明「这是拍卖」的字段，能区分的只有 ID：フリマ 的恒为 z + 数字，
+        # ヤフオク 的是别的字母 + 10 位数字或纯数字（库里两个 Yahoo 源近千行无一例外）。
+        # 【只滤「明确像 ヤフオク」的，认不出的放行】反过来只收 z 开头的话，哪天平台换了 ID
+        # 格式，这个源就一件都收不到，而 raw 照样大于 0、「解析坏了」的判定一声不响。
+        # 成交搜索一样滤：ヤフオク 那边会自己跟到成交，这里再收一份就是重复样本。
+        items = [self._parse(x) for x in raw if not _is_auction_id(str(x.get("id") or ""))]
         total = int(data.get("totalResultsAvailable") or 0)
-        nxt = offset + len(items)
-        return {"items": items, "next": str(nxt) if items and nxt < total else "", "total": total}
+        # 【翻页按过滤前的条数】offset 是平台的游标，按过滤后算会把下一页的开头重翻一遍
+        nxt = offset + len(raw)
+        return {"items": items, "next": str(nxt) if raw and nxt < total else "", "total": total,
+                # 过滤前的条数：一页全是 ヤフオク 时 items 为空，别被当成「解析坏了」（见 poller）
+                "raw": len(raw)}
 
     def detail(self, item_id: str) -> dict | None:
         resp = self._call("GET", ITEM_PAGE.format(item_id))
@@ -138,6 +172,15 @@ class YahooFlea(Source):
             "end_time": self.iso(raw.get("endTime")),
             "bid_count": None, "buy_now_price": None,
         }
+
+
+_AUCTION_ID = re.compile(r"[a-y]\d{10}|\d{10}")
+
+
+def _is_auction_id(item_id: str) -> bool:
+    """ヤフオク 的商品 ID：z 以外的字母 + 10 位数字（c1244386335），或 10 位纯数字（1241582519）。
+    Yahoo!フリマ 自己的是 z + 9 位数字（z708062698）。"""
+    return bool(_AUCTION_ID.fullmatch(item_id))
 
 
 def _find_item(node, item_id: str, depth: int = 0):

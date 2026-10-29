@@ -13,7 +13,16 @@ from web.ui import budget_text, deal_line  # noqa: E402
 
 
 def test_手动价盖过百分比():
-    assert deal_line({"deal_price": 950_000, "deal_ratio": 90}, 800_000) == "手动捡漏价 ¥950,000"
+    assert deal_line({"deal_price": 700_000, "deal_ratio": 90}, 800_000) == "手动捡漏价 ¥700,000"
+    assert deal_line({"deal_price": 700_000, "deal_ratio": 90}, None) == "手动捡漏价 ¥700,000"
+
+
+def test_手动价高过市价中位要说出来():
+    """那样一大半在售都算捡漏、都会推到手机上 —— 2026-10 推出去的 87 条里 51 条按现价算不低于市价中位。"""
+    assert deal_line({"deal_price": 950_000, "deal_ratio": 90}, 800_000) == \
+        "手动捡漏价 ¥950,000（比市价中位还高 19%）"
+    # 高一点点也要写出来，不能显示成「高 0%」
+    assert deal_line({"deal_price": 600_000, "deal_ratio": 90}, 599_000).endswith("还高 1%）")
 
 
 def test_没手动价时按中位数百分比():

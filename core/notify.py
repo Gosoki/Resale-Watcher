@@ -26,6 +26,7 @@ import httpx
 
 import config
 import sources
+from core.matcher import DESC_UNREAD, too_cheap
 from db import store
 
 log = logging.getLogger(__name__)
@@ -55,7 +56,8 @@ def deadline(end) -> str:
     return f" · {config.time_left(end)}（{end:%m-%d %H:%M} 截止）"
 
 
-def compose(rule: dict, row: dict, median: int | None, final: bool = False) -> str:
+def compose(rule: dict, row: dict, median: int | None, final: bool = False,
+            suspect_pct: int = 0) -> str:
     """一条提醒的正文。手机通知栏只看得见前两行，所以最要紧的信息必须在最前面。
 
     【价格在第一行】原先第一行是「🟢 捡漏 | 规则名」、价格在第三行 —— 通知栏里
@@ -67,6 +69,8 @@ def compose(rule: dict, row: dict, median: int | None, final: bool = False) -> s
     final=True 是「快结束提醒」，也就是这件商品的第二条；再跌够 notify_redrop_pct
     的是「📉 再降」。头一个词必须和第一条不一样：其余部分几乎一模一样，不换的话
     你会以为是重复推送、顺手划掉。
+
+    suspect_pct 是设置里的 suspect_low_pct（见 core/matcher.too_cheap），0＝不提示。
     """
     price, pct = row["price"], row.get("deal_pct")
     manual = rule.get("deal_price") or 0
@@ -90,6 +94,22 @@ def compose(rule: dict, row: dict, median: int | None, final: bool = False) -> s
         why = ""
     lines = [f"{head} ¥{price:,}" + (f" · {why}" if why else "") + f" | {rule['name']}",
              row["name"][:60]]
+
+    # 【要你核实的东西紧跟在标题后面】面板上这些是徽标，推送原先一个字都不带 ——
+    # 2026-10 推出去的 87 条里有 27 条描述命中了マイニング/ジャンク/異音/動作未確認
+    # 或者根本没读到，手机上一个字都看不出来，只有打开面板才知道。
+    # 决定要不要立刻去抢的人，最需要的就是这一句。
+    if too_cheap(row, suspect_pct):
+        lines.append(f"⚠ 只有市价的 {pct}%，低得反常 —— 先确认不是别的型号、笔记本、外接盒或配件")
+    warn = row.get("desc_warn") or ""
+    if warn == DESC_UNREAD:
+        lines.append("⚠ 描述没读到，警示词对它没生效 —— 点进去自己看一眼")
+    elif warn:
+        lines.append(f"⚠ 描述含：{warn}")
+    elif rule.get("check_desc") and not row.get("desc_checked"):
+        # 【没读过 ≠ 干净】这一轮读描述的预算用完了、或者那个源的详情这轮出错了，
+        # 推送照样会发 —— 不写这句的话，读起来和「描述查过、没问题」一模一样
+        lines.append("（描述还没读，警示词还没查）")
 
     ref = []
     if (redrop or (row["is_deal"] and manual)) and pct:
@@ -188,10 +208,12 @@ def push_new(rule: dict) -> int:
     if not url:
         return 0
 
+    # 【太久没见到的不推】和命中页「撤下」同一个口径，理由见 store.pending_notify
+    fresh_h = s.get("stale_hide_hours") or 0
     rows = store.pending_notify(rule["id"], only_deal=(s.get("notify_on") != "matched"),
-                                redrop_pct=s.get("notify_redrop_pct") or 0)
+                                redrop_pct=s.get("notify_redrop_pct") or 0, fresh_hours=fresh_h)
     mins = s.get("notify_final_min") or 0
-    final = store.pending_final(rule["id"], mins) if mins else []
+    final = store.pending_final(rule["id"], mins, fresh_hours=fresh_h) if mins else []
 
     cap = s.get("notify_max_per_round") or 5
     if len(rows) > cap:
@@ -223,7 +245,8 @@ def push_new(rule: dict) -> int:
         if i:                               # 第一条不用等
             time.sleep(GAP)
         try:
-            post(url, template, compose(rule, row, median, final=is_final),
+            post(url, template, compose(rule, row, median, final=is_final,
+                                        suspect_pct=s.get("suspect_low_pct") or 0),
                  row.get("thumb_url") or "")
             sent += 1
         except Exception as e:              # noqa: BLE001 - 推送坏了不该影响抓取

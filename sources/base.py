@@ -107,6 +107,14 @@ class Source(ABC):
         if total >= limit:
             raise DailyLimitReached(f"当天全源已发 {total} 次请求，到上限 {limit}")
 
+    def foreign(self, item_id: str) -> bool:
+        """这件商品其实不归这个源管（别的平台混进搜索结果、已经在源里滤掉的那种）。
+
+        对账见到这种旧行就直接收尾，不等 stale_hide_hours：它在别的源下还有自己那一行，
+        这一行留着只会冻在旧价上、继续占着在售。默认都归自己管。
+        """
+        return False
+
     def can_detail(self, item_id: str) -> bool:
         """这件商品的详情能不能拉。默认都能；メルカリShops 的不能（接口不支持）。
 
@@ -162,13 +170,18 @@ class Source(ABC):
                 time.sleep(back)
                 self._last_at = time.time()
                 err = RateLimited(f"{self.name} HTTP {resp.status_code}")
+                err.status = resp.status_code
                 # 【标一下"这是真限流、已经睡过退避"】追踪刷新按它决定要不要把这个源
                 # 本轮剩下的件留到下一轮。单件性质的失败（删掉的商品、某件回 500）
                 # 不带这个标，照旧只跳过那一件 —— 否则一件长期坏掉的商品会每轮
                 # 把整个源 cool 掉，同源别的商品从此再也刷不到。
                 err.backed_off = True
                 raise err
-            raise RateLimited(f"{self.name} HTTP {resp.status_code}: {resp.text[:200]}")
+            err = RateLimited(f"{self.name} HTTP {resp.status_code}: {resp.text[:200]}")
+            # 【带上状态码】上层（poller._one_item_only）靠它分「这一件的问题」和「整个源的问题」：
+            # 400/410 这类只关这一件；5xx、网络错误（没有状态码）是整个源在出事
+            err.status = resp.status_code
+            raise err
 
     # ------------------------------------------------------------ 工具
 
